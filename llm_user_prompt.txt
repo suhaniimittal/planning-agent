@@ -1,0 +1,1111 @@
+## Issue
+Sent emails' subject line is not getting logged in the database.
+
+---
+## Known service dependencies (verified from the graph — already confirmed real, not something to double-check or second-guess)
+- orders -> shipping
+
+---
+## Service: orders
+Domain: E-commerce
+Key symbols: CustomerOrder, toString, getId, setId, getCustomerId, Address, toString, equals, hashCode, getId, Customer, toString, equals, hashCode, getId, Item, id, itemId, quantity, toString, OrdersConfigurationProperties, getPaymentUri, getShippingUri, setDomain, Hostname, Card, toString, equals, hashCode, getId, Cart, contents, add, remove, getCustomerId, PaymentRequest, toString, getAddress, setAddress, getCard, PaymentRequest, toString, getAddress, setAddress, getCard, HTTPMonitoringInterceptor, preHandle, postHandle, afterCompletion, getMatchingURLPattern, ServiceMock, start_container, cleanup, __init__, OrdersContainerTest, OrdersController, newOrder, parseId, calculateTotal, PaymentDeclinedException, HealthCheck, toString, getService, setService, getStatus, Shipment, toString, equals, hashCode, getId, PaymentResponse, toString, isAuthorised, setAuthorised, setMessage, PaymentResponse, toString, isAuthorised, setAuthorised, setMessage, AsyncGetService, getResource, getDataList, postResource, get_data, api_cusutomers, api_cards, api_addresses, api_carts, RestProxyTemplate, restTemplate, init, getRestTemplate, logger, IMAGE, SCRIPT_DIR, DOCKER_CMD, CODE_DIR, REPO, push, tag_and_push_all, DOCKER_PUSH, TAG, REPO, UnitPojo, ensureExpectedPojoCount, testPojoStructureAndBehavior, EXPECTED_CLASS_COUNT, POJO_PACKAGE, SCRIPT_DIR, SCRIPT_NAME, SSH_OPTS, DOCKER_CMD, CODE_DIR, Docker, kill_and_remove, random_container_name, get_container_ip, execute, NewOrderResource, customer, address, card, items, Dredd, test_against_endpoint, image, container_name, PrometheusAutoConfiguration, springBootMetricsCollector, prometheusMetricsServletRegistrationBean, WebMvcConfig, httpMonitoringInterceptor, myMappedInterceptor, HealthCheckController, getHealth, mongoTemplate, OrderApplication, main, MongoConfiguration, optionsProvider, OrdersConfiguration, frameworkMesosConfigProperties, CustomerOrderRepository, findByCustomerId, JavaServices, test_maven, JavaServices, test_maven, JavaServices, test_maven, Api, noResponse, —
+
+(Included only because it's graph-connected to a directly matched service, not a direct semantic match itself — summary only, full documentation omitted to keep this prompt focused.)
+
+### Real code symbols for orders
+- `src/main/java/works/weave/socks/orders/controllers/OrdersController.java:162-167` `src/main/java/works/weave/socks/orders/controllers/OrdersController.java::PaymentDeclinedException` — `@ResponseStatus(value = HttpStatus.NOT_ACCEPTABLE)
+    public class PaymentDeclinedException extends IllegalStateException`
+  ```java
+@ResponseStatus(value = HttpStatus.NOT_ACCEPTABLE)
+    public class PaymentDeclinedException extends IllegalStateException {
+        public PaymentDeclinedException(String s) {
+            super(s);
+        }
+    }
+  ```
+- `src/main/java/works/weave/socks/orders/controllers/OrdersController.java:169-174` `src/main/java/works/weave/socks/orders/controllers/OrdersController.java::InvalidOrderException` — `@ResponseStatus(value = HttpStatus.NOT_ACCEPTABLE)
+    public class InvalidOrderException extends IllegalStateException`
+  ```java
+@ResponseStatus(value = HttpStatus.NOT_ACCEPTABLE)
+    public class InvalidOrderException extends IllegalStateException {
+        public InvalidOrderException(String s) {
+            super(s);
+        }
+    }
+  ```
+- `src/main/java/works/weave/socks/orders/services/AsyncGetService.java:32-93` `src/main/java/works/weave/socks/orders/services/AsyncGetService.java::AsyncGetService` — `@Service
+public class AsyncGetService`
+  ```java
+@Service
+public class AsyncGetService {
+    private final Logger LOG = LoggerFactory.getLogger(getClass());
+
+    private final RestProxyTemplate restProxyTemplate;
+
+    private final RestTemplate halTemplate;
+
+    @Autowired
+    public AsyncGetService(RestProxyTemplate restProxyTemplate) {
+        this.restProxyTemplate = restProxyTemplate;
+        this.halTemplate = new RestTemplate(restProxyTemplate.getRestTemplate().getRequestFactory());
+
+        ObjectMapper objectMapper = new ObjectMapper();
+        objectMapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+        objectMapper.registerModule(new Jackson2HalModule());
+        MappingJackson2HttpMessageConverter halConverter = new MappingJackson2HttpMessageConverter();
+        halConverter.setSupportedMediaTypes(Arrays.asList(MediaTypes.HAL_JSON));
+        halConverter.setObjectMapper(objectMapper);
+        halTemplate.setMessageConverters(Collections.singletonList(halConverter));
+    }
+
+    @Async
+    public <T> Future<Resource<T>> getResource(URI url, TypeReferences.ResourceType<T> type) throws
+            InterruptedException, IOException {
+        RequestEntity<Void> request = RequestEntity.get(url).accept(HAL_JSON).build();
+        LOG.debug("Requesting: " + request.toString());
+        Resource<T> body = restProxyTemplate.getRestTemplate().exchange(request, type).getBody();
+        LOG.debug("Received: " + body.toString());
+        return new AsyncResult<>(body);
+    }
+
+    @Async
+    public <T> Future<Resources<T>> getDataList(URI url, TypeReferences.ResourcesType<T> type) throws
+            InterruptedException, IOException {
+        RequestEntity<Void> request = RequestEntity.get(url).accept(HAL_JSON).build();
+        LOG.debug("Requesting: " + request.toString());
+        Resources<T> body = restProxyTemplate.getRestTemplate().exchange(request, type).getBody();
+        LOG.debug("Received: " + body.toString());
+        return new AsyncResult<>(body);
+    }
+
+    @Async
+    public <T> Future<List<T>> getDataList(URI url, ParameterizedTypeReference<List<T>> type) throws
+            InterruptedException, IOException {
+        RequestEntity<Void> request = RequestEntity.get(url).accept(MediaType.APPLICATION_JSON).build();
+        LOG.debug("Requesting: " + request.toString());
+        List<T> body = restProxyTemplate.getRestTemplate().exchange(request, type).getBody();
+        LOG.debug("Received: " + body.toString());
+        return new AsyncResult<>(body);
+    }
+
+    @Async
+    public <T, B> Future<T> postResource(URI uri, B body, ParameterizedTypeReference<T> returnType) {
+        RequestEntity<B> request = RequestEntity.post(uri).contentType(MediaType.APPLICATION_JSON).accept(MediaType
+                .APPLICATION_JSON).body(body);
+        LOG.debug("Requesting: " + request.toString());
+        T responseBody = restProxyTemplate.getRestTemplate().exchange(request, returnType).getBody();
+        LOG.debug("Received: " + responseBody);
+        return new AsyncResult<>(responseBody);
+    }
+}
+  ```
+- `test/json-server/server.py:5-106` `test/json-server/server.py::get_data` — `def get_data(customer_id, address_id = "57a98d98e4b00679b4a830b3", card_id="57a98d98e4b00679b4a830b4"):`
+  ```python
+def get_data(customer_id, address_id = "57a98d98e4b00679b4a830b3", card_id="57a98d98e4b00679b4a830b4"):
+    customers = {
+        "firstName": "User1",
+        "lastName": "Name1",
+        "email": "",
+        "username": "user1",
+        "addresses": [
+            {
+                  "street": "Maes-Y-Deri",
+                  "number": "4",
+                  "country": "United Kingdom",
+                  "city": "Aberdare",
+                  "postcode": "CF44 6TF",
+                  "id": address_id,
+                  "_links": {
+                          "address": {
+                                    "href": "http://user/addresses/" + address_id
+                                  },
+                          "self": {
+                                    "href": "http://user/addresses/" + address_id
+                                  }
+                        }
+                }
+          ],
+        "cards": [
+            {
+                  "longNum": "0908415193175205",
+                  "expires": "08/19",
+                  "ccv": "280",
+                  "id": card_id,
+                  "_links": {
+                          "card": {
+                                    "href": "http://user/cards/" + card_id
+                                  },
+                          "self": {
+                                    "href": "http://user/cards/" + card_id
+                                  }
+                        }
+                }
+          ],
+        "id": customer_id,
+        "_links": {
+            "addresses": {
+                  "href": "http://user/customers/57a98d98e4b00679b4a830b5/addresses"
+                },
+            "cards": {
+                "href": "http://user/customers/57a98d98e4b00679b4a830b5/cards"
+                },
+            "customer": {
+                  "href": "http://user/customers/" + customer_id
+                },
+            "self": {
+                  "href": "http://user/customers/" + customer_id
+                }
+          }
+    }
+
+
+    customer_cards = {
+        "_embedded": {
+            "card": [
+                  {
+                          "longNum": "0908415193175205",
+                          "expires": "08/19",
+                          "ccv": "280",
+                          "id": card_id,
+                          "_links": {
+                                    "card": {
+                                                "href": "http://user/cards/" + card_id
+                                              },
+                                    "self": {
+                                                "href": "http://user/cards/" + card_id
+                                              }
+                                  }
+                        }
+                ]
+          }
+    }
+
+    customer_addresses = {
+        "_embedded": {
+            "address": [
+                  {
+                          "street": "Maes-Y-Deri",
+                          "number": "4",
+                          "country": "United Kingdom",
+                          "city": "Aberdare",
+                          "postcode": "CF44 6TF",
+                          "id": address_id,
+                          "_links": {
+                                    "address": {
+                                                "href": "http://user/addresses/" + address_id
+                                              },
+                                    "self": {
+                                                "href": "http://user/addresses/" + address_id
+                                              }
+                                  }
+                        }
+                ]
+          }
+    }
+    return customers, customer_cards, customer_addresses
+  ```
+- `test/util/Docker.py:22-26` `test/util/Docker.py::Docker.get_container_ip` — `def get_container_ip(self, ctr_name):`
+  ```python
+def get_container_ip(self, ctr_name):
+        command = ['docker', 'inspect',
+                   '--format', '\'{{.NetworkSettings.IPAddress}}\'',
+                   ctr_name]
+        return re.sub(r'[^0-9.]*', '', self.execute(command))
+  ```
+- `src/main/java/works/weave/socks/orders/middleware/HTTPMonitoringInterceptor.java:72-82` `src/main/java/works/weave/socks/orders/middleware/HTTPMonitoringInterceptor.java::HTTPMonitoringInterceptor.getMatchingURLPattern` — `private String getMatchingURLPattern(HttpServletRequest httpServletRequest)`
+  ```java
+private String getMatchingURLPattern(HttpServletRequest httpServletRequest) {
+        String res = "";
+        for (PatternsRequestCondition pattern : getUrlPatterns()) {
+            if (pattern.getMatchingCondition(httpServletRequest) != null &&
+                    !httpServletRequest.getServletPath().equals("/error")) {
+                res = pattern.getMatchingCondition(httpServletRequest).getPatterns().iterator().next();
+                break;
+            }
+        }
+        return res;
+    }
+  ```
+- `src/main/java/works/weave/socks/orders/middleware/HTTPMonitoringInterceptor.java:84-98` `src/main/java/works/weave/socks/orders/middleware/HTTPMonitoringInterceptor.java::HTTPMonitoringInterceptor.getUrlPatterns` — `private Set<PatternsRequestCondition> getUrlPatterns()`
+  ```java
+private Set<PatternsRequestCondition> getUrlPatterns() {
+        if (this.urlPatterns == null) {
+            this.urlPatterns = new HashSet<>();
+            requestMappingHandlerMapping.getHandlerMethods().forEach((mapping, handlerMethod) ->
+                    urlPatterns.add(mapping.getPatternsCondition()));
+            RepositoryRestHandlerMapping repositoryRestHandlerMapping = new
+                    RepositoryRestHandlerMapping(mappings, repositoryConfiguration);
+            repositoryRestHandlerMapping.setJpaHelper(jpaHelper);
+            repositoryRestHandlerMapping.setApplicationContext(applicationContext);
+            repositoryRestHandlerMapping.afterPropertiesSet();
+            repositoryRestHandlerMapping.getHandlerMethods().forEach((mapping, handlerMethod) ->
+                    urlPatterns.add(mapping.getPatternsCondition()));
+        }
+        return this.urlPatterns;
+    }
+  ```
+- `src/main/java/works/weave/socks/orders/config/RestProxyTemplate.java:52-54` `src/main/java/works/weave/socks/orders/config/RestProxyTemplate.java::RestProxyTemplate.getRestTemplate` — `public RestTemplate getRestTemplate()`
+  ```java
+public RestTemplate getRestTemplate() {
+        return restTemplate;
+    }
+  ```
+
+---
+## Service: shipping
+Domain: Shipping
+Key symbols: HTTPMonitoringInterceptor, preHandle, postHandle, afterCompletion, getMatchingURLPattern, HealthCheck, toString, getService, setService, getStatus, Shipment, toString, equals, hashCode, getId, RabbitMqConfiguration, connectionFactory, amqpAdmin, jsonMessageConverter, rabbitTemplate, UnitPojo, ensureExpectedPojoCount, testPojoStructureAndBehavior, testEquals, testHashcode, ITShippingController, getShipment, getShipmentById, newShipment, getHealthCheck, BUILD_VERSION, BUILD_DATE, SCRIPT_DIR, DOCKER_CMD, CODE_DIR, push, tag_and_push_all, DOCKER_PUSH, TAG, REPO, ShippingController, getShipping, getShippingById, postShipping, getHealth, SCRIPT_DIR, SCRIPT_NAME, SSH_OPTS, DOCKER_CMD, CODE_DIR, Docker, kill_and_remove, random_container_name, get_container_ip, execute, Dredd, test_against_endpoint, image, container_name, PrometheusAutoConfiguration, springBootMetricsCollector, prometheusMetricsServletRegistrationBean, WebMvcConfig, httpMonitoringInterceptor, myMappedInterceptor, ShippingServiceApplication, main, JavaServices, test_maven, JavaServices, test_maven, JavaServices, test_maven, Api, noResponse
+
+Summary: Provides shipping capabilities as part of a microservices architecture.
+(Real code was found for this service — see 'Real code symbols' below, which reflects the actual parsed source. The service's detailed file-by-file documentation is omitted here since it's superseded by that real code; this summary is kept only for the business context code alone doesn't carry.)
+
+### Real code symbols for shipping
+- `test/util/Docker.py:18-22` `test/util/Docker.py::Docker.get_container_ip` — `def get_container_ip(self, ctr_name):`
+  ```python
+def get_container_ip(self, ctr_name):
+        command = ['docker', 'inspect',
+                   '--format', '\'{{.NetworkSettings.IPAddress}}\'',
+                   ctr_name]
+        return re.sub(r'[^0-9.]*', '', self.execute(command))
+  ```
+- `src/test/java/works/weave/socks/shipping/controllers/ITShippingController.java:34-38` `src/test/java/works/weave/socks/shipping/controllers/ITShippingController.java::ITShippingController.getShipment` — `@Test
+    public void getShipment() throws Exception`
+  ```java
+@Test
+    public void getShipment() throws Exception {
+        String shipping = shippingController.getShipping();
+        assertThat(shipping, is(notNullValue()));
+    }
+  ```
+- `src/test/java/works/weave/socks/shipping/controllers/ITShippingController.java:40-44` `src/test/java/works/weave/socks/shipping/controllers/ITShippingController.java::ITShippingController.getShipmentById` — `@Test
+    public void getShipmentById() throws Exception`
+  ```java
+@Test
+    public void getShipmentById() throws Exception {
+        String shipping = shippingController.getShippingById("id");
+        assertThat(shipping, is(notNullValue()));
+    }
+  ```
+- `src/test/java/works/weave/socks/shipping/controllers/ITShippingController.java:54-58` `src/test/java/works/weave/socks/shipping/controllers/ITShippingController.java::ITShippingController.getHealthCheck` — `@Test
+    public void getHealthCheck() throws Exception`
+  ```java
+@Test
+    public void getHealthCheck() throws Exception {
+        Map<String, List<HealthCheck>> healthChecks = shippingController.getHealth();
+        assertThat(healthChecks.get("health").size(), is(equalTo(2)));
+    }
+  ```
+- `src/test/java/works/weave/socks/shipping/controllers/ITShippingController.java:60-67` `src/test/java/works/weave/socks/shipping/controllers/ITShippingController.java::ITShippingController.doNotCrashWhenNoQueue` — `@Test
+    public void doNotCrashWhenNoQueue() throws Exception`
+  ```java
+@Test
+    public void doNotCrashWhenNoQueue() throws Exception {
+        doThrow(new AmqpException("test error")).when(rabbitTemplate).convertAndSend(anyString(), any(Shipment.class));
+        Shipment original = new Shipment("someName");
+        Shipment saved = shippingController.postShipping(original);
+        verify(rabbitTemplate, times(1)).convertAndSend(anyString(), any(Shipment.class));
+        assertThat(original, is(equalTo(saved)));
+    }
+  ```
+
+---
+## Service: user
+Domain: User account management
+Key symbols: init, Mongo, Init, MongoUser, New, Endpoints, MakeEndpoints, MakeLoginEndpoint, MakeRegisterEndpoint, MakeUserGetEndpoint, Middleware, LoggingMiddleware, loggingMiddleware, Login, Register, TestInit, TestSet, TestRegister, TestCreateUser, TestGetUser, Database, init, Init, Set, Register, Service, NewFixedService, fixedService, Health, Login, init, TestMain, exitTest, TestInit, TestNew, MakeHTTPHandler, encodeError, decodeLoginRequest, decodeRegisterRequest, decodeDeleteRequest, init, Links, AddLink, AddAttrLink, AddCustomer, push, tag_and_push_all, DOCKER_PUSH, TAG, REPO, User, New, Validate, MaskCCs, AddLinks, bogusLogger, newBogusLogger, Log, TestLoginMiddleWare, init, TestLogin, TestRegister, TestCalculatePassHash, TestMakeEndpoints, TestMakeLoginEndpoint, TestMakeRegisterEndpoint, SCRIPT_DIR, FILES, init, main, ServiceName, Card, MaskCC, AddLinks, TestNew, TestValidate, TestMaskCCs, get_results, insert_address, get_results, insert_card, get_results, insert_customer, Address, AddLinks, TestAddLinksCard, TestMaskCC, RESPONSECODE, TestAddLinksAdd, —, —
+
+Summary: This service covers user account storage, including cards and addresses.
+(Real code was found for this service — see 'Real code symbols' below, which reflects the actual parsed source. The service's detailed file-by-file documentation is omitted here since it's superseded by that real code; this summary is kept only for the business context code alone doesn't carry.)
+
+### Real code symbols for user
+- `docker/user-db/scripts/card-insert.js:1-3` `docker/user-db/scripts/card-insert.js::get_results` — `function get_results(result)`
+  ```javascript
+function get_results(result) {
+    print(tojson(result));
+}
+  ```
+- `docker/user-db/scripts/address-insert.js:1-3` `docker/user-db/scripts/address-insert.js::get_results` — `function get_results(result)`
+  ```javascript
+function get_results(result) {
+    print(tojson(result));
+}
+  ```
+- `docker/user-db/scripts/customer-insert.js:1-3` `docker/user-db/scripts/customer-insert.js::get_results` — `function get_results(result)`
+  ```javascript
+function get_results(result) {
+    print(tojson(result));
+}
+  ```
+
+---
+## Service: galleryflow
+Domain: Photography SaaS
+Key symbols: GalleryController, constructor, create, list, assetUploadUrl` +33, EventController, constructor, create, list, calendar` +21, AuthController, constructor, isProd, withRefreshCookie, register` +20, AdminSubscriptionController, constructor, listPlans, createPlan, updatePlan` +20, ClientPortalController, constructor, dashboard, events, event` +19, ClientController, constructor, create, list, search` +17, NotificationController, constructor, list, unread, events` +17, PrintCatalogController, constructor, listCategories, createCategory, updateCategory` +17, SuperAdminController, constructor, listStudios, createStudio, suspendStudio` +16, ProofingController, constructor, summary, analytics, selections` +12, PublicGalleryController, constructor, meta, verify, photos` +10, OrderController, constructor, create, list, get` +9, UsageController, constructor, current, quota, byFileType` +8, ClientAuthController, constructor, isProd, withCookie, login` +7, NotificationTemplateController, constructor, list, events, getOne` +7, AdminBillingController, constructor, providers, listTaxRates, createTaxRate` +5, TeamController, constructor, list, roles, activity` +5, TaskController, constructor, create, list, get` +4, AlbumWorkflowController, constructor, create, list, get` +4, BillingController, constructor, getAddress, updateAddress, listInvoices` +3, WatermarkController, constructor, list, create, getDefault` +3, DeliverableController, constructor, create, seedDefaults, list` +3, StudioController, constructor, profile, update, getSettings` +3, GalleryDashboardController, constructor, stats, storage, recentGalleries` +2, EmailSettingsController, constructor, getSettings, saveSettings, sendTest` +2, AdminStudioController, constructor, pending, detail, approve` +2, ReportsController, constructor, catalog, export, summary` +2, SubscriptionController, constructor, current, usageSummary, entitlements` +2, AdminRolesController, constructor, listPermissions, listRoles, createRole` +2, CheckoutController, constructor, config, createOrder, verify` +1, ClientTagController, constructor, list, create, update` +1, CrmDashboardController, constructor, summary, recent, birthdays` +1, CalendarFeedController, constructor, feed, myFeeds, regenerate` +1, EventsDashboardController, constructor, kpis, upcoming, pendingTasks` +1, ClientPortalAdminController, constructor, enable, disable, AdminCrmController, constructor, listClients, analytics, GalleryDownloadController, constructor, download, parsePart, PlatformController, constructor, getSettings, updateSettings, StudioController, constructor, status, resubmit, PlanController, constructor, publicList, list, LeadsController, constructor, create, ProductionDashboardController, constructor, summary, HealthController, check
+
+Summary: GalleryFlow is a multi-tenant SaaS for photography studios, providing features like subscriptions, billing, CRM, event management, and delivery galleries.
+(Real code was found for this service — see 'Real code symbols' below, which reflects the actual parsed source. The service's detailed file-by-file documentation is omitted here since it's superseded by that real code; this summary is kept only for the business context code alone doesn't carry.)
+
+### Real code symbols for galleryflow
+- `apps/api/src/modules/notifications/providers/smtp-email.provider.ts:30-95` `apps/api/src/modules/notifications/providers/smtp-email.provider.ts::SmtpEmailProvider` — `class SmtpEmailProvider implements NotificationProvider`
+  Real EMAIL channel backed by SMTP (nodemailer), configured from the admin UI.
+When SMTP isn't configured it falls back to log-and-succeed so the delivery
+pipeline still runs end-to-end in dev/Docker/smoke without credentials —
+matching the previous log-provider behaviour.
+**This is where a hub template becomes an email.** Templates are authored as plain
+text (a photographer editing `{{galleryTitle}}` copy should not be writing HTML), and
+that text used to be passed straight into the `html` field — so every newline
+collapsed, the studio's client got one run-on paragraph, and the gallery link arrived
+as bare text in the middle of a sentence. `contentFromPlainText` structures it and the
+composer renders it under the sending studio's own name and logo.
+  ```typescript
+class SmtpEmailProvider implements NotificationProvider {
+  readonly channel = NotificationChannel.EMAIL;
+  readonly name = 'smtp';
+  private readonly logger = new Logger('Notify:EMAIL');
+
+  constructor(
+    private readonly mailer: MailerService,
+    private readonly settings: SmtpSettingsService,
+    private readonly email: EmailComposerService,
+    private readonly log: EmailLogService,
+  ) {}
+
+  get configured(): boolean {
+    return this.settings.isConfigured();
+  }
+
+  async send(message: OutboundMessage): Promise<ProviderResult> {
+    if (!this.settings.isConfigured()) {
+      this.logger.debug(
+        `[log] → ${message.toAddress ?? '(none)'} :: ${message.subject ?? message.body.slice(0, 60)}`,
+      );
+      // Record the non-send. This branch short-circuits *before* the mailer, so
+      // without this the delivery log would show a studio's account emails failing
+      // for want of SMTP while its gallery notifications appeared nowhere at all —
+      // the queue reports DELIVERED here on purpose, so the whole lifecycle runs in
+      // dev and smoke, and that fiction must not reach the operator's log.
+      await this.log.record({
+        toAddress: message.toAddress ?? '(no address)',
+        subject: message.subject ?? 'GalleryFlow',
+        kind: EMAIL_KIND.notification(message.eventKey),
+        studioId: message.studioId,
+        status: 'FAILED',
+        error: 'Email (SMTP) is not configured',
+      });
+      return { status: 'DELIVERED', providerMessageId: `log_${message.id}` };
+    }
+    if (!message.toAddress) {
+      return { status: 'FAILED', error: 'No destination address for EMAIL' };
+    }
+    try {
+      const subject = message.subject ?? getEvent(message.eventKey ?? '')?.label ?? 'GalleryFlow';
+      const brand = await this.email.studioBrand(message.studioId);
+      const content = contentFromPlainText(message.body, {
+        // The subject already states what happened; repeating it as the card heading
+        // is the shape every good transactional email has.
+        title: subject,
+        actionLabel: emailActionLabel(message.eventKey),
+      });
+      const { html, text, attachments } = await this.email.compose(content, brand);
+      const { messageId } = await this.mailer.send({
+        to: message.toAddress,
+        subject,
+        html,
+        text,
+        attachments,
+        context: {
+          kind: EMAIL_KIND.notification(message.eventKey),
+          studioId: message.studioId,
+        },
+      });
+      return { status: 'SENT', providerMessageId: messageId };
+    } catch (err) {
+      return { status: 'FAILED', error: (err as Error).message };
+    }
+  }
+}
+  ```
+- `apps/api/src/common/core/entitlement-cache.ts:14-68` `apps/api/src/common/core/entitlement-cache.ts::EntitlementCache` — `class EntitlementCache`
+  A small TTL cache for hot authorization lookups — feature checks and the
+active-subscription resolve run on nearly every protected request, so caching
+them avoids a database round-trip each time.
+This ships as an in-process Map (correct and dependency-free for a single
+node). The public surface (get/set/wrap/invalidate) is intentionally the
+shape of a Redis client, so a production multi-node deployment can drop in a
+Redis-backed implementation behind the same token without touching callers.
+  ```typescript
+class EntitlementCache {
+  private readonly store = new Map<string, { value: unknown; expiresAt: number }>();
+
+  /** Cache key for a studio's resolved entitlements. */
+  static entitlementsKey(studioId: string): string {
+    return `entitlements:${studioId}`;
+  }
+
+  /** Cache key for a studio's active subscription snapshot. */
+  static subscriptionKey(studioId: string): string {
+    return `subscription:${studioId}`;
+  }
+
+  get<T>(key: string): T | undefined {
+    const hit = this.store.get(key);
+    if (!hit) {
+      return undefined;
+    }
+    if (hit.expiresAt <= Date.now()) {
+      this.store.delete(key);
+      return undefined;
+    }
+    return hit.value as T;
+  }
+
+  set<T>(key: string, value: T, ttlMs: number): void {
+    this.store.set(key, { value, expiresAt: Date.now() + ttlMs });
+  }
+
+  /** Read-through cache: return the cached value or compute, store, and return it. */
+  async wrap<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
+    const cached = this.get<T>(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const value = await compute();
+    this.set(key, value, ttlMs);
+    return value;
+  }
+
+  delete(key: string): void {
+    this.store.delete(key);
+  }
+
+  /** Drop every cached entry for a studio (call after any plan/flag change). */
+  invalidateStudio(studioId: string): void {
+    this.delete(EntitlementCache.entitlementsKey(studioId));
+    this.delete(EntitlementCache.subscriptionKey(studioId));
+  }
+
+  /** Drop everything (used when the plan catalog or features change globally). */
+  clear(): void {
+    this.store.clear();
+  }
+}
+  ```
+- `apps/api/src/modules/mail/mailer.service.ts:49-153` `apps/api/src/modules/mail/mailer.service.ts::MailerService` — `class MailerService`
+  Thin nodemailer wrapper. Reads live SMTP config from {@link SmtpSettingsService}
+and reuses one transport, rebuilding it only when the settings revision
+changes. The single send primitive behind the SMTP notification provider, the
+admin test-email button, auth mail and marketing lead notifications.
+Because it is the only way out, it is also where every message is written to the
+{@link EmailLogService} ledger — success and failure alike. Logging in each caller
+instead would be a list someone forgets to extend, and a delivery log missing a
+category is worse than none, because the console presents it as complete.
+  ```typescript
+class MailerService {
+  private readonly logger = new Logger(MailerService.name);
+  private transport: Transporter | null = null;
+  private builtRevision = -1;
+
+  constructor(
+    private readonly settings: SmtpSettingsService,
+    private readonly log: EmailLogService,
+  ) {}
+
+  get available(): boolean {
+    return this.settings.isConfigured();
+  }
+
+  private transporter(): Transporter {
+    if (this.transport && this.builtRevision === this.settings.version) {
+      return this.transport;
+    }
+    const cfg = this.settings.get();
+    this.transport = createTransport({
+      host: cfg.host,
+      port: cfg.port,
+      secure: cfg.secure,
+      auth: cfg.user ? { user: cfg.user, pass: cfg.pass } : undefined,
+    });
+    this.builtRevision = this.settings.version;
+    return this.transport;
+  }
+
+  private fromHeader(): string {
+    const cfg = this.settings.get();
+    return cfg.fromName ? `${cfg.fromName} <${cfg.fromEmail}>` : cfg.fromEmail;
+  }
+
+  /** Verify the connection/credentials without sending (used by the test flow). */
+  async verify(): Promise<void> {
+    if (!this.settings.isConfigured()) {
+      throw new ServiceUnavailableException('Email (SMTP) is not configured');
+    }
+    await this.transporter().verify();
+  }
+
+  async send(input: SendMailInput): Promise<{ messageId: string }> {
+    const kind = input.context?.kind ?? 'unknown';
+    if (!this.settings.isConfigured()) {
+      // Logged, not just thrown. Callers on the auth paths are fire-and-forget and
+      // swallow this, so "the studio never configured SMTP" was invisible to the one
+      // person who could fix it — while users waited for reset links that were never
+      // going to arrive.
+      await this.log.record({
+        toAddress: input.to,
+        subject: input.subject,
+        kind,
+        studioId: input.context?.studioId,
+        status: 'FAILED',
+        error: 'Email (SMTP) is not configured',
+      });
+      throw new ServiceUnavailableException('Email (SMTP) is not configured');
+    }
+    try {
+      const info = await this.transporter().sendMail({
+        from: this.fromHeader(),
+        to: input.to,
+        subject: input.subject,
+        text: input.text,
+        html: input.html,
+        replyTo: input.replyTo,
+        attachments: input.attachments?.map((a) => ({
+          // `false` (not undefined) is what tells nodemailer to emit no `name=` or
+          // `filename=` parameter at all.
+          filename: a.filename ?? false,
+          content: a.content,
+          contentType: a.contentType,
+          cid: a.cid,
+          // Inline, not "1 attachment" in the client's UI — a logo is part of the
+          // message body, and listing it as a download is noise.
+          contentDisposition: a.cid ? 'inline' : 'attachment',
+        })),
+      });
+      this.logger.debug(`Sent "${input.subject}" to ${input.to} (${info.messageId})`);
+      await this.log.record({
+        toAddress: input.to,
+        subject: input.subject,
+        kind,
+        studioId: input.context?.studioId,
+        status: 'SENT',
+        providerMessageId: info.messageId,
+      });
+      return { messageId: info.messageId };
+    } catch (error) {
+      // Record the failure, then rethrow unchanged. Most callers are
+      // fire-and-forget and swallow this — which is exactly why an unsent email
+      // was previously invisible to everyone.
+      await this.log.record({
+        toAddress: input.to,
+        subject: input.subject,
+        kind,
+        studioId: input.context?.studioId,
+        status: 'FAILED',
+        error: (error as Error).message,
+      });
+      throw error;
+    }
+  }
+}
+  ```
+- `apps/api/src/modules/gallery/share-unlock.service.ts:39-89` `apps/api/src/modules/gallery/share-unlock.service.ts::ShareUnlockService` — `class ShareUnlockService`
+  Failed-passcode tally for share links, keyed by **share token + caller IP**.
+A route-level rate limit alone would not defend this. The passcode is accepted
+as a query parameter on the photo, render and download routes as well as on
+`POST :token/verify`, and `/view` legitimately runs once per tile — so it can
+never carry a tight limit. Guessing would simply move to whichever route has
+the loosest one. Counting where the comparison actually happens
+(`PublicGalleryService.assertUnlocked`) covers every route at once, including
+any added later.
+Keyed per IP, not per token: a token-only tally would let one attacker lock a
+gallery for the couple it belongs to, turning a brute-force defence into a
+denial-of-service. The trade is that a caller with many addresses gets many
+budgets — which is what the IP-keyed route limiter is for, and why both exist.
+Entries live in {@link CacheService} for the same reason reset codes do: they
+are short-lived counters, worthless once expired, and a durable table would be
+pure garbage collection. On a multi-instance deployment this needs Redis to be
+shared, exactly like the share-token cache it sits beside.
+  ```typescript
+class ShareUnlockService {
+  private readonly logger = new Logger(ShareUnlockService.name);
+
+  constructor(private readonly cache: CacheService) {}
+
+  private key(token: string, ip?: string): string {
+    // An absent IP shouldn't happen (Express populates `req.ip`, and `main.ts`
+    // trusts one proxy hop so it is the real caller), but bucket it separately
+    // rather than folding it into a shared tally.
+    return `share:unlock:${token}:${ip ?? 'unknown'}`;
+  }
+
+  /** Throw if this caller is in a cooldown from earlier wrong passcodes. */
+  async assertNotLocked(token: string, ip?: string): Promise<void> {
+    const entry = await this.cache.get<UnlockAttempts>(this.key(token, ip));
+    if (entry && entry.blockedUntil > Date.now()) {
+      const minutes = Math.max(1, Math.ceil((entry.blockedUntil - Date.now()) / 60_000));
+      throw new ForbiddenException(
+        `Too many incorrect passcodes. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+      );
+    }
+  }
+
+  /** Count a wrong passcode, starting a cooldown once the allowance is spent. */
+  async recordFailure(token: string, ip?: string): Promise<void> {
+    const cacheKey = this.key(token, ip);
+    const entry = await this.cache.get<UnlockAttempts>(cacheKey);
+    const failures = (entry?.failures ?? 0) + 1;
+    if (failures >= SHARE_UNLOCK_MAX_FAILURES) {
+      this.logger.warn(
+        `share ${token.slice(0, 8)}… locked for ${ip ?? 'unknown ip'} after ${failures} wrong passcodes`,
+      );
+      await this.cache.set<UnlockAttempts>(
+        cacheKey,
+        { failures, blockedUntil: Date.now() + SHARE_UNLOCK_COOLDOWN_MS },
+        SHARE_UNLOCK_COOLDOWN_MS,
+      );
+      return;
+    }
+    await this.cache.set<UnlockAttempts>(
+      cacheKey,
+      { failures, blockedUntil: 0 },
+      SHARE_UNLOCK_WINDOW_MS,
+    );
+  }
+
+  /** Clear the tally — the caller proved they know the passcode. */
+  async recordSuccess(token: string, ip?: string): Promise<void> {
+    await this.cache.del(this.key(token, ip));
+  }
+}
+  ```
+- `apps/api/src/modules/gallery/display-image.service.ts:116-475` `apps/api/src/modules/gallery/display-image.service.ts::DisplayImageService` — `class DisplayImageService`
+  Renders viewer-safe copies of a photo: downsized, re-encoded, EXIF-stripped
+and — when the gallery has a watermark template — watermarked **in the pixels**.
+This service exists so that no viewer-facing surface ever needs a URL that
+resolves to an original. Callers hand it a photo row and get bytes back; the
+original's object key never leaves the API.
+## Failing closed
+Every path that cannot produce a safe copy degrades to the tiny blurred
+`blurDataUrl` placeholder — never to the original bytes. That covers a missing
+`sharp` binary, unconfigured storage, an unfetchable object and a decode
+failure. A blurry gallery is a visible, reportable problem; silently serving
+originals is not, which is exactly why the previous fallback-to-original
+behaviour went unnoticed.
+  ```typescript
+class DisplayImageService {
+  private readonly logger = new Logger(DisplayImageService.name);
+  /** Cached `sharp` factory: `undefined` = not yet tried, `null` = unavailable. */
+  private sharpFactory?: SharpFactory | null;
+  /** Rendered display copies, keyed by photo + size + watermark fingerprint. */
+  private readonly renders = new Map<string, RenderedImage>();
+  private renderBytes = 0;
+  /** Fetched source bytes, keyed by photo + size. Viewer-independent. */
+  private readonly sources = new Map<string, Buffer>();
+  private sourceBytes = 0;
+  /** Watermark overlay images, inlined and measured, keyed by their source URL. */
+  private readonly watermarkImages = new Map<string, WatermarkImage | null>();
+
+  constructor(private readonly storage: StorageService) {}
+
+  /**
+   * Produce a display copy of `photo` at `size`, with `watermark` baked in.
+   *
+   * Results are memoised per (photo, size, watermark) so a gallery of 500 photos
+   * costs one render each rather than one per viewer per scroll.
+   */
+  async render(
+    photo: RenderablePhoto,
+    size: DisplaySize,
+    watermark: WatermarkSpec | null,
+  ): Promise<RenderedImage> {
+    const cacheKey = `${photo.id}:${size}:${watermarkFingerprint(watermark)}`;
+    const hit = this.renders.get(cacheKey);
+    if (hit) {
+      return hit;
+    }
+    const rendered = await this.compose(photo, size, watermark);
+    // Only cache real renders — a degraded placeholder should be retried once the
+    // underlying cause (missing binary, unreachable bucket) is fixed.
+    if (!rendered.degraded) {
+      this.remember(cacheKey, rendered);
+    }
+    return rendered;
+  }
+
+  /**
+   * Fetch and cache a photo's source bytes for a tier without producing a render.
+   *
+   * This is the half of the work that is the *same for every viewer*, and it is
+   * the expensive half: the object-store round trip. Warming it after upload
+   * makes the first client's page load fast even when the watermark is
+   * per-viewer (`{email}`/`{datetime}`), which the render cache cannot help with
+   * because its key includes the mark's fingerprint.
+   *
+   * **Only warms a photo that already has a derivative.** Without one,
+   * `sourceKey` falls back to the full-size original — 10–100× the bytes of a
+   * thumb derivative — so warming a large not-yet-processed gallery would pull
+   * gigabytes past a 128MB budget, evicting the entries a viewer is actually
+   * scrolling through and leaving the cache worse than untouched. The derivative
+   * lands within seconds and warming re-runs then, so skipping here costs
+   * nothing but a brief cold window.
+   *
+   * Best-effort and silent otherwise: a failure just means the request path
+   * fetches as it always did.
+   */
+  async prewarmSource(photo: RenderablePhoto, size: DisplaySize): Promise<boolean> {
+    if (this.sourceKey(photo, size) === photo.storageKey) {
+      return false;
+    }
+    try {
+      return (await this.sourceFor(photo, size)) !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Drop every cached render *and* source of one photo (its pixels or mark changed). */
+  invalidate(photoId: string): void {
+    for (const key of [...this.renders.keys()]) {
+      if (key.startsWith(`${photoId}:`)) {
+        const entry = this.renders.get(key);
+        if (entry) {
+          this.renderBytes -= entry.buffer.byteLength;
+        }
+        this.renders.delete(key);
+      }
+    }
+    for (const key of [...this.sources.keys()]) {
+      if (key.startsWith(`${photoId}:`)) {
+        const buffer = this.sources.get(key);
+        if (buffer) {
+          this.sourceBytes -= buffer.byteLength;
+        }
+        this.sources.delete(key);
+      }
+    }
+  }
+
+  /**
+   * The source bytes for a tier, from cache when possible.
+   *
+   * Caching the *fetched original/derivative* rather than a decoded bitmap keeps
+   * the render a single `sharp` pipeline — decoding to raw and re-encoding later
+   * would add a lossy round trip, and a raw preview bitmap is ~5MB against
+   * ~100KB for the encoded source.
+   */
+  private async sourceFor(photo: RenderablePhoto, size: DisplaySize): Promise<Buffer | null> {
+    const cacheKey = `${photo.id}:${size}`;
+    const hit = this.sources.get(cacheKey);
+    if (hit) {
+      return hit;
+    }
+    // Server-minted key, except for seeded demo photos which are external URLs.
+    const object = await this.storage.fetchObject(this.sourceKey(photo, size), {
+      allowAbsolute: true,
+    });
+    if (!object || object.buffer.byteLength === 0) {
+      return null;
+    }
+    this.sources.set(cacheKey, object.buffer);
+    this.sourceBytes += object.buffer.byteLength;
+    while (this.sourceBytes > SOURCE_CACHE_MAX_BYTES && this.sources.size > 1) {
+      const oldest = this.sources.keys().next().value;
+      if (oldest === undefined) break;
+      const evicted = this.sources.get(oldest);
+      this.sources.delete(oldest);
+      if (evicted) {
+        this.sourceBytes -= evicted.byteLength;
+      }
+    }
+    return object.buffer;
+  }
+
+  /**
+   * Which object key to read pixels from for a given tier.
+   *
+   * Prefers an already-generated derivative — it is smaller, so decoding is
+   * cheaper — and falls back to the original *as a render source only*. The
+   * original's key is read here and never returned to a caller.
+   */
+  private sourceKey(photo: RenderablePhoto, size: DisplaySize): string {
+    const derived =
+      size === 'thumb'
+        ? (thumbnailKey(photo.variants) ?? previewKey(photo.variants))
+        : previewKey(photo.variants);
+    return derived ?? photo.storageKey;
+  }
+
+  private async compose(
+    photo: RenderablePhoto,
+    size: DisplaySize,
+    watermark: WatermarkSpec | null,
+  ): Promise<RenderedImage> {
+    const sharp = await this.loadSharp();
+    if (!sharp) {
+      return this.degrade(photo, 'sharp is unavailable');
+    }
+    // Everything below is inside the try: a render must degrade, never throw, so
+    // one unreachable object can't take a whole gallery down.
+    try {
+      // Cached across viewers: the fetch, not the pixels, is what costs.
+      const source = await this.sourceFor(photo, size);
+      if (!source) {
+        return this.degrade(photo, 'source bytes are unavailable');
+      }
+
+      const target = DISPLAY_LONG_EDGE[size];
+      const { width, height } = await this.fittedSize(sharp, source, target);
+
+      // `.rotate()` bakes EXIF orientation before metadata is dropped, so the copy
+      // is upright even though it carries no orientation tag. Resize, composite
+      // and encode in one pipeline — laying the mark on an already-encoded JPEG
+      // would cost a second lossy round-trip on every photo.
+      const pipeline = sharp(source, { failOn: 'none' })
+        .rotate()
+        .resize({ width: target, height: target, fit: 'inside', withoutEnlargement: true });
+
+      const overlay = await this.overlayFor(watermark, width, height, size);
+      if (overlay) {
+        pipeline.composite([{ input: Buffer.from(overlay), top: 0, left: 0 }]);
+      }
+      const buffer = await pipeline.jpeg({ quality: DISPLAY_QUALITY, mozjpeg: true }).toBuffer();
+      return { buffer, contentType: 'image/jpeg', degraded: false };
+    } catch (error) {
+      // A watermark that fails to rasterise (missing fontconfig, malformed
+      // template) must not hand back the original — degrade instead.
+      return this.degrade(photo, `render failed: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * The dimensions the resize will actually produce, derived from the source's
+   * metadata rather than by encoding twice.
+   *
+   * Deliberately floors: `sharp` rounds, and `floor <= round`, so the overlay is
+   * never *larger* than the image it composites onto — which `sharp` rejects
+   * outright. A sub-pixel difference in mark placement is invisible; a thrown
+   * composite would cost the watermark entirely.
+   */
+  private async fittedSize(
+    sharp: SharpFactory,
+    input: Buffer,
+    target: number,
+  ): Promise<{ width: number; height: number }> {
+    const meta = await sharp(input).metadata();
+    // EXIF orientations 5–8 are the quarter-turns; `.rotate()` will swap the axes,
+    // so the post-rotation extent is what the mark must be laid out against.
+    const turned = (meta.orientation ?? 1) >= 5;
+    const width = (turned ? meta.height : meta.width) ?? 0;
+    const height = (turned ? meta.width : meta.height) ?? 0;
+    if (width <= 0 || height <= 0) {
+      throw new Error('source has no readable dimensions');
+    }
+    const scale = Math.min(1, target / Math.max(width, height));
+    return {
+      width: Math.max(1, Math.floor(width * scale)),
+      height: Math.max(1, Math.floor(height * scale)),
+    };
+  }
+
+  /** The SVG overlay bytes for a spec at a given size, or null when there is none. */
+  private async overlayFor(
+    watermark: WatermarkSpec | null,
+    width: number,
+    height: number,
+    size: DisplaySize,
+  ): Promise<string | null> {
+    if (!watermark?.enabled) {
+      return null;
+    }
+    const image = watermark.imageUrl ? await this.watermarkImage(watermark.imageUrl) : null;
+    return buildWatermarkSvg(watermark, width, height, {
+      image,
+      // Thumbnails are shown in square tiles with `object-cover`, so a mark in the
+      // true corner is cropped off screen — visible in the bytes, invisible to the
+      // viewer it is meant to deter.
+      cropSafe: size === 'thumb',
+    });
+  }
+
+  /**
+   * Fetch a watermark overlay image once and hold it inlined and measured.
+   *
+   * librsvg will not resolve remote `href`s, so the image has to be inlined — and
+   * it has to be *measured*, because an `<image>` without an explicit height is
+   * drawn at its intrinsic size, which ignores the studio's `scale` entirely. A
+   * studio has a handful of templates at most, so a small map is plenty.
+   */
+  private async watermarkImage(url: string): Promise<WatermarkImage | null> {
+    if (this.watermarkImages.has(url)) {
+      return this.watermarkImages.get(url) ?? null;
+    }
+    const image = await this.loadWatermarkImage(url);
+    if (this.watermarkImages.size >= WATERMARK_IMAGE_CACHE_MAX) {
+      const oldest = this.watermarkImages.keys().next().value;
+      if (oldest !== undefined) {
+        this.watermarkImages.delete(oldest);
+      }
+    }
+    this.watermarkImages.set(url, image);
+    return image;
+  }
+
+  /** Read a logo's bytes and aspect ratio, or null if either is unavailable. */
+  private async loadWatermarkImage(url: string): Promise<WatermarkImage | null> {
+    const sharp = await this.loadSharp();
+    if (!sharp) {
+      return null;
+    }
+    try {
+      const object = await this.storage.fetchObject(url);
+      if (!object || object.buffer.byteLength === 0) {
+        return null;
+      }
+      const meta = await sharp(object.buffer).metadata();
+      if (!meta.width || !meta.height) {
+        return null;
+      }
+      // The mime comes from what `sharp` actually decoded, never from the response
+      // header — that string is interpolated into SVG markup, and a remote server
+      // does not get to choose what goes into our document. An unsupported format
+      // drops the image half of the mark rather than declaring a mime we'd be
+      // guessing at.
+      const mime = IMAGE_MIME[meta.format ?? ''];
+      if (!mime) {
+        return null;
+      }
+      return {
+        uri: `data:${mime};base64,${object.buffer.toString('base64')}`,
+        aspect: meta.width / meta.height,
+      };
+    } catch (error) {
+      // An unreadable logo costs the image half of the mark, not the whole render:
+      // the text half still composites and the photo still fails closed.
+      this.logger.warn(`watermark image ${url} is unusable: ${(error as Error).message}`);
+      return null;
+    }
+  }
+
+  /**
+   * The fail-closed response: something safe and visibly not the photograph.
+   *
+   * Prefers the photo's own `blurDataUrl` — a handful of pixels generated
+   * client-side at upload, conveying colour and nothing else. Failing that it
+   * serves {@link PLACEHOLDER_SVG}.
+   *
+   * This must never throw. It used to raise a 503 when `blurDataUrl` was absent,
+   * which is the case for every photo predating LQIP capture (half the seeded
+   * demo set) — so one transient fetch failure turned a gallery into a wall of
+   * broken images with no indication of why. Degrading is the whole point; it has
+   * to degrade for *every* photo, not just recently uploaded ones.
+   */
+  private degrade(photo: RenderablePhoto, reason: string): RenderedImage {
+    this.logger.warn(`photo ${photo.id}: serving placeholder — ${reason}`);
+    const decoded = decodeDataUri(photo.blurDataUrl);
+    if (decoded) {
+      return { ...decoded, degraded: true };
+    }
+    return {
+      buffer: Buffer.from(PLACEHOLDER_SVG, 'utf8'),
+      // An SVG needs no image encoder, so this path stays available even when
+      // `sharp` is the thing that failed — and it scales to any tile size.
+      contentType: 'image/svg+xml',
+      degraded: true,
+    };
+  }
+
+  /** Insert a render, evicting oldest-first to stay inside the byte budget. */
+  private remember(key: string, rendered: RenderedImage): void {
+    this.renders.set(key, rendered);
+    this.renderBytes += rendered.buffer.byteLength;
+    while (this.renderBytes > RENDER_CACHE_MAX_BYTES && this.renders.size > 1) {
+      const oldest = this.renders.keys().next().value;
+      if (oldest === undefined) break;
+      const entry = this.renders.get(oldest);
+      this.renders.delete(oldest);
+      if (entry) {
+        this.renderBytes -= entry.buffer.byteLength;
+      }
+    }
+  }
+
+  /**
+   * Resolve the `sharp` factory once, defensively — mirroring
+   * `PhotoProcessingService`. Unlike there, an unavailable binary here does not
+   * mean "leave the original serving": it means every display request degrades to
+   * a placeholder, which is loud enough to get noticed.
+   */
+  private async loadSharp(): Promise<SharpFactory | null> {
+    if (this.sharpFactory !== undefined) {
+      return this.sharpFactory;
+    }
+    try {
+      const mod = await import('sharp');
+      this.sharpFactory = mod.default ?? (mod as unknown as SharpFactory);
+    } catch (error) {
+      this.logger.error(
+        `sharp is unavailable — protected image rendering is disabled, galleries will ` +
+          `show placeholders: ${(error as Error).message}`,
+      );
+      this.sharpFactory = null;
+    }
+    return this.sharpFactory;
+  }
+}
+  ```
+- `apps/app/components/admin-email-log.tsx:112-340` `apps/app/components/admin-email-log.tsx::AdminEmailLog` — `function AdminEmailLog()`
+  Platform-wide record of every email the system has sent.
+Deliberately not per-studio: the questions this answers ("did the reset link go
+out?", "is SMTP broken?") span tenants, and the account emails people ask about
+most — verification, resets, invitations — belong to no studio at all.
+  ```tsx
+function AdminEmailLog()
+}
+  ```
+- `apps/api/src/modules/mail/email-log.service.ts:145-206` `apps/api/src/modules/mail/email-log.service.ts::EmailLogService.stats` — `async stats(query: EmailLogQuery = {}): Promise<EmailLogStats>`
+  Headline counts for the console, over the same filters as the listing.
+  ```typescript
+async stats(query: EmailLogQuery = {}): Promise<EmailLogStats>
+{
+    const where = this.where(query);
+    const now = Date.now();
+    const since24h = new Date(now - 24 * 3600_000);
+    const since7d = new Date(now - 7 * 24 * 3600_000);
+    const failed = { status: MessageStatus.FAILED };
+  ```
+- `apps/app/app/(admin)/admin/email/page.tsx:28-279` `apps/app/app/(admin)/admin/email/page.tsx::AdminEmailPage` — `function AdminEmailPage()`
+  ```tsx
+function AdminEmailPage()
+}
+  ```
+- `apps/app/app/verify-email/page.tsx:14-112` `apps/app/app/verify-email/page.tsx::VerifyEmail` — `function VerifyEmail()`
+  ```tsx
+function VerifyEmail()
+}
+  ```
+- `apps/api/src/modules/notifications/providers/smtp-email.provider.ts:46-94` `apps/api/src/modules/notifications/providers/smtp-email.provider.ts::SmtpEmailProvider.send` — `async send(message: OutboundMessage): Promise<ProviderResult>`
+  ```typescript
+async send(message: OutboundMessage): Promise<ProviderResult>
+try {
+      const subject = message.subject ?? getEvent(message.eventKey ?? '')?.label ?? 'GalleryFlow';
+      const brand = await this.email.studioBrand(message.studioId);
+      const content = contentFromPlainText(message.body, {
+        // The subject already states what happened; repeating it as the card heading
+        // is the shape every good transactional email has.
+        title: subject,
+        actionLabel: emailActionLabel(message.eventKey),
+      });
+      const { html, text, attachments } = await this.email.compose(content, brand);
+      const { messageId } = await this.mailer.send({
+        to: message.toAddress,
+        subject,
+        html,
+        text,
+        attachments,
+        context: {
+          kind: EMAIL_KIND.notification(message.eventKey),
+          studioId: message.studioId,
+        },
+      });
+      return { status: 'SENT', providerMessageId: messageId };
+    } catch (err) {
+      return { status: 'FAILED', error: (err as Error).message };
+    }
+  ```

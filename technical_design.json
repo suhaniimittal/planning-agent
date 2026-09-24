@@ -1,0 +1,138 @@
+{
+  "title": "TDD for Logging Sent Email Subject Lines",
+  "generated_at": "2026-09-24T07:27:06.772564+00:00",
+  "issue_summary": "Sent emails' subject line is not getting logged in the database.",
+  "functional_requirements": [
+    "The system must log the subject line of every email sent into the database."
+  ],
+  "non_functional_requirements": [],
+  "current_architecture": "Currently, the Orders service handles the creation and processing of orders, while Shipping is responsible for shipment. However, there is no mention of logging email subject lines, which is the cause of the discrepancy reported.",
+  "current_architecture_components": [
+    {
+      "name": "orders",
+      "depends_on": [
+        "shipping"
+      ]
+    },
+    {
+      "name": "shipping",
+      "depends_on": []
+    }
+  ],
+  "current_flow_steps": [
+    {
+      "step": "Process order",
+      "detail": null
+    },
+    {
+      "step": "Send email",
+      "detail": null
+    }
+  ],
+  "root_cause_analysis": "The root cause of the issue lies in the missing functionality to log the subject line of emails sent. While the SMTPEmailProvider class in the galleryflow service handles email composition and sending, it logs email information (including status) using EmailLogService, which does not explicitly capture the subject line separately.",
+  "proposed_solution": "Modify the SmtpEmailProvider class within the galleryflow service to ensure that the subject line is explicitly logged using the EmailLogService whenever an email is sent.",
+  "proposed_architecture": "The proposed architecture will be the same as the current system, but with additional logging added for tracking email subject lines in the galleryflow service.",
+  "proposed_architecture_components": [
+    {
+      "name": "orders",
+      "depends_on": [
+        "shipping"
+      ]
+    },
+    {
+      "name": "shipping",
+      "depends_on": []
+    },
+    {
+      "name": "galleryflow",
+      "depends_on": []
+    }
+  ],
+  "proposed_flow_steps": [
+    {
+      "step": "Process order",
+      "detail": null
+    },
+    {
+      "step": "Send email",
+      "detail": "Log email subject line in addition to sending email."
+    }
+  ],
+  "sequence_steps": [
+    {
+      "from_participant": "SmtpEmailProvider",
+      "to_participant": "EmailLogService",
+      "action": "Log email subject line",
+      "direction": "call"
+    }
+  ],
+  "services": [
+    {
+      "service": "galleryflow",
+      "changes": [
+        {
+          "file_path": "apps/api/src/modules/notifications/providers/smtp-email.provider.ts",
+          "function_or_symbol": "send",
+          "current_behavior": "Logs email sending events without explicitly logging the subject line.",
+          "change_description": "Modify to include explicit logging of the email subject line using EmailLogService.",
+          "implementation_notes": "Within the send method, ensure subject line is included in the logging call to EmailLogService.",
+          "pseudocode_sketch": "try {\n  ...\n  await this.log.record({\n    toAddress: message.toAddress,\n    subject: message.subject,\n    kind: EMAIL_KIND.notification(message.eventKey),\n    studioId: message.studioId,\n    status: 'SENT',\n    providerMessageId: messageId\n  });\n  ...\n}",
+          "acceptance_criteria": [
+            "The subject line of every email sent must be logged in the email log.",
+            "The log entry must include both the subject line and the status of the email."
+          ],
+          "reasoning": "Logging the subject line is crucial for tracking and debugging sent emails and ensures that the system provides a comprehensive audit trail.",
+          "change_type": "modify",
+          "has_real_source": true
+        }
+      ],
+      "complexity": "medium",
+      "responsibility_change": "The responsibility of the galleryflow service is expanded to ensure email subject lines are logged when emails are sent.",
+      "affected_data_model": "EmailLog",
+      "api_changes": [],
+      "reasoning": "Modifying the galleryflow service ensures that the system logs the subject line of emails as required, without impacting existing functionality elsewhere."
+    }
+  ],
+  "service_dependencies": [
+    {
+      "source": "orders",
+      "target": "shipping"
+    }
+  ],
+  "communication_notes": [],
+  "error_handling_notes": "The system should handle situations where the email logging fails due to database unavailability, ensuring no failure affects email sending.",
+  "security_considerations": "Ensure that any logged information respects privacy policies, specifically not logging sensitive information inadvertently.",
+  "backward_compatibility_notes": "No backward compatibility issues expected as existing logging functionality is being enhanced, not removed.",
+  "testing_notes": null,
+  "testing_plan": [
+    {
+      "category": "unit",
+      "scenario": "Log entry created with email subject line on successful email send.",
+      "expected_result": "Email log should contain an entry with the subject line."
+    },
+    {
+      "category": "integration",
+      "scenario": "Test sending an email and verify log entries.",
+      "expected_result": "Log entries should contain the sent email's subject line."
+    },
+    {
+      "category": "edge_case",
+      "scenario": "Email sent without a subject line.",
+      "expected_result": "Log entry should still be created with 'unknown' or default subject."
+    }
+  ],
+  "implementation_plan": [
+    "Identify where emails are logged from SMTPEmailProvider.",
+    "Modify the logging call to ensure the subject line is included.",
+    "Write unit tests to verify that the log now includes subject lines.",
+    "Deploy changed service and run integration tests to confirm proper logging."
+  ],
+  "risks": [
+    "Potential for logs to grow significantly in size if the email volume is high, leading to database performance issues."
+  ],
+  "open_questions": [
+    "Is there a retention policy for these logs? How do we manage disk space over time?",
+    "Is there a standardized format for logs that we must follow?"
+  ],
+  "overall_reasoning": "Adding logging for the email subject line allows for better tracking and troubleshooting of sent emails. This change is necessary to provide comprehensive logs that include key details of each email transaction, ensuring transparency and facilitating easier debugging of email-related issues."
+}

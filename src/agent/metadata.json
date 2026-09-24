@@ -1,0 +1,16 @@
+{
+    "name": "planning_agent",
+    "version": "1.0.0",
+    "description": "Turns a requirement or bug report into a technical design doc.",
+    "config": {
+        "triggers": [
+            {
+              "name": "issue_text",
+              "type": "str",
+              "required": true,
+              "description": "Plain-text requirement or bug report",
+              "friendly_name": "Issue"
+            }
+        ]
+    }
+}

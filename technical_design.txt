@@ -1,0 +1,230 @@
+TECHNICAL DESIGN DOCUMENT
+TDD for Logging Sent Email Subject Lines
+Generated: 2026-09-24T07:27:06.772564+00:00
+
+############################################################
+
+
+2. ISSUE SUMMARY
+================
+
+Sent emails' subject line is not getting logged in the database.
+
+
+3. REQUIREMENTS
+===============
+
+Functional Requirements:
+- The system must log the subject line of every email sent into the database.
+
+Non-Functional Requirements:
+Not specified.
+
+
+4. CURRENT SYSTEM / ARCHITECTURE
+================================
+
+Currently, the Orders service handles the creation and processing of orders, while Shipping is responsible for shipment. However, there is no mention of logging email subject lines, which is the cause of the discrepancy reported.
+
+Diagram:
+[orders]
+   --> [shipping]
+
+[shipping]
+   (no further dependencies)
+
+
+5. CURRENT FLOW
+===============
+
+1. Process order
+2. Send email
+
+Flow:
+Process order
+   |
+   v
+Send email
+
+
+6. ROOT CAUSE / PROBLEM ANALYSIS
+================================
+
+The root cause of the issue lies in the missing functionality to log the subject line of emails sent. While the SMTPEmailProvider class in the galleryflow service handles email composition and sending, it logs email information (including status) using EmailLogService, which does not explicitly capture the subject line separately.
+
+
+7. PROPOSED SOLUTION
+====================
+
+Modify the SmtpEmailProvider class within the galleryflow service to ensure that the subject line is explicitly logged using the EmailLogService whenever an email is sent.
+
+
+8. PROPOSED ARCHITECTURE
+========================
+
+The proposed architecture will be the same as the current system, but with additional logging added for tracking email subject lines in the galleryflow service.
+
+Diagram:
+[orders]
+   --> [shipping]
+
+[shipping]
+   (no further dependencies)
+
+[galleryflow]
+   (no further dependencies)
+
+
+9. PROPOSED FLOW
+================
+
+1. Process order
+2. Send email
+   Log email subject line in addition to sending email.
+
+Flow:
+Process order
+   |
+   v
+Send email
+
+
+10. SEQUENCE / INTERACTION FLOW
+===============================
+
+SmtpEmailProvider --- Log email subject line --> EmailLogService
+
+
+11. AFFECTED SERVICES
+=====================
+
+Service: galleryflow
+Complexity: medium
+Responsibility change: The responsibility of the galleryflow service is expanded to ensure email subject lines are logged when emails are sent.
+Reason: Modifying the galleryflow service ensures that the system logs the subject line of emails as required, without impacting existing functionality elsewhere.
+Affected data model: EmailLog
+
+
+12. AFFECTED FILES, CLASSES & FUNCTIONS
+=======================================
+
+[galleryflow]
+Symbol: send
+File: apps/api/src/modules/notifications/providers/smtp-email.provider.ts
+Change type: modify
+Current behavior: Logs email sending events without explicitly logging the subject line.
+Change: Modify to include explicit logging of the email subject line using EmailLogService.
+Reason: Logging the subject line is crucial for tracking and debugging sent emails and ensures that the system provides a comprehensive audit trail.
+Implementation: Within the send method, ensure subject line is included in the logging call to EmailLogService.
+Pseudocode (grounded in real source):
+  try {
+    ...
+    await this.log.record({
+      toAddress: message.toAddress,
+      subject: message.subject,
+      kind: EMAIL_KIND.notification(message.eventKey),
+      studioId: message.studioId,
+      status: 'SENT',
+      providerMessageId: messageId
+    });
+    ...
+  }
+Acceptance criteria:
+  - The subject line of every email sent must be logged in the email log.
+  - The log entry must include both the subject line and the status of the email.
+
+
+13. API CHANGES
+===============
+
+No API changes identified from the available documentation.
+
+
+14. DATA MODEL / DATABASE CHANGES
+=================================
+
+galleryflow: EmailLog
+
+
+15. INTER-SERVICE COMMUNICATION
+===============================
+
+Real service-to-service dependencies (from the graph):
+- orders -> shipping
+
+
+16. ERROR HANDLING & EDGE CASES
+===============================
+
+The system should handle situations where the email logging fails due to database unavailability, ensuring no failure affects email sending.
+
+
+17. SECURITY CONSIDERATIONS
+===========================
+
+Ensure that any logged information respects privacy policies, specifically not logging sensitive information inadvertently.
+
+
+18. BACKWARD COMPATIBILITY
+==========================
+
+No backward compatibility issues expected as existing logging functionality is being enhanced, not removed.
+
+
+19. TESTING STRATEGY
+====================
+
+Category     Scenario                                                             Expected Result                                                     
+-----------  -------------------------------------------------------------------  --------------------------------------------------------------------
+unit         Log entry created with email subject line on successful email send.  Email log should contain an entry with the subject line.            
+integration  Test sending an email and verify log entries.                        Log entries should contain the sent email's subject line.           
+edge_case    Email sent without a subject line.                                   Log entry should still be created with 'unknown' or default subject.
+
+
+20. IMPLEMENTATION PLAN
+=======================
+
+1. Identify where emails are logged from SMTPEmailProvider.
+2. Modify the logging call to ensure the subject line is included.
+3. Write unit tests to verify that the log now includes subject lines.
+4. Deploy changed service and run integration tests to confirm proper logging.
+
+
+21. RISKS
+=========
+
+- Potential for logs to grow significantly in size if the email volume is high, leading to database performance issues.
+
+
+22. OPEN QUESTIONS
+==================
+
+- Is there a retention policy for these logs? How do we manage disk space over time?
+- Is there a standardized format for logs that we must follow?
+
+
+23. CHANGE SUMMARY
+==================
+
+Service      File                                                                 Symbol  Change Type  Complexity
+-----------  -------------------------------------------------------------------  ------  -----------  ----------
+galleryflow  apps/api/src/modules/notifications/providers/smtp-email.provider.ts  send    modify       medium
+
+
+24. FILES TO CREATE / MODIFY / DELETE
+=====================================
+
+Files to Create:
+None identified.
+
+Files to Modify:
+- apps/api/src/modules/notifications/providers/smtp-email.provider.ts
+
+Files to Delete:
+None identified.
+
+
+25. OVERALL REASONING
+=====================
+
+Adding logging for the email subject line allows for better tracking and troubleshooting of sent emails. This change is necessary to provide comprehensive logs that include key details of each email transaction, ensuring transparency and facilitating easier debugging of email-related issues.
