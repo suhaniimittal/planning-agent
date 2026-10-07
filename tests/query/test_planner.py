@@ -2,7 +2,34 @@ import json
 
 import pytest
 
-from src.query.planner import TddParseError, build_system_prompt, build_user_prompt, parse_tdd
+from src.query.planner import TddParseError, _strip_schema_titles, build_system_prompt, build_user_prompt, parse_tdd
+
+
+def test_build_system_prompt_does_not_leak_schema_class_name_as_title_value():
+    """Regression test: model_json_schema() puts the class's own cosmetic
+    "title": "TechnicalDesignDoc" right next to the TDD's actual `title`
+    FIELD's schema (which also carries a cosmetic "title": "Title") — a
+    real, observed failure mode where the model echoed the schema's class
+    name back as the TDD's title verbatim instead of writing a real one."""
+    prompt = build_system_prompt()
+    assert '"TechnicalDesignDoc"' not in prompt
+
+
+def test_strip_schema_titles_keeps_the_real_title_field_but_drops_metadata():
+    schema = {
+        "title": "TechnicalDesignDoc",  # cosmetic class-name metadata — must be dropped
+        "type": "object",
+        "properties": {
+            "title": {"title": "Title", "type": "string", "description": "keep me"},  # real field — must survive
+        },
+        "required": ["title"],
+    }
+    stripped = _strip_schema_titles(schema)
+
+    assert "title" not in stripped  # cosmetic top-level metadata gone
+    assert "title" in stripped["properties"]  # the real field itself survives
+    assert stripped["properties"]["title"] == {"type": "string", "description": "keep me"}
+    assert stripped["required"] == ["title"]  # untouched — it's a list, not a schema node
 
 
 def test_build_system_prompt_contains_schema_field_names():
@@ -60,20 +87,8 @@ def test_build_system_prompt_instructs_llm_to_leave_service_dependencies_empty()
 
 def test_build_user_prompt_includes_issue_text_and_all_candidate_docs():
     docs = [
-        {
-            "name": "orders",
-            "summary": "Handles order creation and lookup.",
-            "full_doc": "orders full doc text",
-            "key_symbols": ["newOrder"],
-            "domain": "E-commerce",
-        },
-        {
-            "name": "shipping",
-            "summary": "Handles shipment scheduling.",
-            "full_doc": "shipping full doc text",
-            "key_symbols": [],
-            "domain": "Shipping",
-        },
+        {"name": "orders", "summary": "Handles order creation and lookup."},
+        {"name": "shipping", "summary": "Handles shipment scheduling."},
     ]
     prompt = build_user_prompt("shipping estimates are wrong", docs)
     assert "shipping estimates are wrong" in prompt
@@ -83,39 +98,18 @@ def test_build_user_prompt_includes_issue_text_and_all_candidate_docs():
     assert "## Service: shipping" in prompt
 
 
-def test_build_user_prompt_gives_seed_services_summary_not_full_doc_by_default():
-    """A seed with no code_symbols passed at all (the common case for any
-    caller that hasn't run selection yet) gets the same summary-only
-    treatment as a seed with no MATCHED code — full_doc is never the
-    default for a seed anymore, matched code or not."""
-    docs = [
-        {
-            "name": "orders",
-            "summary": "Handles order creation and lookup.",
-            "full_doc": "orders full doc text",
-            "key_symbols": [],
-            "domain": "E-commerce",
-        }
-    ]
+def test_build_user_prompt_seed_with_no_code_gets_summary_only():
+    docs = [{"name": "orders", "summary": "Handles order creation and lookup."}]
     prompt = build_user_prompt("issue", docs, seed_names={"orders"})
     assert "Handles order creation and lookup." in prompt
-    assert "orders full doc text" not in prompt
-    assert "Full documentation:" not in prompt
+    assert "matched at the summary level only" in prompt.lower()
 
 
-def test_build_user_prompt_uses_summary_not_full_doc_when_seed_has_real_code():
-    """Once real code symbols exist for a seed service, the detailed
-    file-by-file full_doc is superseded by it — only the short business-
-    context summary is still worth including alongside the real code."""
-    docs = [
-        {
-            "name": "orders",
-            "summary": "Handles order creation and lookup.",
-            "full_doc": "orders full doc text " * 200,  # simulate a large doc
-            "key_symbols": [],
-            "domain": "E-commerce",
-        }
-    ]
+def test_build_user_prompt_notes_when_seed_has_real_code():
+    """Once real code symbols exist for a seed service, the summary is kept
+    only for business context — the note should say so, and never claim any
+    'full documentation' concept (there isn't one anymore)."""
+    docs = [{"name": "orders", "summary": "Handles order creation and lookup."}]
     code_symbols = {
         "orders": [
             {
@@ -132,34 +126,8 @@ def test_build_user_prompt_uses_summary_not_full_doc_when_seed_has_real_code():
     }
     prompt = build_user_prompt("issue", docs, code_symbols, {}, seed_names={"orders"})
     assert "Handles order creation and lookup." in prompt
-    assert "orders full doc text" not in prompt
-    assert "Full documentation:" not in prompt
-    assert "superseded" in prompt.lower()
-
-
-def test_build_user_prompt_seed_without_matched_code_gets_summary_not_full_doc():
-    """Regression test: a seed only means "scored in the top-k service
-    search" — that can be a weak, coincidental match, especially when
-    several services' summary embeddings score close together on a small
-    graph. Rewarding an unconfirmed seed with its entire full_doc was
-    backwards; it now gets the same summary-only treatment as any other
-    seed, and is explicitly told to treat itself with the same caution as
-    a graph-connected neighbor unless its own summary/key symbols justify
-    otherwise."""
-    docs = [
-        {
-            "name": "orders",
-            "summary": "Handles order creation and lookup.",
-            "full_doc": "orders full doc text",
-            "key_symbols": [],
-            "domain": "E-commerce",
-        }
-    ]
-    prompt = build_user_prompt("issue", docs, code_symbols_by_service={}, seed_names={"orders"})
-    assert "Handles order creation and lookup." in prompt
-    assert "orders full doc text" not in prompt
-    assert "Full documentation:" not in prompt
-    assert "graph-connected neighbor" in prompt.lower()
+    assert "real code was found" in prompt.lower()
+    assert "full documentation" not in prompt.lower()
 
 
 def test_build_user_prompt_includes_known_dependencies_as_verified_input():
@@ -167,7 +135,7 @@ def test_build_user_prompt_includes_known_dependencies_as_verified_input():
     truth at generation time, so it left architecture-diagram `depends_on`
     lists empty rather than guess — real edges must be shown as INPUT, not
     just used to overwrite the model's own output afterward."""
-    docs = [{"name": "orders", "full_doc": "d", "key_symbols": [], "domain": None}]
+    docs = [{"name": "orders", "summary": "d"}]
     prompt = build_user_prompt(
         "issue", docs, known_dependencies=[{"source": "orders", "target": "shipping"}]
     )
@@ -177,53 +145,37 @@ def test_build_user_prompt_includes_known_dependencies_as_verified_input():
 
 
 def test_build_user_prompt_omits_known_dependencies_section_when_none_given():
-    docs = [{"name": "orders", "full_doc": "d", "key_symbols": [], "domain": None}]
+    docs = [{"name": "orders", "summary": "d"}]
     prompt = build_user_prompt("issue", docs, known_dependencies=[])
     assert "Known service dependencies" not in prompt
 
 
-def test_build_user_prompt_omits_full_doc_for_non_seed_neighbor():
-    docs = [{"name": "shipping", "full_doc": "shipping full doc text", "key_symbols": [], "domain": "Shipping"}]
+def test_build_user_prompt_marks_non_seed_neighbor_as_background_context():
+    docs = [{"name": "shipping", "summary": "Handles shipment scheduling."}]
     # "shipping" is a candidate (e.g. via a CALLS hop), but NOT in seed_names
     prompt = build_user_prompt("issue", docs, seed_names={"orders"})
-    assert "shipping full doc text" not in prompt
+    assert "Handles shipment scheduling." in prompt
     assert "graph-connected" in prompt.lower()
 
 
 def test_build_user_prompt_treats_all_as_seeds_when_seed_names_omitted():
     """Default (no seed_names passed) preserves old behavior — every
     candidate is treated as a seed, for any caller that doesn't
-    distinguish. Content is still summary-only without matched code,
-    same as an explicit seed."""
-    docs = [
-        {
-            "name": "shipping",
-            "summary": "Handles shipment scheduling.",
-            "full_doc": "shipping full doc text",
-            "key_symbols": [],
-            "domain": "Shipping",
-        }
-    ]
+    distinguish."""
+    docs = [{"name": "shipping", "summary": "Handles shipment scheduling."}]
     prompt = build_user_prompt("issue", docs)
     assert "Handles shipment scheduling." in prompt
     assert "## Service: shipping" in prompt
 
 
-def test_build_user_prompt_includes_key_symbols_and_domain():
-    docs = [
-        {
-            "name": "orders",
-            "full_doc": "doc",
-            "key_symbols": ["newOrder", "parseId"],
-            "domain": "E-commerce",
-        }
-    ]
+def test_build_user_prompt_handles_missing_summary_gracefully():
+    docs = [{"name": "orders", "summary": None}]
     prompt = build_user_prompt("issue", docs)
-    assert "newOrder, parseId" in prompt
+    assert "Not available." in prompt
 
 
 def test_build_user_prompt_includes_real_code_symbols_section_when_present():
-    docs = [{"name": "orders", "full_doc": "doc", "key_symbols": [], "domain": "E-commerce"}]
+    docs = [{"name": "orders", "summary": "doc"}]
     code_symbols = {
         "orders": [
             {
@@ -250,15 +202,15 @@ def test_build_user_prompt_includes_real_code_symbols_section_when_present():
 
 
 def test_build_user_prompt_omits_real_code_symbols_section_when_absent():
-    docs = [{"name": "shipping", "full_doc": "doc", "key_symbols": [], "domain": "Shipping"}]
+    docs = [{"name": "shipping", "summary": "doc"}]
     prompt = build_user_prompt("issue", docs)
     assert "Real code symbols" not in prompt
 
 
 def test_build_user_prompt_handles_mixed_candidate_set():
     docs = [
-        {"name": "orders", "full_doc": "orders doc", "key_symbols": [], "domain": "E-commerce"},
-        {"name": "shipping", "full_doc": "shipping doc", "key_symbols": [], "domain": "Shipping"},
+        {"name": "orders", "summary": "orders doc"},
+        {"name": "shipping", "summary": "shipping doc"},
     ]
     code_symbols = {
         "orders": [
@@ -404,6 +356,36 @@ def test_parse_tdd_file_path_defaults_to_none():
     assert tdd.services[0].changes[0].acceptance_criteria == []
 
 
+def test_parse_tdd_strips_trailing_line_range_from_file_path():
+    """Regression test: the model is shown each real code symbol's location
+    as `path:START-END` in the input (see _format_code_symbol) and can echo
+    that whole string back into `file_path` instead of the bare path — a
+    real, observed failure mode that silently breaks every downstream
+    file_path lookup (Neo4j, the cloned repo) since neither stores paths
+    with a line-range suffix."""
+    raw = (
+        '{"title": "t", "issue_summary": "s", "services": [{"service": "orders", '
+        '"changes": [{"file_path": "src/main/java/Item.java:45-49", '
+        '"function_or_symbol": "Item.hashCode", "change_description": "add hashCode", '
+        '"implementation_notes": "n", "pseudocode_sketch": "p", "reasoning": "r"}], '
+        '"complexity": "low", "reasoning": "r"}], "overall_reasoning": "o"}'
+    )
+    tdd = parse_tdd(raw)
+    assert tdd.services[0].changes[0].file_path == "src/main/java/Item.java"
+
+
+def test_parse_tdd_leaves_file_path_without_line_range_untouched():
+    raw = (
+        '{"title": "t", "issue_summary": "s", "services": [{"service": "orders", '
+        '"changes": [{"file_path": "src/main/java/Item.java", '
+        '"function_or_symbol": "Item.hashCode", "change_description": "add hashCode", '
+        '"implementation_notes": "n", "pseudocode_sketch": "p", "reasoning": "r"}], '
+        '"complexity": "low", "reasoning": "r"}], "overall_reasoning": "o"}'
+    )
+    tdd = parse_tdd(raw)
+    assert tdd.services[0].changes[0].file_path == "src/main/java/Item.java"
+
+
 def test_parse_tdd_strips_markdown_code_fence():
     raw = (
         '```json\n{"title": "t", "issue_summary": "s", "services": [], '
@@ -468,3 +450,53 @@ def test_parse_tdd_defaults_risks_and_open_questions_to_empty_list():
     assert tdd.risks == []
     assert tdd.open_questions == []
     assert tdd.testing_notes is None
+
+
+@pytest.mark.asyncio
+async def test_both_llm_paths_use_a_low_temperature(monkeypatch):
+    """The API default (1.0) made identical input produce very different
+    TDDs from run to run."""
+    import sys
+    import types
+
+    from src.query import planner
+
+    sent = {}
+
+    class Completions:
+        async def create(self, **kwargs):
+            sent["openai"] = kwargs
+            message = types.SimpleNamespace(content="{}")
+            return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
+
+    class FakeOpenAI:
+        def __init__(self):
+            self.chat = types.SimpleNamespace(completions=Completions())
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+
+    class FakeGateway:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def chat(self, **kwargs):
+            sent["gateway"] = kwargs
+            return {"content": "{}"}
+
+    ai_module = types.SimpleNamespace(AiGatewayClient=FakeGateway)
+    monkeypatch.setitem(sys.modules, "agent_lib.gateway.ai", ai_module)
+    monkeypatch.setenv("AGENTS_GATEWAY_KEY", "k")
+    monkeypatch.setenv("AI_GATEWAY_URL", "https://gateway.example")
+
+    await planner._plan_via_openai("system", "user")
+    await planner._plan_via_gateway("system", "user")
+
+    assert sent["openai"]["temperature"] == planner._TEMPERATURE
+    assert sent["gateway"]["temperature"] == planner._TEMPERATURE
+    assert planner._TEMPERATURE <= 0.3

@@ -1,6 +1,6 @@
 [project]
 name = "plan-agent"
-version = "0.0.1"
+version = "0.0.19"
 description = "Aetherion SDK project for building AI agents and workflows"
 authors = [{ name = "Calfus Inc.", email = "support@calfus.com" }]
 readme = "README.md"
@@ -11,11 +11,41 @@ requires-python = ">=3.12.10,<3.13"
 
 
 dependencies = [
-    "aetherion-sdk @ https://sdk.sbox.aetherion.io/Darwin/aetherion_sdk-0.0.93-cp312-cp312-macosx_26_0_arm64.whl",
+    "aetherion-sdk @ https://sdk.sbox.aetherion.io/Darwin/aetherion_sdk-0.0.100-cp312-cp312-macosx_26_0_arm64.whl",
+    "httpx",
     "neo4j",
     "pydantic>=2.13,<3",
+    "pyyaml",
+    # pyhanko (pulled in by xhtml2pdf, for a PDF-signing feature this project
+    # never uses) constructs a zoneinfo.ZoneInfo('Europe/Brussels') at
+    # IMPORT time — not when actually signing anything. Minimal Linux
+    # containers often ship with no system timezone database at all, so
+    # that import fails outright with ZoneInfoNotFoundError unless the
+    # Python-side tzdata package (a pure-Python, platform-independent
+    # bundle of the IANA database — no wheel-availability concern like
+    # tree-sitter-language-pack had) is installed as a fallback.
+    "tzdata",
     "tree-sitter",
-    "tree-sitter-language-pack",
+    # Pinned to 0.13.0, not latest: every release from 1.0.0 through 1.20.0
+    # (the latest) publishes NO Linux wheel at all — only macOS. The
+    # Aetherion platform runs on Linux, so an unpinned/latest install there
+    # silently breaks this entire import, cascading into run_ingestion
+    # failing to register as a tool at all. 0.13.0 is the newest release
+    # that still ships real Linux wheels, has the exact same public API
+    # (get_parser/get_language/get_binding, same signature), and supports
+    # every language this project parses (python/java/typescript/tsx/
+    # javascript/kotlin/graphql) — confirmed by running the full test suite
+    # against it before pinning, not just checked for importability.
+    "tree-sitter-language-pack==0.13.0",
+    "xhtml2pdf",
+    # Pinned explicitly: arize-phoenix (a transitive dep of aetherion-sdk,
+    # never imported by our own code) pulls in strawberry-graphql, which in
+    # turn requires a graphql-core version it's actually compatible with.
+    # Left unpinned, dependency resolution can land on a combination where
+    # strawberry's `from graphql.execution import ExecutionContext` fails
+    # at import time — this exact pair is confirmed to import cleanly.
+    "graphql-core>=3.2,<3.3",
+    "strawberry-graphql==0.287.3",
 ]
 
 [dependency-groups]

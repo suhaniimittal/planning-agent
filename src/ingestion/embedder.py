@@ -22,6 +22,19 @@ import os
 _MODEL = "text-embedding-3-small"
 _PROVIDER = "openai"
 
+# The model rejects any input over 8192 tokens — and in a batch, one such
+# input fails the whole request. A token always covers at least one byte, so
+# capping by UTF-8 bytes keeps every input under that limit without needing
+# a tokenizer. Only what's embedded is shortened; callers keep the full text.
+_MAX_INPUT_BYTES = 8000
+
+
+def _fit(text: str) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _MAX_INPUT_BYTES:
+        return text
+    return encoded[:_MAX_INPUT_BYTES].decode("utf-8", errors="ignore")
+
 _openai_client = None
 _gateway_client = None
 _gateway_client_lock = asyncio.Lock()
@@ -73,6 +86,41 @@ async def _embed_via_openai(text: str) -> list[float]:
 
 
 async def embed(text: str) -> list[float]:
+    text = _fit(text)
     if _use_gateway():
         return await _embed_via_gateway(text)
     return await _embed_via_openai(text)
+
+
+async def _embed_many_via_gateway(texts: list[str]) -> list[list[float]]:
+    # The gateway accepts a list, but its declared return type is a single
+    # vector — so the batched reply is only trusted when it really is one
+    # vector per text; otherwise fall back to one call per text.
+    gateway_client = await _get_gateway_client()
+    result = await gateway_client.embed(provider=_PROVIDER, model_name=_MODEL, text=texts)
+    if (
+        isinstance(result, list)
+        and len(result) == len(texts)
+        and all(isinstance(v, list) for v in result)
+    ):
+        return result
+    return [await _embed_via_gateway(t) for t in texts]
+
+
+async def _embed_many_via_openai(texts: list[str]) -> list[list[float]]:
+    client = _get_openai_client()
+    resp = await client.embeddings.create(model=_MODEL, input=texts)
+    # OpenAI tags each vector with its input's index; sort rather than trust order.
+    return [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
+
+
+async def embed_many(texts: list[str]) -> list[list[float]]:
+    """One request for many texts — the vectors are identical to calling
+    embed() per text, just far fewer round trips. Returns one vector per
+    text, in the same order. Raises if the request fails as a whole."""
+    if not texts:
+        return []
+    texts = [_fit(t) for t in texts]
+    if _use_gateway():
+        return await _embed_many_via_gateway(texts)
+    return await _embed_many_via_openai(texts)

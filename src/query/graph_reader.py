@@ -78,13 +78,11 @@ def get_edges_among(names: list[str]) -> list[dict]:
 
 
 def load_candidate_docs(names: list[str]) -> list[dict]:
-    """summary + full_doc + key_symbols + domain for exactly these service
-    names. `summary` (the short, one-paragraph Project Overview extracted at
-    ingestion time) is included alongside the full raw doc so callers can
-    choose the short version when real code is already available for a
-    service — the detailed file-by-file prose in full_doc is largely
-    superseded once real parsed code exists, but the business-context
-    summary generally isn't."""
+    """name + summary for exactly these service names — the short,
+    code-derived overview generated at ingestion time (see
+    src/ingestion/summarizer.py). There's no separate "full doc" tier
+    anymore: real per-symbol detail comes from load_code_symbols_for_services/
+    load_source_snippets instead, not a markdown document."""
     if not names:
         return []
     with get_driver().session() as session:
@@ -92,8 +90,7 @@ def load_candidate_docs(names: list[str]) -> list[dict]:
             """
             MATCH (s:Service)
             WHERE s.name IN $names
-            RETURN s.name AS name, s.summary AS summary, s.full_doc AS full_doc,
-                   s.key_symbols AS key_symbols, s.domain AS domain
+            RETURN s.name AS name, s.summary AS summary
             """,
             names=names,
         )
@@ -188,3 +185,55 @@ def load_source_snippets(
             rows=rows,
         )
         return {(r["service"], r["qualified_name"]): r["source_snippet"] for r in result}
+
+
+def file_exists(service: str, file_path: str) -> bool:
+    """Whether `service` has a File node at exactly `file_path`."""
+    with get_driver().session() as session:
+        result = session.run(
+            "MATCH (f:File {service: $service, file_path: $file_path}) RETURN count(f) AS n",
+            service=service,
+            file_path=file_path,
+        )
+        return result.single()["n"] > 0
+
+
+def folder_exists(service: str, folder: str) -> bool:
+    """Whether `service` has at least one File under `folder/` — i.e.
+    `folder` is a real directory of that service, not a file."""
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            MATCH (f:File {service: $service})
+            WHERE f.file_path STARTS WITH $prefix
+            RETURN f.file_path AS file_path LIMIT 1
+            """,
+            service=service,
+            prefix=folder.rstrip("/") + "/",
+        )
+        return result.single() is not None
+
+
+def find_symbol_files(service: str, symbol: str) -> list[str]:
+    """Every file in `service` defining a Class/Function named `symbol` —
+    matched by plain name ("view") or by its qualified_name's tail
+    ("PreAdverseActionModal.view"), the two forms the LLM is shown."""
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            MATCH (n:Class {service: $service})
+            WHERE n.name = $symbol OR n.qualified_name ENDS WITH $by_file
+               OR n.qualified_name ENDS WITH $by_class
+            RETURN n.file_path AS file_path
+            UNION
+            MATCH (n:Function {service: $service})
+            WHERE n.name = $symbol OR n.qualified_name ENDS WITH $by_file
+               OR n.qualified_name ENDS WITH $by_class
+            RETURN n.file_path AS file_path
+            """,
+            service=service,
+            symbol=symbol,
+            by_file="::" + symbol,
+            by_class="." + symbol,
+        )
+        return sorted({r["file_path"] for r in result})

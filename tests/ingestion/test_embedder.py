@@ -163,3 +163,113 @@ async def test_use_gateway_requires_both_env_vars(monkeypatch):
     monkeypatch.setenv("AGENTS_GATEWAY_KEY", "test-key")
     # AI_GATEWAY_URL deliberately left unset.
     assert embedder._use_gateway() is False
+
+
+# --- embed_many: one request for many texts ----------------------------------
+
+
+class _Item:
+    def __init__(self, index, embedding):
+        self.index = index
+        self.embedding = embedding
+
+
+@pytest.mark.asyncio
+async def test_embed_many_openai_sends_one_request_and_keeps_input_order(monkeypatch):
+    calls = []
+
+    class Embeddings:
+        async def create(self, model, input):
+            calls.append(input)
+            # Returned out of order on purpose: the index, not the position, decides.
+            return types.SimpleNamespace(data=[_Item(1, [2.0]), _Item(0, [1.0])])
+
+    monkeypatch.setattr(
+        embedder, "_get_openai_client", lambda: types.SimpleNamespace(embeddings=Embeddings())
+    )
+
+    vectors = await embedder.embed_many(["a", "b"])
+
+    assert calls == [["a", "b"]]
+    assert vectors == [[1.0], [2.0]]
+
+
+@pytest.mark.asyncio
+async def test_embed_many_empty_makes_no_request(monkeypatch):
+    def must_not_be_called():
+        raise AssertionError("no request expected for an empty list")
+
+    monkeypatch.setattr(embedder, "_get_openai_client", must_not_be_called)
+
+    assert await embedder.embed_many([]) == []
+
+
+def _use_fake_gateway(monkeypatch, client):
+    monkeypatch.setenv("AGENTS_GATEWAY_KEY", "key")
+    monkeypatch.setenv("AI_GATEWAY_URL", "https://gateway.example")
+
+    async def get_client():
+        return client
+
+    monkeypatch.setattr(embedder, "_get_gateway_client", get_client)
+
+
+@pytest.mark.asyncio
+async def test_embed_many_gateway_uses_batched_reply_when_one_vector_per_text(monkeypatch):
+    class Client:
+        calls = []
+
+        async def embed(self, provider, model_name, text):
+            self.calls.append(text)
+            return [[1.0], [2.0]]
+
+    client = Client()
+    _use_fake_gateway(monkeypatch, client)
+
+    assert await embedder.embed_many(["a", "b"]) == [[1.0], [2.0]]
+    assert client.calls == [["a", "b"]]
+
+
+@pytest.mark.asyncio
+async def test_embed_many_gateway_falls_back_to_one_call_per_text_on_single_vector_reply(
+    monkeypatch,
+):
+    class Client:
+        calls = []
+
+        async def embed(self, provider, model_name, text):
+            self.calls.append(text)
+            return [0.5, 0.5]
+
+    client = Client()
+    _use_fake_gateway(monkeypatch, client)
+
+    assert await embedder.embed_many(["a", "b"]) == [[0.5, 0.5], [0.5, 0.5]]
+    assert client.calls == [["a", "b"], "a", "b"]
+
+
+def test_fit_leaves_short_text_alone_and_caps_long_text_by_bytes():
+    assert embedder._fit("short") == "short"
+    long_text = "é" * 10_000  # 2 bytes each: 20,000 bytes
+    fitted = embedder._fit(long_text)
+    assert len(fitted.encode("utf-8")) <= embedder._MAX_INPUT_BYTES
+    assert long_text.startswith(fitted)
+
+
+@pytest.mark.asyncio
+async def test_embed_many_sends_capped_texts(monkeypatch):
+    sent = []
+
+    class Embeddings:
+        async def create(self, model, input):
+            sent.extend(input)
+            return types.SimpleNamespace(data=[_Item(i, [0.0]) for i in range(len(input))])
+
+    monkeypatch.setattr(
+        embedder, "_get_openai_client", lambda: types.SimpleNamespace(embeddings=Embeddings())
+    )
+
+    await embedder.embed_many(["ok", "x" * 50_000])
+
+    assert sent[0] == "ok"
+    assert len(sent[1]) == embedder._MAX_INPUT_BYTES

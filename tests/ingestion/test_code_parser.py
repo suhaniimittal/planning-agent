@@ -1,6 +1,43 @@
 from pathlib import Path
 
-from src.ingestion.code_parser import _CHUNK_TARGET_CHARS, LANGUAGE_BY_EXTENSION, parse_file, parse_repo
+from src.ingestion.code_parser import (
+    _CHUNK_TARGET_CHARS,
+    LANGUAGE_BY_EXTENSION,
+    TRACKED_ONLY_EXTENSIONS,
+    parse_file,
+    parse_repo,
+    parse_source,
+)
+
+
+def test_parse_source_extracts_class_and_functions_with_no_disk_file():
+    source = (
+        b'class OrderController:\n'
+        b'    def create_order(self):\n'
+        b'        return {}\n\n'
+        b'def format_total(amount):\n'
+        b'    return f"${amount}"\n'
+    )
+    symbols = parse_source(source, "controller.py", "python")
+    by_name = {s.name: s for s in symbols}
+
+    assert by_name["OrderController"].kind == "class"
+    assert by_name["OrderController"].file_path == "controller.py"
+    assert by_name["create_order"].is_method is True
+    assert by_name["create_order"].file_path == "controller.py"
+    assert by_name["format_total"].is_method is False
+
+
+def test_parse_file_delegates_to_parse_source(tmp_path):
+    """parse_file is now a thin wrapper: same result as calling parse_source
+    directly with the file's bytes and repo-relative path."""
+    src = tmp_path / "app.py"
+    src.write_text("def handler():\n    pass\n")
+
+    from_file = parse_file(src, tmp_path, "python")
+    from_source = parse_source(src.read_bytes(), "app.py", "python")
+
+    assert [s.qualified_name for s in from_file] == [s.qualified_name for s in from_source]
 
 
 def test_parse_file_python_extracts_class_and_methods(tmp_path):
@@ -312,3 +349,228 @@ def test_parse_file_class_has_no_chunks(tmp_path):
     )
     cls = next(s for s in parse_file(src, tmp_path, "python") if s.kind == "class")
     assert cls.chunks == []
+
+
+# --- GraphQL SDL ---------------------------------------------------------
+
+
+def test_graphql_extracts_object_type_and_fields_as_class_and_methods():
+    src = (
+        b'"""A user of the system."""\n'
+        b"type User {\n"
+        b'  """the id"""\n'
+        b"  id: ID!\n"
+        b"  name: String\n"
+        b"}\n"
+    )
+    symbols = parse_source(src, "schema.graphqls", "graphql")
+    by_name = {s.name: s for s in symbols}
+
+    cls = by_name["User"]
+    assert cls.kind == "class"
+    assert cls.docstring == "A user of the system."
+    assert cls.qualified_name == "schema.graphqls::User"
+
+    field = by_name["id"]
+    assert field.kind == "function"
+    assert field.is_method is True
+    assert field.parent_class == "schema.graphqls::User"
+    assert field.docstring == "the id"
+
+
+def test_graphql_extracts_input_interface_and_enum_as_classes():
+    src = (
+        b"input CreateUserInput {\n  name: String!\n}\n\n"
+        b"interface Node {\n  id: ID!\n}\n\n"
+        b"enum Role {\n  ADMIN\n  USER\n}\n"
+    )
+    symbols = parse_source(src, "schema.graphqls", "graphql")
+    classes = {s.name for s in symbols if s.kind == "class"}
+    assert classes == {"CreateUserInput", "Node", "Role"}
+
+
+def test_graphql_query_type_fields_become_methods_not_top_level_functions():
+    src = b"type Query {\n  user(id: ID!): User\n}\n"
+    symbols = parse_source(src, "schema.graphqls", "graphql")
+    query_field = next(s for s in symbols if s.name == "user")
+    assert query_field.is_method is True
+    assert query_field.parent_class == "schema.graphqls::Query"
+
+
+def test_graphql_does_not_extract_field_arguments_as_separate_symbols():
+    src = b"type Query {\n  user(id: ID!, includeArchived: Boolean): User\n}\n"
+    symbols = parse_source(src, "schema.graphqls", "graphql")
+    names = {s.name for s in symbols}
+    assert "id" not in names
+    assert "includeArchived" not in names
+    assert names == {"Query", "user"}
+
+
+def test_language_by_extension_covers_graphqls_bpmn_avdl():
+    assert LANGUAGE_BY_EXTENSION[".graphqls"] == "graphql"
+    assert LANGUAGE_BY_EXTENSION[".bpmn"] == "bpmn"
+    assert LANGUAGE_BY_EXTENSION[".avdl"] == "avdl"
+
+
+# --- BPMN ------------------------------------------------------------------
+
+
+def test_bpmn_extracts_process_as_class_and_flow_nodes_as_methods():
+    src = (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">\n'
+        b'  <bpmn:process id="OrderProcess" name="Order Process">\n'
+        b'    <bpmn:startEvent id="StartEvent_1" name="Order Received" />\n'
+        b'    <bpmn:serviceTask id="Task_1" name="Validate Order" />\n'
+        b'    <bpmn:endEvent id="EndEvent_1" name="Order Complete" />\n'
+        b"  </bpmn:process>\n"
+        b"</bpmn:definitions>\n"
+    )
+    symbols = parse_source(src, "order.bpmn", "bpmn")
+    classes = [s for s in symbols if s.kind == "class"]
+    functions = [s for s in symbols if s.kind == "function"]
+
+    assert len(classes) == 1
+    assert classes[0].name == "Order Process"
+    assert classes[0].qualified_name == "order.bpmn::OrderProcess"
+
+    names = {f.name for f in functions}
+    assert names == {"Order Received", "Validate Order", "Order Complete"}
+    assert all(f.is_method for f in functions)
+    assert all(f.parent_class == "order.bpmn::OrderProcess" for f in functions)
+
+
+def test_bpmn_falls_back_to_id_when_no_name_attribute():
+    src = (
+        b'<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">\n'
+        b'  <bpmn:process id="Proc1">\n'
+        b'    <bpmn:task id="Task_1" />\n'
+        b"  </bpmn:process>\n"
+        b"</bpmn:definitions>\n"
+    )
+    symbols = parse_source(src, "p.bpmn", "bpmn")
+    task = next(s for s in symbols if s.kind == "function")
+    assert task.name == "Task_1"
+
+
+def test_bpmn_ignores_non_flow_node_children():
+    src = (
+        b'<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">\n'
+        b'  <bpmn:process id="Proc1">\n'
+        b'    <bpmn:startEvent id="Start_1" />\n'
+        b'    <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Task_1" />\n'
+        b"  </bpmn:process>\n"
+        b"</bpmn:definitions>\n"
+    )
+    symbols = parse_source(src, "p.bpmn", "bpmn")
+    names = {s.name for s in symbols if s.kind == "function"}
+    assert names == {"Start_1"}  # sequenceFlow isn't a Task/Event/Gateway
+
+
+def test_bpmn_malformed_xml_returns_empty_without_raising():
+    assert parse_source(b"<not><valid", "broken.bpmn", "bpmn") == []
+
+
+# --- Avro IDL (.avdl) --------------------------------------------------------
+
+
+def test_avdl_extracts_record_fields_as_methods():
+    src = b"record User {\n  string name;\n  int age;\n}\n"
+    symbols = parse_source(src, "user.avdl", "avdl")
+    cls = next(s for s in symbols if s.kind == "class")
+    assert cls.name == "User"
+    fields = {s.name for s in symbols if s.kind == "function"}
+    assert fields == {"name", "age"}
+
+
+def test_avdl_extracts_union_typed_field_with_default_value():
+    """Regression test: a multi-word type before the field name (a union)
+    must not cause the field to be dropped — the field name is the LAST
+    identifier before the optional default, not the first word of the type."""
+    src = b"record User {\n  union { null, string } email = null;\n}\n"
+    symbols = parse_source(src, "user.avdl", "avdl")
+    fields = {s.name for s in symbols if s.kind == "function"}
+    assert fields == {"email"}
+
+
+def test_avdl_extracts_error_and_enum_as_classes():
+    src = (
+        b"error UserNotFoundError {\n  string message;\n}\n\n"
+        b"enum Status {\n  ACTIVE, INACTIVE\n}\n"
+    )
+    symbols = parse_source(src, "user.avdl", "avdl")
+    classes = {s.name for s in symbols if s.kind == "class"}
+    assert classes == {"UserNotFoundError", "Status"}
+
+
+def test_avdl_protocol_messages_become_methods_not_fields():
+    src = (
+        b"protocol UserProtocol {\n"
+        b"  record User {\n    string name;\n  }\n\n"
+        b"  User getUser(string id) throws UserNotFoundError;\n"
+        b"  void deleteUser(string id);\n"
+        b"}\n"
+    )
+    symbols = parse_source(src, "user.avdl", "avdl")
+    protocol = next(s for s in symbols if s.name == "UserProtocol")
+    assert protocol.kind == "class"
+
+    messages = {s.name for s in symbols if s.is_method and s.parent_class == protocol.qualified_name}
+    assert messages == {"getUser", "deleteUser"}
+
+    # the nested record's OWN field must not also show up as a protocol message
+    user_record_fields = {
+        s.name for s in symbols if s.is_method and s.parent_class == "user.avdl::User"
+    }
+    assert user_record_fields == {"name"}
+
+
+def test_avdl_no_blocks_returns_empty():
+    assert parse_source(b"// just a comment\n", "empty.avdl", "avdl") == []
+
+
+# --- tracked-only extensions (.html/.css/.csv) — no symbols, but tracked ----
+
+
+def test_tracked_only_extensions_have_no_language_by_extension_entry():
+    """These are deliberately NOT in LANGUAGE_BY_EXTENSION — they have no
+    code-shaped structure to extract, so they must never reach parse_source
+    at all (only get tracked as a File node with zero symbols)."""
+    for ext in TRACKED_ONLY_EXTENSIONS:
+        assert ext not in LANGUAGE_BY_EXTENSION
+
+
+def test_parse_repo_tracks_html_css_csv_without_fake_symbols(tmp_path):
+    (tmp_path / "index.html").write_text("<html></html>")
+    (tmp_path / "style.css").write_text(".foo { color: red; }")
+    (tmp_path / "data.csv").write_text("a,b\n1,2\n")
+
+    graph = parse_repo(tmp_path, "orders")
+
+    assert graph.classes == []
+    assert graph.functions == []
+    assert graph.tracked_files == {
+        "index.html": "html",
+        "style.css": "css",
+        "data.csv": "csv",
+    }
+
+
+def test_parse_repo_still_counts_truly_unsupported_extensions(tmp_path):
+    (tmp_path / "index.html").write_text("<html></html>")
+    (tmp_path / "photo.png").write_bytes(b"binary")
+
+    graph = parse_repo(tmp_path, "orders")
+
+    assert graph.tracked_files == {"index.html": "html"}
+    assert graph.files_skipped_unsupported == 1
+
+
+def test_parse_repo_mixes_real_symbols_and_tracked_only_files(tmp_path):
+    (tmp_path / "app.py").write_text("def handler():\n    pass\n")
+    (tmp_path / "index.html").write_text("<html></html>")
+
+    graph = parse_repo(tmp_path, "orders")
+
+    assert any(f.name == "handler" for f in graph.functions)
+    assert graph.tracked_files == {"index.html": "html"}

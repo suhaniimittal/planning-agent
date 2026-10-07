@@ -8,9 +8,9 @@ GENERAL RULES
 5. Distinguish clearly between existing behavior, proposed behavior, and the reason for the change — never conflate WHAT changes with WHY it changes.
 6. NEVER introduce generic domain or compliance knowledge that isn't actually stated in the evidence you were given — e.g. do not mention a compliance standard (PCI DSS, GDPR, SOC 2, ...), a common design pattern, or a 'typical' way payment/shipping/order systems work, unless the provided documentation or code literally says so. A topic being generically associated with the domain (payments are 'usually' PCI-relevant, orders are 'often' split by address) is not evidence — it's a plausible-sounding guess, and this document must never present a guess as an established fact. If something like this genuinely seems relevant but isn't evidenced, say so explicitly in `open_questions` (e.g. "Whether this system has PCI DSS obligations is not addressed by the available documentation/code") rather than asserting it.
 
-Some services below also include a '### Real code symbols' section, parsed directly from that service's actual source code (real file paths, line numbers, signatures, and — for a shortlisted subset — real source snippets). When a service has this section, PREFER its `file_path`/`function_or_symbol` values over anything in the 'File Reference' table of that service's documentation, since it comes from parsed code rather than prose. Services WITHOUT a 'Real code symbols' section have no parsed source available — for those, fall back to the exact `file_path` as it appears in that service's own 'File Reference' table, and never invent or guess a path that isn't written there. If no file path can be identified for a given symbol in either source, set `file_path` to null rather than guessing. A single candidate set can be mixed — some services grounded in real code, others in documentation only — so do not assume uniform confidence across all services in your answer.
+Some services below also include a '### Real code symbols' section, parsed directly from that service's actual source code (real file paths, line numbers, signatures, and — for a shortlisted subset — real source snippets). Each symbol there is listed as `path/to/File.ext:START-END` — that START-END line range is shown ONLY so you can see roughly how big/where the symbol is; it is NEVER part of the file_path itself. When you set `file_path` in your answer, copy ONLY the plain path before the colon (e.g. `path/to/File.ext`) — never append `:START-END` or any other line range to it, since a downstream tool resolves `file_path` as a literal path on disk. Do use the `function_or_symbol`/`file_path` values (path portion only) from this section when a service has it, since it comes from parsed code rather than prose. Services WITHOUT a 'Real code symbols' section have NO parsed source available and no other source of file paths either — for those, set `file_path` to null rather than guessing one. A single candidate set can be mixed — some services grounded in real code, others with only a short summary — so do not assume uniform confidence across all services in your answer.
 
-Some services are marked as included only because they're graph-connected to a directly relevant service (a real CALLS relationship), not because their own content matched the issue — their full documentation is omitted, showing only their domain and key symbols (plus a 'Real code symbols' section if their code was still a real match). Treat these as background context for understanding dependencies, not primary candidates for changes, unless their 'Real code symbols' section itself shows something directly relevant.
+Some services are marked as included only because they're graph-connected to a directly relevant service (a real CALLS relationship), not because their own content matched the issue — only their short summary is shown (plus a 'Real code symbols' section if their code was still a real match). Treat these as background context for understanding dependencies, not primary candidates for changes, unless their 'Real code symbols' section itself shows something directly relevant.
 
 Separate WHAT should change (`change_description`) from WHY (`reasoning`) — do not conflate them.
 
@@ -51,21 +51,18 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
       "description": "One node in an architecture diagram, as a FACT the LLM states \u2014\nnever as hand-drawn ASCII art. render.py builds the actual diagram from\na list of these; asking the model to draw boxes-and-arrows itself was\nunreliable (inconsistent alignment, frequently skipped entirely) and\nspent effort better used on the reasoning fields.",
       "properties": {
         "name": {
-          "title": "Name",
           "type": "string"
         },
         "depends_on": {
           "items": {
             "type": "string"
           },
-          "title": "Depends On",
           "type": "array"
         }
       },
       "required": [
         "name"
       ],
-      "title": "ArchComponent",
       "type": "object"
     },
     "FileChange": {
@@ -79,11 +76,9 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
               "type": "null"
             }
           ],
-          "default": null,
-          "title": "File Path"
+          "default": null
         },
         "function_or_symbol": {
-          "title": "Function Or Symbol",
           "type": "string"
         },
         "current_behavior": {
@@ -95,30 +90,24 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
               "type": "null"
             }
           ],
-          "default": null,
-          "title": "Current Behavior"
+          "default": null
         },
         "change_description": {
-          "title": "Change Description",
           "type": "string"
         },
         "implementation_notes": {
-          "title": "Implementation Notes",
           "type": "string"
         },
         "pseudocode_sketch": {
-          "title": "Pseudocode Sketch",
           "type": "string"
         },
         "acceptance_criteria": {
           "items": {
             "type": "string"
           },
-          "title": "Acceptance Criteria",
           "type": "array"
         },
         "reasoning": {
-          "title": "Reasoning",
           "type": "string"
         },
         "change_type": {
@@ -128,12 +117,10 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
             "modify",
             "delete"
           ],
-          "title": "Change Type",
           "type": "string"
         },
         "has_real_source": {
           "default": false,
-          "title": "Has Real Source",
           "type": "boolean"
         }
       },
@@ -144,14 +131,12 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
         "pseudocode_sketch",
         "reasoning"
       ],
-      "title": "FileChange",
       "type": "object"
     },
     "FlowStep": {
       "description": "One step in a request/execution flow, as an ordered fact \u2014 replaces\nboth a prose flow paragraph AND a hand-drawn flow diagram with one\nsource of truth; render.py derives both a numbered list and an ASCII\nchain from the same steps, so nothing is stated twice.",
       "properties": {
         "step": {
-          "title": "Step",
           "type": "string"
         },
         "detail": {
@@ -163,28 +148,23 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
               "type": "null"
             }
           ],
-          "default": null,
-          "title": "Detail"
+          "default": null
         }
       },
       "required": [
         "step"
       ],
-      "title": "FlowStep",
       "type": "object"
     },
     "Scenario": {
       "properties": {
         "category": {
-          "title": "Category",
           "type": "string"
         },
         "scenario": {
-          "title": "Scenario",
           "type": "string"
         },
         "expected_result": {
-          "title": "Expected Result",
           "type": "string"
         }
       },
@@ -193,22 +173,18 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
         "scenario",
         "expected_result"
       ],
-      "title": "Scenario",
       "type": "object"
     },
     "SequenceStep": {
       "description": "One call or response in a multi-participant interaction \u2014 render.py\nassembles these into an aligned ASCII sequence diagram.",
       "properties": {
         "from_participant": {
-          "title": "From Participant",
           "type": "string"
         },
         "to_participant": {
-          "title": "To Participant",
           "type": "string"
         },
         "action": {
-          "title": "Action",
           "type": "string"
         },
         "direction": {
@@ -217,7 +193,6 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
             "call",
             "response"
           ],
-          "title": "Direction",
           "type": "string"
         }
       },
@@ -226,42 +201,46 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
         "to_participant",
         "action"
       ],
-      "title": "SequenceStep",
       "type": "object"
     },
     "ServiceDependency": {
       "properties": {
         "source": {
-          "title": "Source",
           "type": "string"
         },
         "target": {
-          "title": "Target",
           "type": "string"
+        },
+        "via": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
         "source",
         "target"
       ],
-      "title": "ServiceDependency",
       "type": "object"
     },
     "ServicePlan": {
       "properties": {
         "service": {
-          "title": "Service",
           "type": "string"
         },
         "changes": {
           "items": {
             "$ref": "#/$defs/FileChange"
           },
-          "title": "Changes",
           "type": "array"
         },
         "complexity": {
-          "title": "Complexity",
           "type": "string"
         },
         "responsibility_change": {
@@ -273,8 +252,7 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
               "type": "null"
             }
           ],
-          "default": null,
-          "title": "Responsibility Change"
+          "default": null
         },
         "affected_data_model": {
           "anyOf": [
@@ -285,18 +263,15 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
               "type": "null"
             }
           ],
-          "default": null,
-          "title": "Affected Data Model"
+          "default": null
         },
         "api_changes": {
           "items": {
             "type": "string"
           },
-          "title": "Api Changes",
           "type": "array"
         },
         "reasoning": {
-          "title": "Reasoning",
           "type": "string"
         }
       },
@@ -305,13 +280,12 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
         "complexity",
         "reasoning"
       ],
-      "title": "ServicePlan",
       "type": "object"
     }
   },
   "properties": {
     "title": {
-      "title": "Title",
+      "description": "A short, specific title for this issue/fix \u2014 never a generic or schema-name placeholder.",
       "type": "string"
     },
     "generated_at": {
@@ -323,25 +297,21 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
           "type": "null"
         }
       ],
-      "default": null,
-      "title": "Generated At"
+      "default": null
     },
     "issue_summary": {
-      "title": "Issue Summary",
       "type": "string"
     },
     "functional_requirements": {
       "items": {
         "type": "string"
       },
-      "title": "Functional Requirements",
       "type": "array"
     },
     "non_functional_requirements": {
       "items": {
         "type": "string"
       },
-      "title": "Non Functional Requirements",
       "type": "array"
     },
     "current_architecture": {
@@ -353,21 +323,18 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
           "type": "null"
         }
       ],
-      "default": null,
-      "title": "Current Architecture"
+      "default": null
     },
     "current_architecture_components": {
       "items": {
         "$ref": "#/$defs/ArchComponent"
       },
-      "title": "Current Architecture Components",
       "type": "array"
     },
     "current_flow_steps": {
       "items": {
         "$ref": "#/$defs/FlowStep"
       },
-      "title": "Current Flow Steps",
       "type": "array"
     },
     "root_cause_analysis": {
@@ -379,8 +346,7 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
           "type": "null"
         }
       ],
-      "default": null,
-      "title": "Root Cause Analysis"
+      "default": null
     },
     "proposed_solution": {
       "anyOf": [
@@ -391,8 +357,7 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
           "type": "null"
         }
       ],
-      "default": null,
-      "title": "Proposed Solution"
+      "default": null
     },
     "proposed_architecture": {
       "anyOf": [
@@ -403,49 +368,42 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
           "type": "null"
         }
       ],
-      "default": null,
-      "title": "Proposed Architecture"
+      "default": null
     },
     "proposed_architecture_components": {
       "items": {
         "$ref": "#/$defs/ArchComponent"
       },
-      "title": "Proposed Architecture Components",
       "type": "array"
     },
     "proposed_flow_steps": {
       "items": {
         "$ref": "#/$defs/FlowStep"
       },
-      "title": "Proposed Flow Steps",
       "type": "array"
     },
     "sequence_steps": {
       "items": {
         "$ref": "#/$defs/SequenceStep"
       },
-      "title": "Sequence Steps",
       "type": "array"
     },
     "services": {
       "items": {
         "$ref": "#/$defs/ServicePlan"
       },
-      "title": "Services",
       "type": "array"
     },
     "service_dependencies": {
       "items": {
         "$ref": "#/$defs/ServiceDependency"
       },
-      "title": "Service Dependencies",
       "type": "array"
     },
     "communication_notes": {
       "items": {
         "type": "string"
       },
-      "title": "Communication Notes",
       "type": "array"
     },
     "error_handling_notes": {
@@ -457,8 +415,7 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
           "type": "null"
         }
       ],
-      "default": null,
-      "title": "Error Handling Notes"
+      "default": null
     },
     "security_considerations": {
       "anyOf": [
@@ -469,8 +426,7 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
           "type": "null"
         }
       ],
-      "default": null,
-      "title": "Security Considerations"
+      "default": null
     },
     "backward_compatibility_notes": {
       "anyOf": [
@@ -481,8 +437,7 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
           "type": "null"
         }
       ],
-      "default": null,
-      "title": "Backward Compatibility Notes"
+      "default": null
     },
     "testing_notes": {
       "anyOf": [
@@ -493,39 +448,33 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
           "type": "null"
         }
       ],
-      "default": null,
-      "title": "Testing Notes"
+      "default": null
     },
     "testing_plan": {
       "items": {
         "$ref": "#/$defs/Scenario"
       },
-      "title": "Testing Plan",
       "type": "array"
     },
     "implementation_plan": {
       "items": {
         "type": "string"
       },
-      "title": "Implementation Plan",
       "type": "array"
     },
     "risks": {
       "items": {
         "type": "string"
       },
-      "title": "Risks",
       "type": "array"
     },
     "open_questions": {
       "items": {
         "type": "string"
       },
-      "title": "Open Questions",
       "type": "array"
     },
     "overall_reasoning": {
-      "title": "Overall Reasoning",
       "type": "string"
     }
   },
@@ -535,6 +484,5 @@ Respond with ONLY one JSON object matching this schema, no markdown fences, no p
     "services",
     "overall_reasoning"
   ],
-  "title": "TechnicalDesignDoc",
   "type": "object"
 }

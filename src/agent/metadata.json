@@ -1,15 +1,36 @@
 {
     "name": "planning_agent",
     "version": "1.0.0",
-    "description": "Turns a requirement or bug report into a technical design doc.",
+    "description": "Syncs the service graph, then turns a requirement or bug report into a downloadable technical design doc.",
     "config": {
         "triggers": [
             {
               "name": "issue_text",
-              "type": "str",
+              "type": "textarea",
               "required": true,
               "description": "Plain-text requirement or bug report",
               "friendly_name": "Issue"
+            },
+            {
+              "name": "repos",
+              "type": "textarea",
+              "required": true,
+              "description": "One service per line: 'name: org/repo' or 'name: org/repo@branch'. Example:\norders: myorg/orders-service\npayment: myorg/payment-service@develop",
+              "friendly_name": "Repositories"
+            },
+            {
+              "name": "top_k",
+              "type": "number",
+              "required": false,
+              "description": "How many top-matching services to seed the search with (default 5).",
+              "friendly_name": "Top K"
+            },
+            {
+              "name": "hops",
+              "type": "number",
+              "required": false,
+              "description": "How many CALLS-graph hops to expand from the seed services (default 2).",
+              "friendly_name": "Graph hops"
             }
         ]
     }

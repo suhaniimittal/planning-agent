@@ -41,6 +41,13 @@ class FileChange(BaseModel):
     # against the graph, don't guess" principle as service_dependencies
     # below.
     has_real_source: bool = False
+    # Also set programmatically (query.verify, after the LLM call) by
+    # looking `file_path`/`function_or_symbol` up in the code graph — never
+    # trusted from the LLM: "verified" (both exist), "corrected" (file_path
+    # was rewritten to where the symbol really is), "new" (a create in a
+    # real file/folder), "unverified" (couldn't be confirmed — see the note).
+    verification: Literal["verified", "corrected", "new", "unverified"] | None = None
+    verification_note: str | None = None
 
 
 class ServicePlan(BaseModel):
@@ -58,6 +65,9 @@ class ServicePlan(BaseModel):
 class ServiceDependency(BaseModel):
     source: str
     target: str
+    # None for a plain CALLS (HTTP/REST) edge. Reserved for labeling a
+    # non-HTTP dependency mechanism if one is ever detected again.
+    via: str | None = None
 
 
 class Scenario(BaseModel):
@@ -98,7 +108,11 @@ class SequenceStep(BaseModel):
 
 
 class TechnicalDesignDoc(BaseModel):
-    title: str
+    # A short, specific title for THIS issue/fix — e.g. "Propagate shipment
+    # creation failures in the orders service" — never the schema/class
+    # name itself (see planner.py's _strip_schema_titles for why that
+    # collision was a real, observed failure mode).
+    title: str = Field(description="A short, specific title for this issue/fix — never a generic or schema-name placeholder.")
     # Set programmatically after parsing, in query_flow.build_tdd() — a
     # generation timestamp is a fact about the run, not something an LLM
     # should be asked to guess.

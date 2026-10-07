@@ -1,138 +1,286 @@
 {
-  "title": "TDD for Logging Sent Email Subject Lines",
-  "generated_at": "2026-09-24T07:27:06.772564+00:00",
-  "issue_summary": "Sent emails' subject line is not getting logged in the database.",
+  "title": "Add Currency Field to Payment Requests and Enforce Proper Bank Transfer Validation",
+  "generated_at": "2026-10-06T11:17:46.155727+00:00",
+  "issue_summary": "The payment system lacks currency specification in requests and bank transfers allow invalid transactions like overdrafts and zero/negative amounts.",
   "functional_requirements": [
-    "The system must log the subject line of every email sent into the database."
+    "Add a currency field to the PaymentRequest class.",
+    "Validate the currency code for supported values before processing payments.",
+    "Prevent bank transfers from withdrawing more than an account's balance.",
+    "Reject bank transfers with zero or negative amounts."
   ],
   "non_functional_requirements": [],
-  "current_architecture": "Currently, the Orders service handles the creation and processing of orders, while Shipping is responsible for shipment. However, there is no mention of logging email subject lines, which is the cause of the discrepancy reported.",
+  "current_architecture": "Currently, the orders service processes payments without specifying a currency. The bank transfer service allows transfers that could result in negative balances or are non-positive in amount.",
   "current_architecture_components": [
     {
       "name": "orders",
       "depends_on": [
-        "shipping"
+        "shipping",
+        "user"
       ]
     },
     {
       "name": "shipping",
+      "depends_on": [
+        "orders",
+        "user"
+      ]
+    },
+    {
+      "name": "user",
+      "depends_on": []
+    },
+    {
+      "name": "cart-service",
+      "depends_on": []
+    },
+    {
+      "name": "bank-transfer-service",
       "depends_on": []
     }
   ],
   "current_flow_steps": [
     {
-      "step": "Process order",
-      "detail": null
+      "step": "Process Payment Request",
+      "detail": "A payment request is created without specifying a currency."
     },
     {
-      "step": "Send email",
-      "detail": null
+      "step": "Transfer Funds Between Accounts",
+      "detail": "TransferService allows transfers that can overdraw an account or use non-positive amounts."
     }
   ],
-  "root_cause_analysis": "The root cause of the issue lies in the missing functionality to log the subject line of emails sent. While the SMTPEmailProvider class in the galleryflow service handles email composition and sending, it logs email information (including status) using EmailLogService, which does not explicitly capture the subject line separately.",
-  "proposed_solution": "Modify the SmtpEmailProvider class within the galleryflow service to ensure that the subject line is explicitly logged using the EmailLogService whenever an email is sent.",
-  "proposed_architecture": "The proposed architecture will be the same as the current system, but with additional logging added for tracking email subject lines in the galleryflow service.",
+  "root_cause_analysis": "The PaymentRequest class currently lacks a currency field, which prevents specifying or validating the currency. The Account and TransferService classes do not validate sufficient balance or the positivity of the transfer amount, respectively.",
+  "proposed_solution": "Introduce a currency field in PaymentRequest and add logic to validate its value against supported currencies. Modify Account and TransferService to validate account balance before withdrawal and ensure transfer amounts are positive.",
+  "proposed_architecture": "Enforced validation in both the payment and bank transfer processes enhance reliability and correctness. Payment processing now includes currency, and bank transfer logic ensures valid fund movement.",
   "proposed_architecture_components": [
     {
       "name": "orders",
       "depends_on": [
-        "shipping"
+        "shipping",
+        "user"
       ]
     },
     {
       "name": "shipping",
+      "depends_on": [
+        "orders",
+        "user"
+      ]
+    },
+    {
+      "name": "user",
       "depends_on": []
     },
     {
-      "name": "galleryflow",
+      "name": "cart-service",
+      "depends_on": []
+    },
+    {
+      "name": "bank-transfer-service",
       "depends_on": []
     }
   ],
   "proposed_flow_steps": [
     {
-      "step": "Process order",
-      "detail": null
+      "step": "Validate Payment Currency",
+      "detail": "Check if the provided currency in a payment request is supported."
     },
     {
-      "step": "Send email",
-      "detail": "Log email subject line in addition to sending email."
+      "step": "Check Account Balance Before Withdrawal",
+      "detail": "Ensure the account has sufficient balance for withdrawal during transfer."
+    },
+    {
+      "step": "Reject Non-positive Transfer Amounts",
+      "detail": "Verify that transfer amounts are strictly positive."
     }
   ],
   "sequence_steps": [
     {
-      "from_participant": "SmtpEmailProvider",
-      "to_participant": "EmailLogService",
-      "action": "Log email subject line",
+      "from_participant": "client",
+      "to_participant": "orders",
+      "action": "Submit payment request with currency",
       "direction": "call"
+    },
+    {
+      "from_participant": "orders",
+      "to_participant": "paymentAuth",
+      "action": "Validate currency and amount",
+      "direction": "response"
+    },
+    {
+      "from_participant": "client",
+      "to_participant": "bank-transfer-service",
+      "action": "Request fund transfer",
+      "direction": "call"
+    },
+    {
+      "from_participant": "bank-transfer-service",
+      "to_participant": "bank-transfer-service",
+      "action": "Validate account and transfer amount",
+      "direction": "response"
     }
   ],
   "services": [
     {
-      "service": "galleryflow",
+      "service": "orders",
       "changes": [
         {
-          "file_path": "apps/api/src/modules/notifications/providers/smtp-email.provider.ts",
-          "function_or_symbol": "send",
-          "current_behavior": "Logs email sending events without explicitly logging the subject line.",
-          "change_description": "Modify to include explicit logging of the email subject line using EmailLogService.",
-          "implementation_notes": "Within the send method, ensure subject line is included in the logging call to EmailLogService.",
-          "pseudocode_sketch": "try {\n  ...\n  await this.log.record({\n    toAddress: message.toAddress,\n    subject: message.subject,\n    kind: EMAIL_KIND.notification(message.eventKey),\n    studioId: message.studioId,\n    status: 'SENT',\n    providerMessageId: messageId\n  });\n  ...\n}",
+          "file_path": "src/main/java/works/weave/socks/orders/resources/PaymentRequest.java",
+          "function_or_symbol": "PaymentRequest",
+          "current_behavior": "Holds address, card, customer, and amount information only.",
+          "change_description": "Add a new field 'currency' to PaymentRequest and modify the constructor and field-access methods.",
+          "implementation_notes": "Introduce a String field 'currency'. Update constructor to accept this field. Modify toString, getters, and setters accordingly.",
+          "pseudocode_sketch": "class PaymentRequest {\n    private String currency;\n    // Existing fields...\n\n    public PaymentRequest(Address address, Card card, Customer customer, float amount, String currency) {\n        // Existing assignments\n        this.currency = currency;\n    }\n\n    public String getCurrency() {\n        return currency;\n    }\n    \n    public void setCurrency(String currency) {\n        this.currency = currency;\n    }\n}",
           "acceptance_criteria": [
-            "The subject line of every email sent must be logged in the email log.",
-            "The log entry must include both the subject line and the status of the email."
+            "PaymentRequest class includes currency field.",
+            "Currency can be set and retrieved as expected.",
+            "Existing functionality remains unaffected except where modified."
           ],
-          "reasoning": "Logging the subject line is crucial for tracking and debugging sent emails and ensures that the system provides a comprehensive audit trail.",
+          "reasoning": "By including a currency field in the payment request, we can support multi-currency transactions and ensure payments are processed with the specified currency.",
+          "change_type": "modify",
+          "has_real_source": true
+        },
+        {
+          "file_path": "src/main/java/works/weave/socks/orders/resources/PaymentResponse.java",
+          "function_or_symbol": "PaymentResponse",
+          "current_behavior": "Handles payment authorization response.",
+          "change_description": "Implement currency validation logic.",
+          "implementation_notes": "Add logic to check if the currency is among the supported types before proceeding with payment processing.",
+          "pseudocode_sketch": "if (!isCurrencySupported(currency)) {\n    throw new UnsupportedCurrencyException();\n}\n// proceed if valid",
+          "acceptance_criteria": [
+            "Payments with unsupported currencies are rejected.",
+            "Payments with supported currencies proceed.",
+            "Proper error message is returned for unsupported currencies."
+          ],
+          "reasoning": "Validating currency ensures that the payment is processed correctly and with a currency that the system supports.",
           "change_type": "modify",
           "has_real_source": true
         }
       ],
       "complexity": "medium",
-      "responsibility_change": "The responsibility of the galleryflow service is expanded to ensure email subject lines are logged when emails are sent.",
-      "affected_data_model": "EmailLog",
+      "responsibility_change": "The Orders service extends its responsibilities to handle and validate the currency in payment requests.",
+      "affected_data_model": null,
+      "api_changes": [
+        "Add currency field to payment requests."
+      ],
+      "reasoning": "Integrating currency into payment processing enhances the capability to handle diverse transactions."
+    },
+    {
+      "service": "bank-transfer-service",
+      "changes": [
+        {
+          "file_path": "src/main/java/com/bank/Account.java",
+          "function_or_symbol": "Account.withdraw",
+          "current_behavior": "Subtracts amount from balance without checking sufficiency.",
+          "change_description": "Add check for balance sufficiency before withdrawing.",
+          "implementation_notes": "Before reducing the balance, compare the withdrawal amount to current balance and throw an exception if it's insufficient.",
+          "pseudocode_sketch": "void withdraw(double amount) {\n    if (amount > balance) {\n        throw new IllegalStateException(\"Insufficient balance\");\n    }\n    balance -= amount;\n}",
+          "acceptance_criteria": [
+            "Insufficient balance results in an exception.",
+            "Account balance remains unchanged if withdrawal is rejected."
+          ],
+          "reasoning": "Preventing overdrafts maintains financial integrity and ensures accounts cannot be inadvertently overdrawn.",
+          "change_type": "modify",
+          "has_real_source": false
+        },
+        {
+          "file_path": "src/main/java/com/bank/TransferService.java",
+          "function_or_symbol": "TransferService.transfer",
+          "current_behavior": "Performs transfer without checking for positive amount.",
+          "change_description": "Add check for positive transfer amounts.",
+          "implementation_notes": "Before proceeding with the transfer, ensure amount is strictly positive and throw an exception if not.",
+          "pseudocode_sketch": "public Transaction transfer(Account from, Account to, double amount) {\n    if (amount <= 0) {\n        throw new IllegalArgumentException(\"Transfer amount must be positive\");\n    }\n    // existing logic\n}",
+          "acceptance_criteria": [
+            "Zero or negative amounts result in an exception.",
+            "Only positive transfer amounts are accepted."
+          ],
+          "reasoning": "Ensuring transfer amounts are positive prevents errors in transaction processing and maintains logical consistency of fund movements.",
+          "change_type": "modify",
+          "has_real_source": false
+        }
+      ],
+      "complexity": "medium",
+      "responsibility_change": "The Bank Transfer Service is now responsible for ensuring the legitimacy of transfers regarding balance availability and valid amounts.",
+      "affected_data_model": null,
       "api_changes": [],
-      "reasoning": "Modifying the galleryflow service ensures that the system logs the subject line of emails as required, without impacting existing functionality elsewhere."
+      "reasoning": "By adding validation, we prevent misuse of the transfer service that could otherwise lead to incorrect financial state."
     }
   ],
   "service_dependencies": [
     {
       "source": "orders",
-      "target": "shipping"
+      "target": "shipping",
+      "via": null
+    },
+    {
+      "source": "shipping",
+      "target": "orders",
+      "via": null
+    },
+    {
+      "source": "shipping",
+      "target": "user",
+      "via": null
+    },
+    {
+      "source": "orders",
+      "target": "user",
+      "via": null
     }
   ],
   "communication_notes": [],
-  "error_handling_notes": "The system should handle situations where the email logging fails due to database unavailability, ensuring no failure affects email sending.",
-  "security_considerations": "Ensure that any logged information respects privacy policies, specifically not logging sensitive information inadvertently.",
-  "backward_compatibility_notes": "No backward compatibility issues expected as existing logging functionality is being enhanced, not removed.",
+  "error_handling_notes": "New exceptions thrown for unsupported currency, insufficient balance, and non-positive transfer amounts require proper error management to inform clients correctly.",
+  "security_considerations": "Ensuring currency validation and transaction checks prevent potential errors but do not inherently introduce additional access control or encryption requirements.",
+  "backward_compatibility_notes": null,
   "testing_notes": null,
   "testing_plan": [
     {
       "category": "unit",
-      "scenario": "Log entry created with email subject line on successful email send.",
-      "expected_result": "Email log should contain an entry with the subject line."
+      "scenario": "Add and retrieve currency in PaymentRequest",
+      "expected_result": "Currency field is correctly set and retrieved without impacting other fields."
+    },
+    {
+      "category": "unit",
+      "scenario": "Validate currency against supported list",
+      "expected_result": "Payments with unsupported currencies are rejected with an error."
+    },
+    {
+      "category": "unit",
+      "scenario": "Reject transfer if amount exceeds balance",
+      "expected_result": "Transfer is rejected with proper error, and balance remains intact."
+    },
+    {
+      "category": "unit",
+      "scenario": "Reject zero or negative transfer amounts",
+      "expected_result": "Transfer is rejected with proper error, disallowing zero or negative amounts."
     },
     {
       "category": "integration",
-      "scenario": "Test sending an email and verify log entries.",
-      "expected_result": "Log entries should contain the sent email's subject line."
+      "scenario": "Integration test for payment processing with currency",
+      "expected_result": "Payments are processed correctly with valid currencies and rejected otherwise."
     },
     {
-      "category": "edge_case",
-      "scenario": "Email sent without a subject line.",
-      "expected_result": "Log entry should still be created with 'unknown' or default subject."
+      "category": "integration",
+      "scenario": "Integration test for valid and invalid bank transfers",
+      "expected_result": "Valid transfers complete correctly, while invalid transfers are rejected as expected."
     }
   ],
   "implementation_plan": [
-    "Identify where emails are logged from SMTPEmailProvider.",
-    "Modify the logging call to ensure the subject line is included.",
-    "Write unit tests to verify that the log now includes subject lines.",
-    "Deploy changed service and run integration tests to confirm proper logging."
+    "Add currency field to PaymentRequest class.",
+    "Implement currency validation logic in payment processing.",
+    "Update Account.withdraw method to check for sufficient balance.",
+    "Update TransferService.transfer method to check for positive amounts.",
+    "Write unit tests for new PaymentRequest currency handling.",
+    "Write integration tests for currency validation in payments.",
+    "Write unit tests for Account and TransferService validation logic.",
+    "Run integration tests to verify end-to-end process flow."
   ],
   "risks": [
-    "Potential for logs to grow significantly in size if the email volume is high, leading to database performance issues."
+    "Changes to payment API might require frontend/client updates if they don't supply currency now.",
+    "Validation logic could reject valid transfers if implemented incorrectly, impacting user experience."
   ],
   "open_questions": [
-    "Is there a retention policy for these logs? How do we manage disk space over time?",
-    "Is there a standardized format for logs that we must follow?"
+    "What are the supported currency codes for the payment service?",
+    "Do any client applications need updating due to the new currency field in payment requests?"
   ],
-  "overall_reasoning": "Adding logging for the email subject line allows for better tracking and troubleshooting of sent emails. This change is necessary to provide comprehensive logs that include key details of each email transaction, ensuring transparency and facilitating easier debugging of email-related issues."
+  "overall_reasoning": "The proposed changes integrate currency specification into payment processing and enforce essential validations for bank transfers, addressing functional gaps and preventing erroneous transactions."
 }

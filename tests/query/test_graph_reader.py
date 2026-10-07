@@ -81,16 +81,13 @@ def test_get_edges_among_empty_names_returns_empty_without_query(monkeypatch):
     assert driver._session.last_query is None
 
 
-def test_load_candidate_docs_returns_summary_full_doc_and_key_symbols_for_given_names(monkeypatch):
+def test_load_candidate_docs_returns_name_and_summary_for_given_names(monkeypatch):
     driver = _patch_driver(
         monkeypatch,
         [
             {
                 "name": "orders",
                 "summary": "Handles order creation and lookup.",
-                "full_doc": "doc text",
-                "key_symbols": ["newOrder"],
-                "domain": "E-commerce",
             }
         ],
     )
@@ -99,12 +96,10 @@ def test_load_candidate_docs_returns_summary_full_doc_and_key_symbols_for_given_
         {
             "name": "orders",
             "summary": "Handles order creation and lookup.",
-            "full_doc": "doc text",
-            "key_symbols": ["newOrder"],
-            "domain": "E-commerce",
         }
     ]
     assert "s.summary AS summary" in driver._session.last_query
+    assert "full_doc" not in driver._session.last_query
     assert driver._session.last_params == {"names": ["orders"]}
 
 
@@ -202,3 +197,36 @@ def test_vector_search_chunks_empty_service_names_returns_empty_without_query(mo
     result = graph_reader.vector_search_chunks([0.1], [])
     assert result == []
     assert driver._session.last_query is None
+
+
+def test_file_exists_matches_exact_service_and_path(monkeypatch):
+    class One:
+        def single(self):
+            return {"n": 1}
+
+    driver = _patch_driver(monkeypatch, One())
+    assert graph_reader.file_exists("ui", "src/a.tsx") is True
+    assert driver._session.last_params == {"service": "ui", "file_path": "src/a.tsx"}
+
+
+def test_folder_exists_searches_by_prefix_with_trailing_slash(monkeypatch):
+    class Some:
+        def single(self):
+            return {"file_path": "src/report/a.tsx"}
+
+    driver = _patch_driver(monkeypatch, Some())
+    assert graph_reader.folder_exists("ui", "src/report/") is True
+    assert driver._session.last_params == {"service": "ui", "prefix": "src/report/"}
+
+
+def test_find_symbol_files_matches_name_or_qualified_tail(monkeypatch):
+    driver = _patch_driver(
+        monkeypatch, [{"file_path": "b.tsx"}, {"file_path": "a.tsx"}, {"file_path": "a.tsx"}]
+    )
+    assert graph_reader.find_symbol_files("ui", "Modal.view") == ["a.tsx", "b.tsx"]
+    assert driver._session.last_params == {
+        "service": "ui",
+        "symbol": "Modal.view",
+        "by_file": "::Modal.view",
+        "by_class": ".Modal.view",
+    }

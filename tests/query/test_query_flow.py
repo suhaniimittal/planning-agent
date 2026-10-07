@@ -40,7 +40,7 @@ async def test_build_tdd_calls_pipeline_in_order(monkeypatch):
 
     def fake_load_candidate_docs(names):
         calls.append(("load_candidate_docs", names))
-        return [{"name": n, "full_doc": "d", "key_symbols": [], "domain": None} for n in names]
+        return [{"name": n, "summary": "d"} for n in names]
 
     def fake_load_code_symbols(names):
         calls.append(("load_code_symbols_for_services", names))
@@ -157,6 +157,83 @@ async def test_build_tdd_calls_pipeline_in_order(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_build_tdd_skips_a_function_already_shown_via_its_matched_class(monkeypatch):
+    """Regression test: a matched class's full source_snippet already
+    contains every one of its own methods verbatim. Without this check, a
+    method that ALSO independently scores well via the function-embedding
+    path would appear in the prompt TWICE — once buried in the class's
+    snippet, once again as its own separate, highlighted Function entry.
+    Wasted prompt space, never a correctness bug, but a real duplication
+    this must prevent."""
+    calls = []
+
+    async def fake_embed(text):
+        return [0.1, 0.2]
+
+    monkeypatch.setattr(query_flow, "embed", fake_embed)
+    monkeypatch.setattr(query_flow.graph_reader, "vector_search_services", lambda e, k: [{"name": "orders", "score": 0.9}])
+    monkeypatch.setattr(query_flow.graph_reader, "expand_neighbors", lambda names, hops: [])
+    monkeypatch.setattr(query_flow.candidates, "merge_candidates", lambda hits, neighbors: ["orders"])
+    monkeypatch.setattr(query_flow.graph_reader, "load_candidate_docs", lambda names: [{"name": "orders", "summary": "d"}])
+    monkeypatch.setattr(query_flow.graph_reader, "get_edges_among", lambda names: [])
+
+    # Item is a matched class, and Item.equals is one of ITS OWN methods —
+    # also independently returned by the embedding-ranked function path.
+    raw_symbols = [
+        {"service": "orders", "qualified_name": "Item.py::Item", "name": "Item", "kind": "Class",
+         "docstring": None, "signature": "class Item", "language": "python"},
+        {"service": "orders", "qualified_name": "Item.py::Item.equals", "name": "equals", "kind": "Function",
+         "is_method": True, "parent_class": "Item.py::Item", "docstring": None, "signature": "def equals(self)",
+         "language": "python"},
+        {"service": "orders", "qualified_name": "Cart.py::add_item", "name": "add_item", "kind": "Function",
+         "is_method": False, "parent_class": None, "docstring": None, "signature": "def add_item(self)",
+         "language": "python"},
+    ]
+    monkeypatch.setattr(query_flow.graph_reader, "load_code_symbols_for_services", lambda names: raw_symbols)
+
+    def fake_select_relevant_symbols(symbols, issue_text):
+        # Only ever asked to rank classes here (fallback path finds no
+        # services needing it, since the chunk path below covers "orders")
+        return [s for s in symbols if s["kind"] == "Class"]
+
+    monkeypatch.setattr(query_flow.candidates, "select_relevant_symbols", fake_select_relevant_symbols)
+    monkeypatch.setattr(query_flow.graph_reader, "load_source_snippets", lambda pairs: {p: "snippet" for p in pairs})
+    monkeypatch.setattr(query_flow.graph_reader, "vector_search_chunks", lambda e, names: [
+        {"service": "orders", "function_qualified_name": "Item.py::Item.equals", "text": "code", "score": 0.9},
+        {"service": "orders", "function_qualified_name": "Cart.py::add_item", "text": "code", "score": 0.8},
+    ])
+    monkeypatch.setattr(query_flow.candidates, "select_relevant_functions_by_embedding", lambda hits: hits)
+
+    def fake_build_user_prompt(
+        issue_text,
+        docs,
+        code_symbols_by_service=None,
+        snippets_by_key=None,
+        seed_names=None,
+        known_dependencies=None,
+    ):
+        calls.append(code_symbols_by_service)
+        return "user"
+
+    monkeypatch.setattr(query_flow.planner, "build_system_prompt", lambda: "system")
+    monkeypatch.setattr(query_flow.planner, "build_user_prompt", fake_build_user_prompt)
+
+    async def fake_call_llm(system_prompt, user_prompt):
+        return "raw"
+
+    monkeypatch.setattr(query_flow.planner, "call_llm", fake_call_llm)
+    monkeypatch.setattr(query_flow.planner, "parse_tdd", lambda raw: FakeTdd(services=[FakeServicePlan("orders")]))
+
+    await query_flow.build_tdd("issue text", top_k=3, hops=1)
+
+    code_symbols = calls[0]["orders"]
+    qnames = {s["qualified_name"] for s in code_symbols}
+    assert "Item.py::Item" in qnames  # the matched class itself
+    assert "Item.py::Item.equals" not in qnames  # its own method — already covered by the class above
+    assert "Cart.py::add_item" in qnames  # unrelated function — still shown normally
+
+
+@pytest.mark.asyncio
 async def test_build_tdd_scopes_dependency_diagram_to_flagged_services_only(monkeypatch):
     """Regression test: with top_k larger than the real service count, the raw
     candidate pool can include services unrelated to the issue (e.g. orders/
@@ -178,7 +255,7 @@ async def test_build_tdd_scopes_dependency_diagram_to_flagged_services_only(monk
         return ["user", "orders", "shipping", "flask"]
 
     def fake_load_candidate_docs(names):
-        return [{"name": n, "full_doc": "d", "key_symbols": [], "domain": None} for n in names]
+        return [{"name": n, "summary": "d"} for n in names]
 
     def fake_load_code_symbols(names):
         return []
@@ -275,7 +352,7 @@ async def test_build_tdd_widens_dependency_scope_to_architecture_diagram_targets
         return ["orders", "shipping"]
 
     def fake_load_candidate_docs(names):
-        return [{"name": n, "full_doc": "d", "key_symbols": [], "domain": None} for n in names]
+        return [{"name": n, "summary": "d"} for n in names]
 
     def fake_load_code_symbols(names):
         return []
@@ -435,3 +512,55 @@ async def test_build_tdd_propagates_tdd_parse_error(monkeypatch):
 
     with pytest.raises(TddParseError):
         await query_flow.build_tdd("issue text")
+
+
+@pytest.mark.asyncio
+async def test_build_tdd_verifies_changes_against_the_graph(monkeypatch):
+    """build_tdd must hand every change to the verifier, along with the files
+    whose code was shown to the LLM."""
+    from src.query.models import FileChange, ServicePlan, TechnicalDesignDoc
+
+    async def fake_embed(text):
+        return [0.1]
+
+    monkeypatch.setattr(query_flow, "embed", fake_embed)
+    monkeypatch.setattr(query_flow.graph_reader, "vector_search_services", lambda e, k: [{"name": "ui", "score": 0.9}])
+    monkeypatch.setattr(query_flow.graph_reader, "expand_neighbors", lambda names, hops: [])
+    monkeypatch.setattr(query_flow.graph_reader, "load_candidate_docs", lambda names: [{"name": "ui", "summary": "d"}])
+    monkeypatch.setattr(query_flow.graph_reader, "get_edges_among", lambda names: [])
+    monkeypatch.setattr(
+        query_flow.graph_reader,
+        "load_code_symbols_for_services",
+        lambda names: [
+            {"service": "ui", "kind": "Function", "name": "view", "qualified_name": "src/m/view.tsx::M.view",
+             "file_path": "src/m/view.tsx", "parent_class": None, "line_start": 1, "line_end": 2,
+             "signature": "view()", "docstring": None, "language": "typescript"}
+        ],
+    )
+    monkeypatch.setattr(query_flow.graph_reader, "load_source_snippets", lambda pairs: {})
+    monkeypatch.setattr(query_flow.graph_reader, "vector_search_chunks", lambda e, names: [
+        {"service": "ui", "function_qualified_name": "src/m/view.tsx::M.view", "text": "code", "score": 0.9},
+    ])
+    monkeypatch.setattr(query_flow.candidates, "select_relevant_functions_by_embedding", lambda hits: hits)
+
+    change = FileChange(
+        file_path="src/m", function_or_symbol="ghost", change_description="d",
+        implementation_notes="i", pseudocode_sketch="p", reasoning="r",
+    )
+    tdd = TechnicalDesignDoc(
+        title="t", issue_summary="s", overall_reasoning="r",
+        services=[ServicePlan(service="ui", complexity="low", reasoning="r", changes=[change])],
+    )
+
+    async def fake_call_llm(system_prompt, user_prompt):
+        return "raw"
+
+    monkeypatch.setattr(query_flow.planner, "call_llm", fake_call_llm)
+    monkeypatch.setattr(query_flow.planner, "parse_tdd", lambda raw: tdd)
+    seen = {}
+    monkeypatch.setattr(query_flow, "verify_tdd", lambda t, shown: seen.update(tdd=t, shown=shown))
+
+    result = await query_flow.build_tdd("issue", top_k=1, hops=1)
+
+    assert seen["tdd"] is result
+    assert seen["shown"] == {"ui": {"src/m/view.tsx"}}

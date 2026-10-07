@@ -1,0 +1,27 @@
+# Service manifest: the ingestion pipeline's only source of "which services
+# exist and which repo to clone for each" — replaces the old S3/RepoDocAI-doc
+# listing entirely. Add a service by adding an entry here; nothing else
+# needs editing.
+#
+# Fields:
+#   name   - required. Canonical service name, used as the Service node's
+#            key in Neo4j and for --service filtering.
+#   repo   - required. "org/repo" GitHub slug to clone.
+#   branch - optional. Defaults to the repo's default branch when omitted.
+services:
+  - name: orders
+    repo: suhaniimittal/orders
+  - name: user
+    repo: suhaniimittal/user
+  - name: shipping
+    repo: suhaniimittal/shipping
+  - name: codemanager
+    repo: sathvikchoudar61/CodeManager
+  - name: cart-service
+    repo: suhaniimittal/cart-service
+  - name: spring-security
+    repo: suhaniimittal/spring-security
+  - name: bank-transfer-service
+    repo: suhaniimittal/bank-transfer-service
+
+ 

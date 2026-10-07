@@ -2,7 +2,7 @@
 bug report, narrow the graph down to a handful of relevant services and
 produce a structured technical design doc via a single LLM call.
 
-Mirrors how ingest.py orchestrates over extractors.py/embedder.py/graph_writer.py.
+Mirrors how ingest.py orchestrates over embedder.py/graph_writer.py.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from src.ingestion.embedder import embed
 
 from . import candidates, graph_reader, planner
 from .models import ServiceDependency, TechnicalDesignDoc
+from .verify import verify_tdd
 
 
 def _print_selection_debug(
@@ -27,7 +28,7 @@ def _print_selection_debug(
     seed_set = set(seed_names)
     print("  [DEBUG] Candidate services:")
     for name in candidate_names:
-        tag = "seed — full doc" if name in seed_set else "neighbor — summary only"
+        tag = "seed" if name in seed_set else "neighbor — summary only"
         print(f"    - {name} ({tag})")
 
     by_service: dict[str, list[dict]] = {}
@@ -121,8 +122,16 @@ async def build_tdd(
     # embedded at ingestion time (see the chunking design) — so keyword
     # overlap is still the only relevance signal available for them.
     relevant_classes = candidates.select_relevant_symbols(raw_classes, issue_text)
+    # A matched class's full source_snippet already contains every one of
+    # its own methods verbatim — tracked here so a method belonging to one
+    # of these classes never ALSO gets shown a second time as its own
+    # separate Function entry below (real duplication this caused before
+    # this check existed: the same method's code appearing twice in one
+    # prompt, once buried in its class and once highlighted on its own).
+    matched_class_qnames_by_service: dict[str, set[str]] = {}
     for symbol in relevant_classes:
         code_symbols_by_service.setdefault(symbol["service"], []).append(symbol)
+        matched_class_qnames_by_service.setdefault(symbol["service"], set()).add(symbol["qualified_name"])
         selection_log.append(
             {
                 "service": symbol["service"],
@@ -138,6 +147,9 @@ async def build_tdd(
         )
     )
 
+    def _already_shown_via_its_class(service: str, parent_class: str | None) -> bool:
+        return parent_class is not None and parent_class in matched_class_qnames_by_service.get(service, set())
+
     # Functions: real semantic similarity is the primary signal now, via the
     # chunk embeddings built at ingestion time — reusing the SAME issue
     # embedding already computed above, not a second embed() call.
@@ -150,6 +162,8 @@ async def build_tdd(
         meta = metadata_by_key.get(key)
         if meta is None:
             continue  # stale hit (function renamed/removed since the chunk was embedded) — skip, never fabricate metadata
+        if _already_shown_via_its_class(hit["service"], meta.get("parent_class")):
+            continue  # this method's code is already fully visible in its class's own snippet above
         code_symbols_by_service.setdefault(hit["service"], []).append(meta)
         # The winning CHUNK's text, not the function's full source_snippet —
         # the relevant slice for a long function, the whole thing for a
@@ -174,7 +188,12 @@ async def build_tdd(
     if services_needing_fallback:
         fallback_pool = [s for s in raw_functions if s["service"] in services_needing_fallback]
         fallback_ranked = candidates.select_relevant_symbols(fallback_pool, issue_text)
-        for symbol in fallback_ranked:
+        fallback_kept = [
+            symbol
+            for symbol in fallback_ranked
+            if not _already_shown_via_its_class(symbol["service"], symbol.get("parent_class"))
+        ]
+        for symbol in fallback_kept:
             code_symbols_by_service.setdefault(symbol["service"], []).append(symbol)
             selection_log.append(
                 {
@@ -187,7 +206,7 @@ async def build_tdd(
             )
         snippet_map.update(
             graph_reader.load_source_snippets(
-                [(s["service"], s["qualified_name"]) for s in fallback_ranked]
+                [(s["service"], s["qualified_name"]) for s in fallback_kept]
             )
         )
 
@@ -253,5 +272,14 @@ async def build_tdd(
         candidates_for_service = matchable_names_with_snippet.get(service_plan.service, set())
         for change in service_plan.changes:
             change.has_real_source = change.function_or_symbol in candidates_for_service
+
+    # Every file/symbol the LLM named, checked against the real code graph —
+    # same "verify, don't trust" principle as above, applied to the paths a
+    # coding agent will actually open.
+    shown_files_by_service = {
+        service: {symbol["file_path"] for symbol in symbols if symbol.get("file_path")}
+        for service, symbols in code_symbols_by_service.items()
+    }
+    verify_tdd(tdd, shown_files_by_service)
 
     return tdd

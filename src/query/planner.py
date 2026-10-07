@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 from typing import get_origin
 
 from pydantic import BaseModel, ValidationError
@@ -30,13 +31,46 @@ from .models import FileChange, ServicePlan, TechnicalDesignDoc
 _GATEWAY_PROVIDER, _GATEWAY_MODEL = "anthropic", "claude-sonnet-4-6"
 _OPENAI_MODEL = "gpt-4o"
 
+# Low, not the API default of 1.0: the same issue and the same code shown to
+# the model should produce nearly the same TDD — at 1.0, one run named three
+# real backend files and the next only a UI folder, from identical input.
+# Not 0, so the model can still word things naturally.
+_TEMPERATURE = 0.2
+
 
 class TddParseError(Exception):
     """Raised when the LLM's raw output can't be parsed into a TechnicalDesignDoc."""
 
 
+_SCHEMA_NODE_MARKERS = ("type", "$ref", "allOf", "anyOf", "enum")
+
+
+def _strip_schema_titles(node: object) -> object:
+    """Pydantic's model_json_schema() adds a "title" key to every schema
+    NODE purely as cosmetic metadata (the class/field name, title-cased) —
+    e.g. the whole schema's own top-level "title": "TechnicalDesignDoc"
+    sits directly above the TDD's actual `title` FIELD's schema (itself
+    carrying its own cosmetic "title": "Title"). Dumped raw into the
+    prompt, that collision is a real, observed failure mode: the model
+    echoed the schema's class name back as the TDD's title verbatim.
+
+    Only removes "title" from a dict that looks like an actual schema node
+    (one of the markers above present as a sibling key) — NOT from a
+    "properties" mapping, whose keys are real field names (one of which is
+    legitimately "title" itself, e.g. TechnicalDesignDoc.title) and must
+    never be dropped just because a key happens to match this string."""
+    if isinstance(node, dict):
+        stripped = {k: _strip_schema_titles(v) for k, v in node.items()}
+        if "title" in stripped and any(marker in stripped for marker in _SCHEMA_NODE_MARKERS):
+            del stripped["title"]
+        return stripped
+    if isinstance(node, list):
+        return [_strip_schema_titles(v) for v in node]
+    return node
+
+
 def build_system_prompt() -> str:
-    schema = json.dumps(TechnicalDesignDoc.model_json_schema(), indent=2)
+    schema = json.dumps(_strip_schema_titles(TechnicalDesignDoc.model_json_schema()), indent=2)
     return (
         "You are a senior software architect analyzing a requirement/bug "
         "report and producing the structured data behind an "
@@ -78,35 +112,40 @@ def build_system_prompt() -> str:
         "Some services below also include a '### Real code symbols' section, "
         "parsed directly from that service's actual source code (real file "
         "paths, line numbers, signatures, and — for a shortlisted subset — "
-        "real source snippets). When a service has this section, PREFER its "
-        "`file_path`/`function_or_symbol` values over anything in the 'File "
-        "Reference' table of that service's documentation, since it comes "
-        "from parsed code rather than prose. Services WITHOUT a 'Real code "
-        "symbols' section have no parsed source available — for those, fall "
-        "back to the exact `file_path` as it appears in that service's own "
-        "'File Reference' table, and never invent or guess a path that isn't "
-        "written there. If no file path can be identified for a given symbol "
-        "in either source, set `file_path` to null rather than guessing. A "
-        "single candidate set can be mixed — some services grounded in real "
-        "code, others in documentation only — so do not assume uniform "
-        "confidence across all services in your answer.\n\n"
+        "real source snippets). Each symbol there is listed as "
+        "`path/to/File.ext:START-END` — that START-END line range is shown "
+        "ONLY so you can see roughly how big/where the symbol is; it is "
+        "NEVER part of the file_path itself. When you set `file_path` in "
+        "your answer, copy ONLY the plain path before the colon (e.g. "
+        "`path/to/File.ext`) — never append `:START-END` or any other line "
+        "range to it, since a downstream tool resolves `file_path` as a "
+        "literal path on disk. Do use the `function_or_symbol`/`file_path` "
+        "values (path portion only) from this section when a service has "
+        "it, since it comes from parsed code rather than prose. Services "
+        "WITHOUT a 'Real code symbols' section have NO parsed source "
+        "available and no other source of file paths either — for those, "
+        "set `file_path` to null rather than guessing one. A single "
+        "candidate set can be mixed — "
+        "some services grounded in real code, others with only a short "
+        "summary — so do not assume uniform confidence across all services "
+        "in your answer.\n\n"
         "Some services are marked as included only because they're "
         "graph-connected to a directly relevant service (a real CALLS "
         "relationship), not because their own content matched the issue — "
-        "their full documentation is omitted, showing only their domain and "
-        "key symbols (plus a 'Real code symbols' section if their code was "
-        "still a real match). Treat these as background context for "
-        "understanding dependencies, not primary candidates for changes, "
-        "unless their 'Real code symbols' section itself shows something "
-        "directly relevant.\n\n"
+        "only their short summary is shown (plus a 'Real code symbols' "
+        "section if their code was still a real match). Treat these as "
+        "background context for understanding dependencies, not primary "
+        "candidates for changes, unless their 'Real code symbols' section "
+        "itself shows something directly relevant.\n\n"
         "Separate WHAT should change (`change_description`) from WHY "
         "(`reasoning`) — do not conflate them.\n\n"
         "List anything that couldn't be determined from the documentation "
         "alone in `risks` or `open_questions` rather than stating it as fact.\n\n"
         "Leave `service_dependencies` as an empty list — it is filled in "
         "automatically afterward from the real service graph, not by you. "
-        "Likewise, leave `has_real_source` on every change as false — it is "
-        "also filled in afterward, from the real code graph, not by you.\n\n"
+        "Likewise, leave `has_real_source` on every change as false, and "
+        "`verification`/`verification_note` as null — they are also filled "
+        "in afterward, from the real code graph, not by you.\n\n"
         "For each change, also provide `implementation_notes` — a concrete, "
         "step-by-step description of the approach (not just what and why, "
         "but roughly how) — `current_behavior` describing what the symbol "
@@ -296,30 +335,19 @@ def build_user_prompt(
 
     `seed_names`: services that were DIRECT semantic matches to the issue
     (vector_search_services hits), as opposed to ones only pulled in via a
-    1-2 hop CALLS traversal from a seed. Neighbors get only a short summary
-    — a neighbor is a speculative "might be related via the call graph"
-    candidate, not a confirmed-relevant one, so giving it the entire doc
-    (often several thousand words) was diluting the prompt with mostly-
-    irrelevant text for every candidate that happened to be graph-adjacent.
-    `None` (the default) treats every candidate as a seed, preserving old
-    behavior for any caller that doesn't distinguish them.
+    1-2 hop CALLS traversal from a seed. `None` (the default) treats every
+    candidate as a seed, preserving old behavior for any caller that doesn't
+    distinguish them.
 
-    Among seeds, whether the FULL doc is worth including further depends on
-    whether real code symbols exist for that service: once real, parsed
-    code is available (see `code_symbols_by_service`), the doc's detailed
-    file-by-file prose is largely superseded by it — only the short,
-    business-context `summary` (extracted once at ingestion time) still
-    adds something the code itself can't. A seed with NO matched code ALSO
-    only gets the summary, never the full doc — "seed" only means "scored
-    in the top-k service search," which can be a weak, coincidental match
-    rather than a confirmed one (especially when several services' summary
-    embeddings score close together, which happens often on a small graph).
-    Rewarding that unconfirmed match with the single most expensive kind of
-    content — its entire multi-thousand-word documentation — was exactly
-    backwards: a seed that turned out to have nothing relevant in its code
-    is the LEAST justified case for spending the most tokens, not the most.
-    If a service really is the relevant one, its summary (plus real code
-    symbols, if any were found) should already make that case on its own.
+    Every candidate service only ever gets its short, code-derived `summary`
+    (see summarizer.py) — there is no longer a separate "full doc" tier to
+    choose between; the real per-symbol detail comes entirely from
+    `code_symbols_by_service`/`snippets_by_key` when a service's code graph
+    matched. A seed with no matched code, or a graph-neighbor pulled in via
+    CALLS, both get only the summary — "seed" just means "scored in the
+    top-k service search," which can be a weak, coincidental match rather
+    than a confirmed one, so it earns no special extra content beyond that
+    summary and whatever real code symbols were separately found relevant.
     """
     code_symbols_by_service = code_symbols_by_service or {}
     snippets_by_key = snippets_by_key or {}
@@ -333,45 +361,39 @@ def build_user_prompt(
             "already confirmed real, not something to double-check or "
             "second-guess)\n" + edges + "\n"
         )
+
     for doc in candidate_docs:
-        symbols = ", ".join(doc.get("key_symbols") or [])
         is_seed = seed_names is None or doc["name"] in seed_names
         code_symbols = code_symbols_by_service.get(doc["name"])
+        summary_line = f"Summary: {doc.get('summary') or 'Not available.'}\n"
 
         if not is_seed:
-            doc_body = (
+            doc_body = summary_line + (
                 "(Included only because it's graph-connected to a directly "
                 "matched service, not a direct semantic match itself — "
-                "summary only, full documentation omitted to keep this "
-                "prompt focused.)\n"
+                "treat as background context for dependencies, not a "
+                "primary candidate for changes, unless its 'Real code "
+                "symbols' section below shows something directly relevant.)\n"
             )
         elif code_symbols:
-            doc_body = (
-                f"Summary: {doc.get('summary') or 'Not available.'}\n"
+            doc_body = summary_line + (
                 "(Real code was found for this service — see 'Real code "
-                "symbols' below, which reflects the actual parsed source. "
-                "The service's detailed file-by-file documentation is "
-                "omitted here since it's superseded by that real code; this "
-                "summary is kept only for the business context code alone "
-                "doesn't carry.)\n"
+                "symbols' below, which reflects the actual parsed source; "
+                "this summary is kept only for business context the code "
+                "itself doesn't carry.)\n"
             )
         else:
-            doc_body = (
-                f"Summary: {doc.get('summary') or 'Not available.'}\n"
+            doc_body = summary_line + (
                 "(This service matched at the summary level only — no real "
-                "code symbols were found relevant to this issue, so its "
-                "full documentation is omitted here to keep this prompt "
-                "focused. A summary-only match is not automatically a "
-                "confirmed one: treat this the same way you'd treat a "
-                "graph-connected neighbor — background context, not a "
-                "primary candidate for changes — unless this summary or "
-                "its key symbols clearly and specifically support it.)\n"
+                "code symbols were found relevant to this issue. A "
+                "summary-only match is not automatically a confirmed one: "
+                "treat this the same way you'd treat a graph-connected "
+                "neighbor — background context, not a primary candidate for "
+                "changes — unless this summary clearly and specifically "
+                "supports it.)\n"
             )
 
-        section = (
-            f"## Service: {doc['name']}\nDomain: {doc.get('domain') or 'unknown'}\n"
-            f"Key symbols: {symbols}\n\n{doc_body}"
-        )
+        section = f"## Service: {doc['name']}\n\n{doc_body}"
         if code_symbols:
             lines = [
                 _format_code_symbol(
@@ -407,6 +429,7 @@ async def _plan_via_gateway(system_prompt: str, user_prompt: str) -> str:
             # multi-line ASCII diagrams plus everything else can still eat
             # into it fast.
             max_tokens=12000,
+            temperature=_TEMPERATURE,
         )
         return reply["content"]
 
@@ -423,6 +446,7 @@ async def _plan_via_openai(system_prompt: str, user_prompt: str) -> str:
         ],
         response_format={"type": "json_object"},
         max_tokens=12000,
+        temperature=_TEMPERATURE,
     )
     return resp.choices[0].message.content
 
@@ -494,6 +518,28 @@ def _repair_missing_fields(data: dict, errors: list[dict]) -> tuple[dict, list[s
     return repaired, notes
 
 
+_TRAILING_LINE_RANGE = re.compile(r":\d+-\d+$")
+
+
+def _strip_line_ranges(tdd: TechnicalDesignDoc) -> TechnicalDesignDoc:
+    """Defense-in-depth, not a substitute for the prompt fix: the model is
+    shown each real code symbol's location as `path:START-END` (see
+    _format_code_symbol) and occasionally echoes that whole string back
+    into `file_path` instead of the bare path. A downstream coding-agent
+    step resolves `file_path` as a literal path on disk — a stray
+    `:START-END` suffix would make every lookup for that file silently
+    fail (never found in the graph, never found in a clone), so it's
+    stripped here unconditionally rather than trusted from the model's own
+    output, same "verify/normalize, don't just hope" principle already
+    used for service_dependencies/has_real_source elsewhere in this
+    pipeline."""
+    for service_plan in tdd.services:
+        for change in service_plan.changes:
+            if change.file_path:
+                change.file_path = _TRAILING_LINE_RANGE.sub("", change.file_path)
+    return tdd
+
+
 def parse_tdd(raw_llm_output: str) -> TechnicalDesignDoc:
     text = raw_llm_output.strip()
     if text.startswith("```"):
@@ -507,7 +553,7 @@ def parse_tdd(raw_llm_output: str) -> TechnicalDesignDoc:
         raise TddParseError(f"not valid JSON: {e}\nRaw: {raw_llm_output[:500]}") from e
 
     try:
-        return TechnicalDesignDoc.model_validate(data)
+        return _strip_line_ranges(TechnicalDesignDoc.model_validate(data))
     except ValidationError as e:
         repair = _repair_missing_fields(data, e.errors())
         if repair is None:
@@ -520,4 +566,4 @@ def parse_tdd(raw_llm_output: str) -> TechnicalDesignDoc:
                 f"JSON didn't match schema even after filling missing fields: {e2}"
             ) from e2
         tdd.open_questions = [*notes, *tdd.open_questions]
-        return tdd
+        return _strip_line_ranges(tdd)
