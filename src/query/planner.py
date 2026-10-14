@@ -29,13 +29,28 @@ from pydantic import BaseModel, ValidationError
 from .models import FileChange, ServicePlan, TechnicalDesignDoc
 
 _GATEWAY_PROVIDER, _GATEWAY_MODEL = "anthropic", "claude-sonnet-4-6"
-_OPENAI_MODEL = "gpt-4o"
+# gpt-5.4, not 5.5: the newer model refuses `temperature` outright ("does not
+# support 0 with this model"), leaving the API default of 1.0, and the same
+# ticket then produced visibly different TDDs run to run. 5.4 is one
+# generation back but accepts both temperature and a seed.
+_OPENAI_MODEL = "gpt-5.4"
+# Models that spend part of the output budget thinking before writing, and
+# whose API takes `max_completion_tokens` rather than `max_tokens`.
+_OPENAI_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+# Models in that family that additionally REFUSE `temperature` (only the
+# default is allowed). Checked before the prefix list above, which they also
+# match. Verified against the API, not assumed.
+_OPENAI_NO_TEMPERATURE_PREFIXES = ("gpt-5.5", "gpt-5.6", "o1", "o3", "o4")
+_OPENAI_REASONING_MAX_TOKENS = 40000
 
-# Low, not the API default of 1.0: the same issue and the same code shown to
-# the model should produce nearly the same TDD — at 1.0, one run named three
-# real backend files and the next only a UI folder, from identical input.
-# Not 0, so the model can still word things naturally.
-_TEMPERATURE = 0.2
+# 0, not the API default of 1.0: the same ticket and the same code must give
+# the same TDD. At 1.0 one run named three real backend files and the next
+# only a UI folder, from identical input.
+_TEMPERATURE = 0
+# Any fixed value; it only has to stay the same across runs so the model
+# starts from the same point. Output is still not byte-identical every time
+# (GPU arithmetic is not perfectly reproducible), but the large swings go.
+_SEED = 7
 
 
 class TddParseError(Exception):
@@ -90,9 +105,15 @@ def build_system_prompt() -> str:
         "3. If information cannot be determined, leave the field null/empty "
         "(for a list) rather than guessing, and note the gap in "
         "`open_questions` or `risks` if it could affect implementation.\n"
-        "4. Keep scope limited to what's actually relevant to the "
-        "requirement — do not include a service or file merely because it "
-        "exists or could theoretically be involved.\n"
+        "4. ONLY FIX WHAT THE TICKET REPORTS. The ticket defines the scope. "
+        "Every change you propose must be needed to fix the specific problem "
+        "it describes — not an improvement you noticed along the way, not a "
+        "related weakness in nearby code, not a second place with the same "
+        "shape of bug that the ticket never mentions. Nobody asked for those, "
+        "and a reviewer will reject them. If you genuinely spot a related "
+        "problem outside the report, state it in ONE line under `risks` and "
+        "propose no change for it. Do not include a service or file merely "
+        "because it exists or could theoretically be involved.\n"
         "5. Distinguish clearly between existing behavior, proposed "
         "behavior, and the reason for the change — never conflate WHAT "
         "changes with WHY it changes.\n"
@@ -141,6 +162,15 @@ def build_system_prompt() -> str:
         "(`reasoning`) — do not conflate them.\n\n"
         "List anything that couldn't be determined from the documentation "
         "alone in `risks` or `open_questions` rather than stating it as fact.\n\n"
+        "Every service that has a 'Real code symbols' section and is NOT "
+        "marked as graph-connected background context was chosen as likely "
+        "involved in this issue. For EACH of those services, either propose "
+        "at least one concrete change in a file listed in its 'Real code "
+        "symbols' section, or still include it in `services` with an empty "
+        "`changes` list and explain in its `reasoning` exactly why it needs "
+        "no change. Never silently leave one out. For a service the reported "
+        "problem does not touch, \"no change needed\" IS the correct answer — "
+        "do not invent work for it to look thorough.\n\n"
         "Leave `service_dependencies` as an empty list — it is filled in "
         "automatically afterward from the real service graph, not by you. "
         "Likewise, leave `has_real_source` on every change as false, and "
@@ -209,24 +239,21 @@ def build_system_prompt() -> str:
         "alone. Also describe `current_architecture` as prose — this is the "
         "narrative WHY behind the structure (not a restatement of the "
         "component list, which is just the WHAT).\n\n"
-        "BEFORE writing `root_cause_analysis`, you must actually TRACE the "
-        "real code you were shown — do not summarize it generically. For "
-        "every function in a 'Real code symbols' section that's relevant "
-        "to this issue, walk through what it literally does, in order: "
-        "what it receives as input, each real operation it performs on "
-        "that data (quoting or closely paraphrasing the actual lines, not "
-        "a generic description like \"processes the request\"), and what "
-        "it returns or passes onward. Only after this literal trace should "
-        "you state `root_cause_analysis` — and the confirmed/likely/"
-        "unknown distinction below must be grounded in that trace, not in "
-        "how a similar-sounding bug \"usually\" happens in systems like "
-        "this. If a symbol you need to reason about has NO real source (a "
-        "documentation-only service), say so explicitly rather than "
-        "describing its internals as if you'd seen them.\n\n"
-        "Then describe `root_cause_analysis`, explicitly distinguishing a "
-        "confirmed cause (evidenced by real code/docs) from a likely cause "
-        "(plausible but unconfirmed) from an unknown cause — never present a "
-        "guess as confirmed. Mirror the same pattern for the proposed "
+        "BEFORE writing `root_cause_analysis`, actually TRACE the real "
+        "code you were shown, for yourself: what each relevant function "
+        "receives, what it really does with that data, and what it returns "
+        "— grounded in its actual lines, not in how a similar-sounding bug "
+        "\"usually\" happens. Do this tracing in your head; WRITE only the "
+        "conclusions it supports (see the format below), never the "
+        "walk-through itself. If a symbol you need has NO real source, say "
+        "so rather than describing its internals as if you'd seen them.\n\n"
+        "Then write `root_cause_analysis` as a few short lines, each one "
+        "starting with its certainty and naming its evidence (file and "
+        "function), e.g.:\n"
+        "Confirmed: <cause> — <file>: <what that code does>.\n"
+        "Likely: <cause> — <why it's only likely>.\n"
+        "Not the cause: <ruled-out part> — <why>.\n"
+        "Never present a guess as confirmed. Mirror the same pattern for the proposed "
         "system: `proposed_solution` (what changes, what stays, which "
         "components participate, how it resolves the issue), "
         "`proposed_architecture` (prose) + `proposed_architecture_"
@@ -291,25 +318,49 @@ def build_system_prompt() -> str:
         "rather than inventing plausible-sounding detail. Thoroughness means "
         "using everything the documentation gives you, not adding facts it "
         "doesn't contain.\n\n"
-        "You no longer need to spend any effort hand-drawing diagrams — that "
-        "is handled separately from structured facts you provide above. "
-        "Put that freed-up effort into DEPTH on `root_cause_analysis`, "
-        "`proposed_solution`, and every `reasoning`/`change_description`/"
-        "`implementation_notes` field: write multiple sentences that "
-        "actually explain the reasoning chain (this is true because X, "
-        "which means Y, therefore Z), not a single terse label. A short "
-        "phrase where a real explanation is possible is a worse answer, "
-        "even if it's not technically wrong.\n\n"
+        "WRITE FOR A BUSY DEVELOPER: short, specific, no repetition. "
+        "The document is read top to bottom by someone who will make the "
+        "change, so every sentence must add a fact they need.\n"
+        "- `issue_summary`: 2-4 sentences restating the reported problem — "
+        "what the user sees, where, and the trigger. No causes or fixes.\n"
+        "- `proposed_solution`: 2-5 sentences — what changes, in which "
+        "services, and how that resolves the issue.\n"
+        "- Each change's `change_description`, `implementation_notes` and "
+        "`reasoning`: 1-3 sentences each, naming the concrete thing (field, "
+        "condition, call) — never restating the issue.\n"
+        "- `function_or_symbol` is exactly ONE symbol name as listed in "
+        "'Real code symbols' (e.g. `isPhoneValid` or `Form.validate`), never "
+        "two names joined with '/' or 'and'. If two functions change, that "
+        "is two separate changes.\n"
+        "- `pseudocode_sketch`: only the lines that change, at most ~10.\n"
+        "- Leave `sequence_steps` empty and `current_architecture` and "
+        "`overall_reasoning` to one sentence each — they are not shown.\n"
+        "- Don't repeat the same fact in several fields; say it once in the "
+        "field it belongs to.\n\n"
         "Respond with ONLY one JSON object matching this schema, no markdown "
         "fences, no prose outside the JSON:\n" + schema
     )
 
 
-def _format_code_symbol(symbol: dict, snippet: str | None) -> str:
+_MAX_FILE_CONTEXT_NAMES = 20
+
+
+def _format_code_symbol(
+    symbol: dict, snippet: str | None, file_neighbors: list[str] | None = None
+) -> str:
     location = f"{symbol['file_path']}:{symbol['line_start']}-{symbol['line_end']}"
     line = f"- `{location}` `{symbol['qualified_name']}` — `{symbol['signature']}`"
     if symbol.get("docstring"):
         line += f"\n  {symbol['docstring']}"
+    if symbol.get("matched_identifiers"):
+        named = ", ".join(f"`{w}`" for w in symbol["matched_identifiers"])
+        line += f"\n  Contains {named}, named in the issue itself."
+    others = [n for n in file_neighbors or [] if n != symbol["name"]]
+    if others:
+        shown = ", ".join(others[:_MAX_FILE_CONTEXT_NAMES])
+        hidden = len(others) - _MAX_FILE_CONTEXT_NAMES
+        more = f" (+{hidden} more)" if hidden > 0 else ""
+        line += f"\n  Also defined in this file: {shown}{more}"
     if snippet:
         line += f"\n  ```{symbol.get('language') or ''}\n{snippet}\n  ```"
     return line
@@ -322,6 +373,7 @@ def build_user_prompt(
     snippets_by_key: dict[tuple[str, str], str] | None = None,
     seed_names: set[str] | None = None,
     known_dependencies: list[dict] | None = None,
+    file_context: dict[tuple[str, str], list[str]] | None = None,
 ) -> str:
     """`known_dependencies`: real CALLS edges among the candidate services,
     read from the graph BEFORE the LLM call — shown here as confirmed
@@ -351,6 +403,7 @@ def build_user_prompt(
     """
     code_symbols_by_service = code_symbols_by_service or {}
     snippets_by_key = snippets_by_key or {}
+    file_context = file_context or {}
 
     sections = [f"## Issue\n{issue_text}\n"]
 
@@ -397,7 +450,9 @@ def build_user_prompt(
         if code_symbols:
             lines = [
                 _format_code_symbol(
-                    symbol, snippets_by_key.get((doc["name"], symbol["qualified_name"]))
+                    symbol,
+                    snippets_by_key.get((doc["name"], symbol["qualified_name"])),
+                    file_context.get((doc["name"], symbol["file_path"])),
                 )
                 for symbol in code_symbols
             ]
@@ -434,6 +489,24 @@ async def _plan_via_gateway(system_prompt: str, user_prompt: str) -> str:
         return reply["content"]
 
 
+def _openai_params(model: str) -> dict:
+    """Output-length and sampling settings for `model`.
+
+    Three shapes, because the families differ: a thinking model needs
+    `max_completion_tokens` and room to think on top of the TDD itself, and
+    some of those also refuse `temperature`/`seed` entirely.
+    """
+    if model.startswith(_OPENAI_NO_TEMPERATURE_PREFIXES):
+        return {"max_completion_tokens": _OPENAI_REASONING_MAX_TOKENS}
+    if model.startswith(_OPENAI_REASONING_PREFIXES):
+        return {
+            "max_completion_tokens": _OPENAI_REASONING_MAX_TOKENS,
+            "temperature": _TEMPERATURE,
+            "seed": _SEED,
+        }
+    return {"max_tokens": 12000, "temperature": _TEMPERATURE, "seed": _SEED}
+
+
 async def _plan_via_openai(system_prompt: str, user_prompt: str) -> str:
     from openai import AsyncOpenAI
 
@@ -445,8 +518,7 @@ async def _plan_via_openai(system_prompt: str, user_prompt: str) -> str:
             {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
-        max_tokens=12000,
-        temperature=_TEMPERATURE,
+        **_openai_params(_OPENAI_MODEL),
     )
     return resp.choices[0].message.content
 

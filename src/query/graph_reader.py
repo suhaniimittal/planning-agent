@@ -7,6 +7,7 @@ kept separate since the two paths have different callers and failure modes
 from __future__ import annotations
 
 from src.ingestion.graph_writer import get_driver
+from src.ingestion.test_paths import CYPHER_TEST_PATH_RE
 
 
 def vector_search_services(embedding: list[float], k: int = 5) -> list[dict]:
@@ -237,3 +238,131 @@ def find_symbol_files(service: str, symbol: str) -> list[str]:
             by_class="." + symbol,
         )
         return sorted({r["file_path"] for r in result})
+
+
+# Real code only: `is_test` is stamped at ingestion; nodes ingested before it
+# existed fall back to the same path rule, evaluated here.
+_NOT_TEST = "NOT coalesce(c.is_test, c.file_path =~ $test_re)"
+
+
+def summary_scores(embedding: list[float], names: list[str] | None = None) -> dict[str, float]:
+    """{service: cosine(issue embedding, summary embedding)} for `names`
+    (every summarized service when None). Exact, not the vector index's
+    approximate top-k — a run never has more than a few dozen services."""
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            MATCH (s:Service)
+            WHERE s.summary_embedding IS NOT NULL AND ($names IS NULL OR s.name IN $names)
+            RETURN s.name AS name,
+                   vector.similarity.cosine(s.summary_embedding, $embedding) AS score
+            """,
+            names=names,
+            embedding=embedding,
+        )
+        return {r["name"]: r["score"] for r in result}
+
+
+def search_service_chunks(
+    service: str, vectors: list[list[float]], identifiers: list[str], k: int = 20
+) -> list[dict]:
+    """One service's best-matching NON-TEST chunks, searched within that
+    service only — so a large service can never crowd a small one out.
+
+    A chunk's score is its BEST cosine against any of `vectors` (the whole
+    ticket plus each of its parts) — matching one part of a multi-topic
+    ticket strongly is enough, so a specific detail is not averaged away.
+    Two reads, merged: the top `k` by that score, plus every chunk
+    containing one of `identifiers` (exact code names from the issue text),
+    whatever its score.
+
+    Returns [{"function_qualified_name", "text", "score", "identifiers"}].
+    """
+    score = (
+        "reduce(best = 0.0, v IN $vectors | "
+        "CASE WHEN vector.similarity.cosine(c.embedding, v) > best "
+        "THEN vector.similarity.cosine(c.embedding, v) ELSE best END)"
+    )
+    params = {"service": service, "vectors": vectors, "test_re": CYPHER_TEST_PATH_RE}
+    with get_driver().session() as session:
+        semantic = session.run(
+            f"""
+            MATCH (c:Chunk {{service: $service}})
+            WHERE {_NOT_TEST}
+            WITH c, {score} AS score
+            ORDER BY score DESC LIMIT $k
+            MATCH (f:Function)-[:HAS_CHUNK]->(c)
+            RETURN f.qualified_name AS function_qualified_name, c.text AS text, score,
+                   [] AS identifiers
+            """,
+            k=k,
+            **params,
+        )
+        rows = [dict(r) for r in semantic]
+        if identifiers:
+            exact = session.run(
+                f"""
+                MATCH (c:Chunk {{service: $service}})
+                WHERE any(w IN $identifiers WHERE c.text CONTAINS w) AND {_NOT_TEST}
+                WITH c, {score} AS score
+                MATCH (f:Function)-[:HAS_CHUNK]->(c)
+                RETURN f.qualified_name AS function_qualified_name, c.text AS text, score,
+                       [w IN $identifiers WHERE c.text CONTAINS w] AS identifiers
+                LIMIT 200
+                """,
+                identifiers=identifiers,
+                **params,
+            )
+            rows += [dict(r) for r in exact]
+        return rows
+
+
+def load_symbols(service_qualified_name_pairs: list[tuple[str, str]]) -> list[dict]:
+    """Full metadata AND source for exactly these (service, qualified_name)
+    Class/Function symbols — the final shortlist only."""
+    if not service_qualified_name_pairs:
+        return []
+    rows = [{"service": s, "qualified_name": q} for s, q in service_qualified_name_pairs]
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (n)
+            WHERE (n:Class OR n:Function)
+              AND n.service = row.service AND n.qualified_name = row.qualified_name
+            RETURN n.service AS service, n.qualified_name AS qualified_name,
+                   n.name AS name, n.file_path AS file_path,
+                   n.line_start AS line_start, n.line_end AS line_end,
+                   n.signature AS signature, n.docstring AS docstring,
+                   n.language AS language, n.source_snippet AS source_snippet,
+                   n.is_method AS is_method, n.parent_class AS parent_class,
+                   labels(n)[0] AS kind
+            """,
+            rows=rows,
+        )
+        return [dict(r) for r in result]
+
+
+def load_file_context(
+    service_file_pairs: list[tuple[str, str]],
+) -> dict[tuple[str, str], list[str]]:
+    """{(service, file_path): names of everything defined in that file} —
+    classes, top-level functions, and each class's methods as
+    "Class.method" — so the planner sees what a matched function sits next
+    to and can call, without being sent all of that code."""
+    if not service_file_pairs:
+        return {}
+    rows = [{"service": s, "file_path": f} for s, f in service_file_pairs]
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (file:File {service: row.service, file_path: row.file_path})-[:DEFINES]->(n)
+            OPTIONAL MATCH (n)-[:DECLARES]->(m:Function)
+            WITH row, n, collect(n.name + "." + m.name) AS methods
+            RETURN row.service AS service, row.file_path AS file_path,
+                   collect(n.name) + reduce(acc = [], ms IN collect(methods) | acc + ms) AS names
+            """,
+            rows=rows,
+        )
+        return {(r["service"], r["file_path"]): sorted(set(r["names"])) for r in result}

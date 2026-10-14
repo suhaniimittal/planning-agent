@@ -79,7 +79,17 @@ def test_chunk_row_builds_expected_shape():
         "text": "def create_order():\n    pass",
         "embedding": [0.1, 0.2],
         "language": "python",
+        "is_test": False,
     }
+
+
+def test_rows_mark_test_code():
+    test_fn = _fn_symbol(file_path="src/test/kotlin/OrderTests.kt")
+    chunk = CodeChunk(index=0, line_start=1, line_end=2, text="x")
+
+    assert ingest._function_row(test_fn)["is_test"] is True
+    assert ingest._chunk_row(test_fn, chunk, [0.1])["is_test"] is True
+    assert ingest._function_row(_fn_symbol())["is_test"] is False
 
 
 @pytest.mark.asyncio
@@ -1000,6 +1010,13 @@ def _patch_run_dependencies(monkeypatch):
         lambda name, repo: calls["upsert_service_node"].append((name, repo)),
     )
     monkeypatch.setattr(ingest.graph_writer, "create_vector_index", lambda: None)
+    # No service has a stored summary unless a test says otherwise, so the
+    # summarizer runs as it always did; the "keep what we have" path has its
+    # own test below.
+    calls["already_summarized"] = set()
+    monkeypatch.setattr(
+        ingest.graph_writer, "services_with_summaries", lambda names: calls["already_summarized"]
+    )
     monkeypatch.setattr(
         ingest.graph_writer,
         "update_service_summary",
@@ -1297,3 +1314,60 @@ async def test_sync_service_local_mode_bad_path_skips(monkeypatch, tmp_path):
 
     spec = ServiceSpec(name="orders", repo="org/orders-service")
     assert await ingest.sync_service(spec, None, {"orders"}) is None
+
+
+@pytest.mark.asyncio
+async def test_run_keeps_an_existing_summary_when_the_code_did_not_change(monkeypatch):
+    """A summary is written once. Re-summarizing unchanged code reworded it
+    every run, which moved its embedding, which silently reshuffled which
+    services a TDD considered at all — the same ticket then got a different
+    answer for no real reason."""
+    calls = _patch_run_dependencies(monkeypatch)
+    calls["already_summarized"] = {"orders", "shipping"}
+
+    async def unchanged(spec, github_token, known_service_names):
+        return None  # nothing re-ingested this run
+
+    monkeypatch.setattr(ingest, "sync_service", unchanged)
+
+    def must_not_be_read(name):
+        raise AssertionError(f"built a digest for {name}, which already has a summary")
+
+    monkeypatch.setattr(ingest.code_graph_writer, "load_current_symbols", must_not_be_read)
+
+    async def must_not_be_called(digests):
+        raise AssertionError("called the summarizer with nothing to summarize")
+
+    monkeypatch.setattr(ingest, "generate_summaries", must_not_be_called)
+
+    await ingest.run()
+
+    assert calls["update_service_summary"] == []
+
+
+@pytest.mark.asyncio
+async def test_run_summarizes_a_service_whose_code_changed_even_if_it_has_a_summary(monkeypatch):
+    """Keeping summaries must not mean stale ones: a service that was really
+    re-ingested this run gets re-summarized from its fresh graph."""
+    calls = _patch_run_dependencies(monkeypatch)
+    calls["already_summarized"] = {"orders", "shipping"}
+    graph = RepoGraph(classes=[_class_symbol("Order", "order.py")], functions=[])
+
+    async def changed(spec, github_token, known_service_names):
+        return graph if spec.name == "orders" else None
+
+    monkeypatch.setattr(ingest, "sync_service", changed)
+    monkeypatch.setattr(ingest.code_graph_writer, "load_current_symbols", lambda name: ([], []))
+
+    seen = {}
+
+    async def fake_summaries(digests):
+        seen["names"] = [d["service"] for d in digests]
+        return {"orders": "fresh summary"}
+
+    monkeypatch.setattr(ingest, "generate_summaries", fake_summaries)
+
+    await ingest.run()
+
+    assert seen["names"] == ["orders"]  # only the one that changed
+    assert [name for name, _, _ in calls["update_service_summary"]] == ["orders"]

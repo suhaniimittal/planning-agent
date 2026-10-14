@@ -33,6 +33,9 @@ from .render import render_text
 # is drawn off the right edge — still in the file's text, but invisible to a
 # reader. Lines are therefore wrapped here, before xhtml2pdf sees them.
 _WRAP_WIDTH = 100
+# A first line this short after wrapping is a label ("- ", "File:", "- modify:")
+# that lost its value to the next line.
+_MAX_LEAD_IN = 12
 
 
 def _split_long(line: str, continuation: str) -> list[str]:
@@ -61,13 +64,19 @@ def _wrap_lines(text: str) -> str:
             continue
         indent = line[: len(line) - len(line.lstrip(" "))]
         continuation = indent + "  "
-        for piece in textwrap.wrap(
+        pieces = textwrap.wrap(
             line,
             width=_WRAP_WIDTH,
             subsequent_indent=continuation,
             break_long_words=False,
             break_on_hyphens=False,
-        ):
+        )
+        # textwrap puts a token too long for the line (a deep path) on a line
+        # of its own, stranding a short lead-in like "- " or "File:" above it;
+        # rejoin them — _split_long then breaks the path at a "/" instead.
+        if len(pieces) > 1 and len(pieces[0].strip()) <= _MAX_LEAD_IN:
+            pieces = [pieces[0] + " " + pieces[1].strip(), *pieces[2:]]
+        for piece in pieces:
             wrapped.extend(_split_long(piece, continuation))
     return "\n".join(wrapped)
 

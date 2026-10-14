@@ -43,6 +43,7 @@ from .repo_fetcher import (
     local_repo_root,
 )
 from .summarizer import SummarizerError, build_digest, generate_summaries
+from .test_paths import is_test_path
 
 # How many repos to sync concurrently — serially syncing 40-50 repos would
 # otherwise dominate ingestion runtime; unbounded concurrency risks GitHub
@@ -90,6 +91,7 @@ def _class_row(symbol: ParsedSymbol) -> dict:
         "docstring": symbol.docstring,
         "source_snippet": symbol.source_snippet,
         "language": symbol.language,
+        "is_test": is_test_path(symbol.file_path),
     }
 
 
@@ -105,6 +107,7 @@ def _function_row(symbol: ParsedSymbol) -> dict:
         "source_snippet": symbol.source_snippet,
         "language": symbol.language,
         "is_method": symbol.is_method,
+        "is_test": is_test_path(symbol.file_path),
         "parent_class": symbol.parent_class,
     }
 
@@ -120,6 +123,7 @@ def _chunk_row(function_symbol: ParsedSymbol, chunk: CodeChunk, embedding: list[
         "text": chunk.text,
         "embedding": embedding,
         "language": function_symbol.language,
+        "is_test": is_test_path(function_symbol.file_path),
     }
 
 
@@ -624,6 +628,13 @@ async def run(
     results = await asyncio.gather(*(_one(spec) for spec in specs))
 
     print("\n=== Generating code-derived service summaries (one batched LLM call) ===")
+    # A summary is written ONCE and then left alone. Re-summarizing unchanged
+    # code rewords the summary every run, which moves its embedding, which
+    # silently reshuffles which services a TDD considers at all — the same
+    # ticket then gets a different answer for no real reason. Only a service
+    # whose code actually changed this run, or one that has no summary yet,
+    # is sent to the model.
+    already_summarized = graph_writer.services_with_summaries([name for name, _ in results])
     digests = []
     for name, graph in results:
         if graph is not None:
@@ -632,16 +643,20 @@ async def run(
             classes = [_class_row(c) for c in graph.classes]
             functions = [_function_row(f) for f in graph.functions]
             digests.append(build_digest(name, classes, functions))
-        else:
-            # No fresh RepoGraph this run (incremental sync, or already
-            # up to date) — rebuild the digest from the service's CURRENT
-            # state in Neo4j instead, never from a repo clone.
+        elif name not in already_summarized:
+            # Unchanged this run but has no summary yet (first-ever run, or a
+            # previous summarizer failure) — rebuild the digest from the
+            # service's CURRENT state in Neo4j, never from a repo clone.
             classes, functions = code_graph_writer.load_current_symbols(name)
             if classes or functions:
                 digests.append(build_digest(name, classes, functions))
 
+    kept = sorted(name for name, graph in results if graph is None and name in already_summarized)
+    if kept:
+        print(f"  keeping existing summaries (code unchanged): {', '.join(kept)}")
+
     if not digests:
-        print("  no services have a code graph — nothing to summarize")
+        print("  every service already has a summary — nothing to regenerate")
         return
 
     try:

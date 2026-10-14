@@ -274,10 +274,14 @@ def test_build_system_prompt_instructs_facts_not_hand_drawn_diagrams():
     assert "current_flow_steps" in prompt
 
 
-def test_build_system_prompt_asks_for_reasoning_depth_now_that_diagrams_are_offloaded():
+def test_build_system_prompt_asks_for_short_specific_writing():
+    """The TDDs had become 15-page walls of text that repeated themselves;
+    the prompt must ask for brevity, one fact per field, one symbol per change."""
     prompt = build_system_prompt()
-    assert "freed-up effort" in prompt.lower() or "freed up effort" in prompt.lower()
-    assert "reasoning chain" in prompt.lower()
+    assert "WRITE FOR A BUSY DEVELOPER" in prompt
+    assert "multiple sentences" not in prompt
+    assert "exactly ONE symbol name" in prompt
+    assert "Leave `sequence_steps` empty" in prompt
 
 
 def test_build_system_prompt_forbids_generic_domain_knowledge_as_fact():
@@ -292,12 +296,14 @@ def test_build_system_prompt_forbids_generic_domain_knowledge_as_fact():
 
 def test_build_system_prompt_requires_tracing_real_code_before_root_cause():
     """Regression test: root cause analysis was describing functions
-    generically ("processes the request") instead of what the actual
-    retrieved snippet does — the prompt must force a literal trace first."""
+    generically instead of what the real code does — the model must still
+    trace the real lines first, but write only the conclusions, each marked
+    with its certainty and evidence."""
     prompt = build_system_prompt()
-    assert "trace" in prompt.lower()
-    assert "quoting or closely paraphrasing" in prompt.lower()
-    assert "processes the request" in prompt.lower()  # the explicit bad example
+    assert "TRACE the real" in prompt
+    assert "grounded in its actual lines" in prompt
+    assert "never the walk-through itself" in prompt
+    assert "Confirmed: <cause>" in prompt and "Not the cause:" in prompt
 
 
 def test_build_system_prompt_requires_impact_analysis_to_name_specific_evidence():
@@ -494,9 +500,87 @@ async def test_both_llm_paths_use_a_low_temperature(monkeypatch):
     monkeypatch.setenv("AGENTS_GATEWAY_KEY", "k")
     monkeypatch.setenv("AI_GATEWAY_URL", "https://gateway.example")
 
+    monkeypatch.setattr(planner, "_OPENAI_MODEL", "gpt-4o")
     await planner._plan_via_openai("system", "user")
     await planner._plan_via_gateway("system", "user")
 
     assert sent["openai"]["temperature"] == planner._TEMPERATURE
     assert sent["gateway"]["temperature"] == planner._TEMPERATURE
     assert planner._TEMPERATURE <= 0.3
+
+
+def test_models_get_the_api_parameters_they_actually_accept():
+    """Three families, verified against the live API: gpt-5.5/5.6 refuse
+    `temperature` outright, other gpt-5 models accept it but still need
+    `max_completion_tokens`, and pre-5 models take the plain parameters."""
+    from src.query import planner
+
+    refuses_temp = planner._openai_params("gpt-5.5")
+    assert "temperature" not in refuses_temp and "seed" not in refuses_temp
+    assert refuses_temp["max_completion_tokens"] >= 12000
+
+    thinking = planner._openai_params("gpt-5.4")
+    assert thinking["temperature"] == 0 and thinking["seed"] == planner._SEED
+    assert thinking["max_completion_tokens"] >= 12000
+
+    plain = planner._openai_params("gpt-4.1")
+    assert plain == {"max_tokens": 12000, "temperature": 0, "seed": planner._SEED}
+
+
+def test_tdd_model_is_deterministic_by_default():
+    """The same ticket must not produce a visibly different TDD run to run."""
+    from src.query import planner
+
+    assert planner._TEMPERATURE == 0
+    assert "temperature" in planner._openai_params(planner._OPENAI_MODEL)
+
+
+
+def test_user_prompt_lists_what_else_is_defined_in_each_file():
+    symbol = {
+        "file_path": "a.ts", "line_start": 1, "line_end": 3, "qualified_name": "a.ts::validate",
+        "name": "validate", "signature": "validate()", "docstring": None, "language": "typescript",
+    }
+    prompt = build_user_prompt(
+        "issue",
+        [{"name": "ui", "summary": "s"}],
+        {"ui": [symbol]},
+        {("ui", "a.ts::validate"): "code"},
+        file_context={("ui", "a.ts"): ["validate", "submit", "Form.render"]},
+    )
+    assert "Also defined in this file: submit, Form.render" in prompt
+
+
+def test_system_prompt_requires_an_answer_for_every_chosen_service():
+    prompt = build_system_prompt()
+    assert "Never silently leave one out" in prompt
+
+
+def test_user_prompt_says_which_issue_names_a_symbol_contains():
+    symbol = {
+        "file_path": "a.ts", "line_start": 1, "line_end": 3, "qualified_name": "a.ts::schema",
+        "name": "schema", "signature": "schema", "docstring": None, "language": "typescript",
+        "matched_identifiers": ["internationalPhoneNumber"],
+    }
+    prompt = build_user_prompt("issue", [{"name": "ui", "summary": "s"}], {"ui": [symbol]}, {})
+    assert "Contains `internationalPhoneNumber`, named in the issue itself." in prompt
+
+
+def test_system_prompt_restricts_scope_to_what_the_ticket_reports():
+    """Regression test: the prompt once told the model to fix every copy of a
+    pattern and "where the bad input ENTERS and where the failure SURFACES".
+    It obeyed — and produced a UI alert box nobody asked for, which a human
+    reviewer rejected with "does anyone told you to add alert popup... this is
+    not mentioned in the ticket description"."""
+    prompt = build_system_prompt()
+    assert "ONLY FIX WHAT THE TICKET REPORTS" in prompt
+    assert "not an improvement you noticed along the way" in prompt
+    assert "propose a change for EACH of them" not in prompt
+    assert "where the bad input ENTERS" not in prompt
+
+
+def test_system_prompt_allows_no_change_as_a_real_answer():
+    """A service the report does not touch should get "no change needed",
+    not invented work to look thorough."""
+    prompt = build_system_prompt()
+    assert '"no change needed" IS the correct answer' in prompt

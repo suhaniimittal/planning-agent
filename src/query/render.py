@@ -31,7 +31,11 @@ def _code_check(c) -> str | None:
     if not c.verification:
         return None
     label = _VERIFICATION_LABELS.get(c.verification, c.verification.upper())
-    return f"{label} — {c.verification_note}" if c.verification_note else label
+    # A verified change's note only repeats the file and symbol shown right
+    # beside it; the other outcomes' notes say what was corrected or missing.
+    if c.verification == "verified" or not c.verification_note:
+        return label
+    return f"{label} — {c.verification_note}"
 
 
 def _mermaid_id(name: str) -> str:
@@ -412,27 +416,28 @@ def _ascii_sequence_diagram(steps) -> str | None:
     return "\n".join(lines)
 
 
-def _txt_change_block(c) -> str:
+def _txt_change_block(number: str, c) -> str:
+    """One change as a short labelled block: what, where, whether the code
+    graph confirmed it, then what/how/why and when it's done."""
+    status = _code_check(c)
     lines = [
-        f"Symbol: {c.function_or_symbol}",
-        f"File: {c.file_path or 'Unknown'}",
-        f"Change type: {c.change_type}",
+        f"{number} {c.function_or_symbol}  ({c.change_type})",
+        f"    File: {c.file_path or 'Unknown'}",
     ]
-    if _code_check(c):
-        lines.append(f"Code check: {_code_check(c)}")
+    if status:
+        lines.append(f"    Code check: {status}")
     if c.current_behavior:
-        lines.append(f"Current behavior: {c.current_behavior}")
-    lines += [
-        f"Change: {c.change_description}",
-        f"Reason: {c.reasoning}",
-        f"Implementation: {c.implementation_notes}",
-    ]
-    source_tag = "grounded in real source" if c.has_real_source else "illustrative only, not verified code"
-    lines.append(f"Pseudocode ({source_tag}):")
-    lines += ["  " + line for line in c.pseudocode_sketch.splitlines()]
+        lines.append(f"    Today: {c.current_behavior}")
+    lines.append(f"    Change: {c.change_description}")
+    lines.append(f"    How: {c.implementation_notes}")
+    lines.append(f"    Why: {c.reasoning}")
+    if c.pseudocode_sketch and c.pseudocode_sketch.strip():
+        label = "Sketch" if c.has_real_source else "Sketch (illustrative, not real code)"
+        lines.append(f"    {label}:")
+        lines += ["        " + line for line in c.pseudocode_sketch.strip().splitlines()]
     if c.acceptance_criteria:
-        lines.append("Acceptance criteria:")
-        lines += [f"  - {ac}" for ac in c.acceptance_criteria]
+        lines.append("    Done when:")
+        lines += [f"      - {ac}" for ac in c.acceptance_criteria]
     return "\n".join(lines)
 
 
@@ -677,172 +682,124 @@ def render_confluence(tdd: TechnicalDesignDoc) -> str:
 
 
 def render_text(tdd: TechnicalDesignDoc) -> str:
-    """The full, section-numbered plain-text TDD — meant to be saved
-    directly as a `.txt` file and read start to finish by a developer or a
-    coding agent, without re-analyzing the repository. Every section is
-    built from the structured TechnicalDesignDoc; nothing here is invented
-    by the renderer — a section with no supporting data is simply omitted,
-    same "say Unknown rather than guess" principle the LLM itself follows.
-    """
-    header = [
-        "TECHNICAL DESIGN DOCUMENT",
-        tdd.title,
-    ]
+    """The plain-text TDD behind the PDF — read top to bottom by a developer,
+    and read back by coding_agent. Ordered by what a reader needs: the
+    problem, its cause, the fix, then every change per service with its file.
+    Sections are numbered consecutively and omitted when empty; no tables
+    (they don't survive line wrapping) and no fact stated twice."""
+    header = ["TECHNICAL DESIGN DOCUMENT", tdd.title]
     if tdd.generated_at:
         header.append(f"Generated: {tdd.generated_at}")
-    top = "\n".join(header) + "\n\n" + ("#" * 60)
 
-    sections: list[str | None] = [top]
+    body: list[tuple[str, list[str | None]]] = []
+    body.append(("Summary", [tdd.issue_summary]))
 
-    sections.append(_txt_section(2, "Issue Summary", tdd.issue_summary))
+    requirements = [_txt_bullets(tdd.functional_requirements)]
+    if tdd.non_functional_requirements:
+        requirements.append("Non-functional:\n" + _txt_bullets(tdd.non_functional_requirements))
+    body.append(("Requirements", requirements))
 
-    sections.append(
-        _txt_section(
-            3,
-            "Requirements",
-            "Functional Requirements:\n"
-            + (_txt_bullets(tdd.functional_requirements) or "Not specified."),
-            "Non-Functional Requirements:\n"
-            + (_txt_bullets(tdd.non_functional_requirements) or "Not specified."),
-        )
-    )
+    body.append(("Root Cause", [_one_finding_per_line(tdd.root_cause_analysis)]))
+    body.append(("Proposed Solution", [tdd.proposed_solution]))
 
-    current_arch_diagram = _ascii_architecture_diagram(tdd.current_architecture_components)
-    sections.append(
-        _txt_section(
-            4,
-            "Current System / Architecture",
-            tdd.current_architecture,
-            f"Diagram:\n{current_arch_diagram}" if current_arch_diagram else None,
-        )
-    )
-
-    current_flow_diagram = _ascii_flow_diagram(tdd.current_flow_steps)
-    sections.append(_txt_section(5, "Current Flow", current_flow_diagram))
-
-    sections.append(_txt_section(6, "Root Cause / Problem Analysis", tdd.root_cause_analysis))
-
-    sections.append(_txt_section(7, "Proposed Solution", tdd.proposed_solution))
-
-    proposed_arch_diagram = _ascii_architecture_diagram(tdd.proposed_architecture_components)
-    sections.append(
-        _txt_section(
-            8,
-            "Proposed Architecture",
-            tdd.proposed_architecture,
-            f"Diagram:\n{proposed_arch_diagram}" if proposed_arch_diagram else None,
-        )
-    )
-
-    proposed_flow_diagram = _ascii_flow_diagram(tdd.proposed_flow_steps)
-    sections.append(_txt_section(9, "Proposed Flow", proposed_flow_diagram))
-
-    sequence_diagram = _ascii_sequence_diagram(tdd.sequence_steps)
-    sections.append(_txt_section(10, "Sequence / Interaction Flow", sequence_diagram))
-
-    service_blocks = []
+    service_parts = []
+    change_number = 0
     for s in tdd.services:
-        block = [f"Service: {s.service}", f"Complexity: {s.complexity}"]
-        if s.responsibility_change:
-            block.append(f"Responsibility change: {s.responsibility_change}")
-        block.append(f"Reason: {s.reasoning}")
-        if s.affected_data_model:
-            block.append(f"Affected data model: {s.affected_data_model}")
+        if not s.changes:
+            service_parts.append(f"{s.service} — no change\n    {s.reasoning}")
+            continue
+        head = [f"{s.service}  (complexity: {s.complexity})", f"    Why: {s.reasoning}"]
         if s.api_changes:
-            block.append("API changes:\n" + _txt_bullets(s.api_changes))
-        service_blocks.append("\n".join(block))
-    sections.append(_txt_section(11, "Affected Services", *service_blocks))
-
-    change_blocks = []
-    for s in tdd.services:
+            head.append("    API changes:\n" + "\n".join(f"      - {a}" for a in s.api_changes))
+        if s.affected_data_model:
+            head.append(f"    Data model: {s.affected_data_model}")
+        blocks = []
         for c in s.changes:
-            change_blocks.append(f"[{s.service}]\n" + _txt_change_block(c))
-    sections.append(_txt_section(12, "Affected Files, Classes & Functions", *change_blocks))
+            change_number += 1
+            blocks.append(_txt_change_block(f"Change {change_number}:", c))
+        service_parts.append("\n".join(head) + "\n\n" + "\n\n".join(blocks))
+    body.append(("Services and Changes", service_parts))
 
-    api_blocks = [
-        f"{s.service}:\n" + _txt_bullets(s.api_changes) for s in tdd.services if s.api_changes
-    ]
-    sections.append(
-        _txt_section(
-            13,
-            "API Changes",
-            *api_blocks if api_blocks else ["No API changes identified from the available documentation."],
-        )
-    )
+    file_parts = []
+    for s in tdd.services:
+        rows = sorted({(c.change_type, c.file_path) for c in s.changes if c.file_path})
+        if rows:
+            listed = "\n".join(f"  - {kind}: {path}" for kind, path in rows)
+            file_parts.append(f"{s.service}\n{listed}")
+    body.append(("Files to Change", file_parts))
 
-    data_model_blocks = [
-        f"{s.service}: {s.affected_data_model}" for s in tdd.services if s.affected_data_model
-    ]
-    sections.append(
-        _txt_section(
-            14,
-            "Data Model / Database Changes",
-            "\n".join(data_model_blocks) if data_model_blocks else "Affected data model: Unknown",
-        )
-    )
+    flow = []
+    if tdd.current_flow_steps:
+        flow.append("Today:\n" + _txt_steps(tdd.current_flow_steps))
+    if tdd.proposed_flow_steps:
+        flow.append("After the change:\n" + _txt_steps(tdd.proposed_flow_steps))
+    body.append(("Flow", flow))
 
-    comm_parts = []
+    arch = [tdd.proposed_architecture]
+    diagram = _ascii_architecture_diagram(tdd.proposed_architecture_components)
+    if diagram:
+        arch.append("Components:\n" + diagram)
     if tdd.service_dependencies:
-        comm_parts.append(
-            "Real service-to-service dependencies (from the graph):\n"
+        arch.append(
+            "Real service dependencies (from the code graph):\n"
             + "\n".join(
                 f"- {d.source} -> {d.target}" + (f" (via {d.via})" if d.via else "")
                 for d in tdd.service_dependencies
             )
         )
     if tdd.communication_notes:
-        comm_parts.append("Notes:\n" + _txt_bullets(tdd.communication_notes))
-    sections.append(_txt_section(15, "Inter-Service Communication", *comm_parts))
+        arch.append("Communication:\n" + _txt_bullets(tdd.communication_notes))
+    body.append(("Architecture", arch))
 
-    sections.append(_txt_section(16, "Error Handling & Edge Cases", tdd.error_handling_notes))
-    sections.append(_txt_section(17, "Security Considerations", tdd.security_considerations))
-    sections.append(_txt_section(18, "Backward Compatibility", tdd.backward_compatibility_notes))
-
-    testing_parts = []
-    if tdd.testing_notes:
-        testing_parts.append(tdd.testing_notes)
+    testing = [tdd.testing_notes]
     if tdd.testing_plan:
-        table = _txt_table(
-            ["Category", "Scenario", "Expected Result"],
-            [[t.category, t.scenario, t.expected_result] for t in tdd.testing_plan],
-        )
-        if table:
-            testing_parts.append(table)
-    sections.append(_txt_section(19, "Testing Strategy", *testing_parts))
-
-    if tdd.implementation_plan:
-        sections.append(
-            _txt_section(
-                20,
-                "Implementation Plan",
-                "\n".join(f"{i + 1}. {step}" for i, step in enumerate(tdd.implementation_plan)),
+        testing.append(
+            "\n".join(
+                f"- [{t.category}] {t.scenario}\n    Expected: {t.expected_result}"
+                for t in tdd.testing_plan
             )
         )
+    body.append(("Testing", testing))
 
-    sections.append(_txt_section(21, "Risks", _txt_bullets(tdd.risks)))
-    sections.append(_txt_section(22, "Open Questions", _txt_bullets(tdd.open_questions)))
+    plan = "\n".join(f"{i}. {step}" for i, step in enumerate(tdd.implementation_plan, start=1))
+    body.append(("Implementation Plan", [plan]))
+    body.append(("Risks", [_txt_bullets(tdd.risks)]))
+    body.append(("Open Questions", [_txt_bullets(tdd.open_questions)]))
 
-    summary_rows = [
-        [s.service, c.file_path or "Unknown", c.function_or_symbol, c.change_type, s.complexity]
-        for s in tdd.services
-        for c in s.changes
-    ]
-    summary_table = _txt_table(["Service", "File", "Symbol", "Change Type", "Complexity"], summary_rows)
-    sections.append(_txt_section(23, "Change Summary", summary_table))
+    notes = []
+    if tdd.error_handling_notes:
+        notes.append("Error handling: " + tdd.error_handling_notes)
+    if tdd.security_considerations:
+        notes.append("Security: " + tdd.security_considerations)
+    if tdd.backward_compatibility_notes:
+        notes.append("Backward compatibility: " + tdd.backward_compatibility_notes)
+    body.append(("Other Notes", notes))
 
-    created = [c.file_path for s in tdd.services for c in s.changes if c.change_type == "create" and c.file_path]
-    modified = [c.file_path for s in tdd.services for c in s.changes if c.change_type == "modify" and c.file_path]
-    deleted = [c.file_path for s in tdd.services for c in s.changes if c.change_type == "delete" and c.file_path]
-    sections.append(
-        _txt_section(
-            24,
-            "Files to Create / Modify / Delete",
-            "Files to Create:\n" + (_txt_bullets(sorted(set(created))) or "None identified."),
-            "Files to Modify:\n" + (_txt_bullets(sorted(set(modified))) or "None identified."),
-            "Files to Delete:\n" + (_txt_bullets(sorted(set(deleted))) or "None identified."),
-        )
-    )
+    sections = ["\n".join(header) + "\n\n" + ("#" * 60)]
+    number = 0
+    for title, parts in body:
+        if not any(p and p.strip() for p in parts):
+            continue
+        number += 1
+        sections.append(_txt_section(number, title, *parts))
+    return "\n\n\n".join(sections)
 
-    sections.append(_txt_section(25, "Overall Reasoning", tdd.overall_reasoning))
 
-    return "\n\n\n".join(s for s in sections if s)
+_FINDING_LABEL = re.compile(r"\s+(?=(?:Confirmed|Likely|Not the cause|Unknown):)")
+
+
+def _one_finding_per_line(text: str | None) -> str | None:
+    """Root cause findings ("Confirmed: ...", "Likely: ...", "Not the cause:
+    ...") on separate lines — the model often runs them into one paragraph."""
+    if not text:
+        return text
+    return _FINDING_LABEL.sub("\n\n", text.strip())
+
+
+def _txt_steps(steps) -> str:
+    lines = []
+    for i, step in enumerate(steps, start=1):
+        lines.append(f"{i}. {step.step}")
+        if step.detail:
+            lines.append(f"   {step.detail}")
+    return "\n".join(lines)

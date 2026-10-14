@@ -1,19 +1,33 @@
 """Orchestrator for the query-time flow: given a plain-text requirement or
-bug report, narrow the graph down to a handful of relevant services and
-produce a structured technical design doc via a single LLM call.
+bug report, pick the few services it involves (by summary AND by their own
+code), find each one's most relevant functions, and produce a structured
+technical design doc via a single LLM call.
 
 Mirrors how ingest.py orchestrates over embedder.py/graph_writer.py.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
-from src.ingestion.embedder import embed
+from src.ingestion.embedder import embed_many
 
-from . import candidates, graph_reader, planner
+from . import code_search, graph_reader, planner
 from .models import ServiceDependency, TechnicalDesignDoc
 from .verify import verify_tdd
+
+# Services beyond top_k whose code is also searched before choosing — so a
+# service with a generic summary can still win on its code.
+_CODE_EVIDENCE_EXTRA = 3
+# A service's rank = this weight x summary match + the rest x best code match.
+_SUMMARY_WEIGHT = 0.5
+# Functions up to this long are shown whole; longer ones by their best chunk.
+_FULL_SOURCE_MAX_CHARS = 1500
+# A matched method's whole class is shown when the class is at most this
+# long — enough for a typical input/DTO class (the one in the worked example
+# is ~7,400 chars), small enough that it cannot crowd out other services.
+_FULL_CLASS_MAX_CHARS = 8000
 
 
 def _print_selection_debug(
@@ -75,140 +89,183 @@ def _referenced_service_names(tdd: TechnicalDesignDoc) -> list[str]:
     return ordered
 
 
+def _widen_to_small_classes(
+    parent_of: dict[tuple[str, str], tuple[str, str]],
+    code_symbols_by_service: dict[str, list[dict]],
+    snippet_map: dict[tuple[str, str], str],
+) -> None:
+    """Show a matched method's WHOLE class, when that class is small enough.
+
+    Search ranks a method by what its own body means, so a sibling that never
+    mentions the issue's words is invisible — even when it is the real place
+    to change. Seen for real: a bug about a phone value keeping its
+    whitespace matched `isPhoneValid` (which only READS the field), while
+    `toAvro` (which WRITES it, and held the actual one-line fix) ranked
+    nowhere and was hidden behind "(+2 more)" in the file listing. Both sit
+    in the same 167-line class. Showing that class costs a few thousand
+    characters and puts every sibling in front of the planner.
+
+    Only for classes under `_FULL_CLASS_MAX_CHARS`; a large class would
+    crowd out every other service's code. Mutates its arguments in place.
+    """
+    if not parent_of:
+        return
+    classes = {pair for pair in parent_of.values()}
+    loaded = {
+        (c["service"], c["qualified_name"]): c
+        for c in graph_reader.load_symbols(sorted(classes))
+        if c["kind"] == "Class"
+    }
+    for (service, method_qname), class_key in parent_of.items():
+        klass = loaded.get(class_key)
+        if klass is None:
+            continue
+        source = klass.get("source_snippet") or ""
+        if not 0 < len(source) <= _FULL_CLASS_MAX_CHARS:
+            continue
+        shown = code_symbols_by_service.get(service, [])
+        if any(sym["qualified_name"] == klass["qualified_name"] for sym in shown):
+            continue  # another matched method already pulled this class in
+        method = next((s for s in shown if s["qualified_name"] == method_qname), None)
+        entry = {
+            **klass,
+            "matched_identifiers": (method or {}).get("matched_identifiers") or [],
+            "shown_because": method_qname.rsplit("::", 1)[-1],
+        }
+        shown.append(entry)
+        snippet_map[(service, klass["qualified_name"])] = source
+
+
 async def build_tdd(
     issue_text: str,
     top_k: int = 5,
     hops: int = 2,
     debug_dump_prompts: bool = False,
+    service_names: list[str] | None = None,
 ) -> TechnicalDesignDoc:
-    """`debug_dump_prompts=True` writes the exact system/user prompt sent to
+    """`service_names`: the services this run covers (the Repositories the
+    user listed) — only those are ever considered. None considers every
+    service in the graph.
+
+    `top_k` is the most services the TDD may involve; `hops` widens only the
+    BACKGROUND context (graph-connected services shown by summary, never
+    given code to change).
+
+    `debug_dump_prompts=True` writes the exact system/user prompt sent to
     the LLM to llm_system_prompt.txt / llm_user_prompt.txt in the current
     directory — off by default so normal callers (query_tools.py, the
     agent) never get unexpected local file writes."""
-    embedding = await embed(issue_text)
-    vector_hits = graph_reader.vector_search_services(embedding, k=top_k)
-    seed_names = [h["name"] for h in vector_hits]
-    neighbors = graph_reader.expand_neighbors(seed_names, hops=hops)
-    candidate_names = candidates.merge_candidates(vector_hits, neighbors)
-    candidate_docs = graph_reader.load_candidate_docs(candidate_names)
+    # The whole ticket, then its parts. `vectors[0]` (the whole ticket) is
+    # what scores services; all of them together search each service's code,
+    # so a detail that only one sentence describes still finds its function.
+    queries = code_search.issue_queries(issue_text)
+    vectors = await embed_many(queries)
+    embedding = vectors[0]
+    identifiers = code_search.issue_identifiers(issue_text)
 
-    # Real CALLS edges among the candidates — computed now, from the graph,
-    # and shown to the model AS INPUT (not just used to overwrite its output
-    # afterward, like the final service_dependencies field is). Without
-    # this, the model has no confirmed ground truth for cross-service
-    # relationships and — appropriately cautious — tends to leave
-    # architecture-diagram `depends_on` lists empty rather than guess from
-    # prose alone.
-    known_dependencies = graph_reader.get_edges_among(candidate_names)
+    # 1. Which services. Summary similarity alone misjudges a service whose
+    #    summary is generic — a large UI repo ranked 4th of 6 for a bug in
+    #    its own form validation — so the services' own code gets a vote:
+    #    every service on the shortlist is searched, and its best function
+    #    match counts as much as its summary match. A service the issue
+    #    names outright is always included.
+    summary = graph_reader.summary_scores(embedding, service_names)
+    by_summary = sorted(summary, key=lambda name: -summary[name])
+    named = code_search.services_named_in(issue_text, by_summary)
+    shortlist = list(dict.fromkeys(named + by_summary[: top_k + _CODE_EVIDENCE_EXTRA]))
 
-    # Debug-only bookkeeping: which symbol came from which selection path
-    # (class keyword match / function embedding hit / function fallback) —
-    # never affects what's actually sent to the LLM, just makes it visible
-    # afterward when debug_dump_prompts=True.
-    selection_log: list[dict] = []
-
-    # Additive: real code symbols alongside the existing doc text, when the
-    # code graph exists for a candidate (never required — a service with no
-    # code graph still gets planned from its doc alone, same as today).
-    raw_symbols = graph_reader.load_code_symbols_for_services(candidate_names)
-    raw_classes = [s for s in raw_symbols if s.get("kind") == "Class"]
-    raw_functions = [s for s in raw_symbols if s.get("kind") == "Function"]
-    metadata_by_key = {(s["service"], s["qualified_name"]): s for s in raw_symbols}
-
-    code_symbols_by_service: dict[str, list[dict]] = {}
-    snippet_map: dict[tuple[str, str], str] = {}
-
-    # Classes have no per-symbol embeddings — only functions get chunked and
-    # embedded at ingestion time (see the chunking design) — so keyword
-    # overlap is still the only relevance signal available for them.
-    relevant_classes = candidates.select_relevant_symbols(raw_classes, issue_text)
-    # A matched class's full source_snippet already contains every one of
-    # its own methods verbatim — tracked here so a method belonging to one
-    # of these classes never ALSO gets shown a second time as its own
-    # separate Function entry below (real duplication this caused before
-    # this check existed: the same method's code appearing twice in one
-    # prompt, once buried in its class and once highlighted on its own).
-    matched_class_qnames_by_service: dict[str, set[str]] = {}
-    for symbol in relevant_classes:
-        code_symbols_by_service.setdefault(symbol["service"], []).append(symbol)
-        matched_class_qnames_by_service.setdefault(symbol["service"], set()).add(symbol["qualified_name"])
-        selection_log.append(
-            {
-                "service": symbol["service"],
-                "kind": "Class",
-                "name": symbol["name"],
-                "qualified_name": symbol["qualified_name"],
-                "reason": "keyword match",
-            }
-        )
-    snippet_map.update(
-        graph_reader.load_source_snippets(
-            [(s["service"], s["qualified_name"]) for s in relevant_classes]
+    # 2. What code, per service: each service's own top chunks (never a
+    #    shared top-k a large service can monopolize), test code excluded.
+    searches = await asyncio.gather(
+        *(
+            asyncio.to_thread(graph_reader.search_service_chunks, service, vectors, identifiers)
+            for service in shortlist
         )
     )
+    ranked_by_service = {
+        service: code_search.rank_functions(hits)
+        for service, hits in zip(shortlist, searches, strict=True)
+    }
+    code_score = {s: (r[0]["score"] if r else 0.0) for s, r in ranked_by_service.items()}
+    combined = {
+        s: _SUMMARY_WEIGHT * summary[s] + (1 - _SUMMARY_WEIGHT) * code_score[s] for s in shortlist
+    }
+    selected = list(dict.fromkeys(named + sorted(shortlist, key=lambda s: -combined[s])))
+    selected = selected[: max(top_k, len(named))]
 
-    def _already_shown_via_its_class(service: str, parent_class: str | None) -> bool:
-        return parent_class is not None and parent_class in matched_class_qnames_by_service.get(service, set())
+    print("  [TDD] services (summary / code -> combined), * = selected:")
+    for s in sorted(shortlist, key=lambda s: -combined[s]):
+        mark = "*" if s in selected else " "
+        note = "  (named in the issue)" if s in named else ""
+        print(f"    {mark} {s}: {summary[s]:.3f} / {code_score[s]:.3f} -> {combined[s]:.3f}{note}")
 
-    # Functions: real semantic similarity is the primary signal now, via the
-    # chunk embeddings built at ingestion time — reusing the SAME issue
-    # embedding already computed above, not a second embed() call.
-    chunk_hits = graph_reader.vector_search_chunks(embedding, candidate_names)
-    ranked_functions = candidates.select_relevant_functions_by_embedding(chunk_hits)
+    # Graph-connected services are shown as background only (summary, no
+    # code) — they explain dependencies, they aren't candidates for change.
+    # The graph traversal supports 1-2 hops; more would pull in most of the graph anyway.
+    neighbors = (
+        [n["name"] for n in graph_reader.expand_neighbors(selected, hops=min(hops, 2))]
+        if hops and hops > 0
+        else []
+    )
+    if service_names is not None:
+        neighbors = [n for n in neighbors if n in service_names]
+    context_names = selected + [n for n in neighbors if n not in selected]
+    order = {name: i for i, name in enumerate(context_names)}
+    candidate_docs = sorted(
+        graph_reader.load_candidate_docs(context_names),
+        key=lambda d: order.get(d["name"], len(order)),
+    )
+    # Only links between the chosen services: a link to a background
+    # service is shown nowhere else, and only cluttered the diagrams.
+    known_dependencies = graph_reader.get_edges_among(selected)
 
-    services_with_chunk_hits = {hit["service"] for hit in ranked_functions}
-    for hit in ranked_functions:
-        key = (hit["service"], hit["function_qualified_name"])
-        meta = metadata_by_key.get(key)
-        if meta is None:
-            continue  # stale hit (function renamed/removed since the chunk was embedded) — skip, never fabricate metadata
-        if _already_shown_via_its_class(hit["service"], meta.get("parent_class")):
-            continue  # this method's code is already fully visible in its class's own snippet above
-        code_symbols_by_service.setdefault(hit["service"], []).append(meta)
-        # The winning CHUNK's text, not the function's full source_snippet —
-        # the relevant slice for a long function, the whole thing for a
-        # short one, exactly the point of chunking.
-        snippet_map[key] = hit["text"]
-        selection_log.append(
-            {
-                "service": hit["service"],
-                "kind": "Function",
-                "name": meta["name"],
-                "qualified_name": meta["qualified_name"],
-                "reason": f"semantic match (score={hit['score']:.3f})",
-            }
-        )
-
-    # Fallback: any candidate service with zero chunk hits (not yet
-    # re-ingested since chunking shipped, or nothing semantically close
-    # among what it has) still gets a keyword-based functions shortlist —
-    # never silently left with no code symbols just because embeddings
-    # haven't (yet) been built for that one service.
-    services_needing_fallback = set(candidate_names) - services_with_chunk_hits
-    if services_needing_fallback:
-        fallback_pool = [s for s in raw_functions if s["service"] in services_needing_fallback]
-        fallback_ranked = candidates.select_relevant_symbols(fallback_pool, issue_text)
-        fallback_kept = [
-            symbol
-            for symbol in fallback_ranked
-            if not _already_shown_via_its_class(symbol["service"], symbol.get("parent_class"))
-        ]
-        for symbol in fallback_kept:
-            code_symbols_by_service.setdefault(symbol["service"], []).append(symbol)
+    symbols = graph_reader.load_symbols(
+        [(s, hit["function_qualified_name"]) for s in selected for hit in ranked_by_service[s]]
+    )
+    by_key = {(m["service"], m["qualified_name"]): m for m in symbols}
+    code_symbols_by_service: dict[str, list[dict]] = {}
+    snippet_map: dict[tuple[str, str], str] = {}
+    selection_log: list[dict] = []
+    parent_of: dict[tuple[str, str], tuple[str, str]] = {}
+    for service in selected:
+        for hit in ranked_by_service[service]:
+            key = (service, hit["function_qualified_name"])
+            symbol = by_key.get(key)
+            if symbol is None:
+                continue  # stale chunk (function renamed/removed since) — never fabricate metadata
+            symbol = {**symbol, "matched_identifiers": hit["identifiers"]}
+            code_symbols_by_service.setdefault(service, []).append(symbol)
+            if symbol.get("parent_class"):
+                parent_of[key] = (service, symbol["parent_class"])
+            # A short function is shown whole; a long one only by its
+            # best-matching chunk — the relevant slice, exactly the point of
+            # chunking.
+            source = symbol.get("source_snippet") or ""
+            snippet_map[key] = source if 0 < len(source) <= _FULL_SOURCE_MAX_CHARS else hit["text"]
+            reason = f"score {hit['score']:.3f}"
+            if hit["identifiers"]:
+                reason += f", contains {', '.join(hit['identifiers'])}"
             selection_log.append(
                 {
-                    "service": symbol["service"],
-                    "kind": "Function",
+                    "service": service,
+                    "kind": symbol["kind"],
                     "name": symbol["name"],
                     "qualified_name": symbol["qualified_name"],
-                    "reason": "keyword fallback (no chunk embeddings for this service)",
+                    "reason": reason,
                 }
             )
-        snippet_map.update(
-            graph_reader.load_source_snippets(
-                [(s["service"], s["qualified_name"]) for s in fallback_kept]
-            )
+    _widen_to_small_classes(parent_of, code_symbols_by_service, snippet_map)
+
+    file_context = graph_reader.load_file_context(
+        sorted(
+            {
+                (service, symbol["file_path"])
+                for service, symbols_ in code_symbols_by_service.items()
+                for symbol in symbols_
+                if symbol.get("file_path")
+            }
         )
+    )
 
     system_prompt = planner.build_system_prompt()
     user_prompt = planner.build_user_prompt(
@@ -216,8 +273,9 @@ async def build_tdd(
         candidate_docs,
         code_symbols_by_service,
         snippet_map,
-        seed_names=set(seed_names),
+        seed_names=set(selected),
         known_dependencies=known_dependencies,
+        file_context=file_context,
     )
 
     if debug_dump_prompts:
@@ -229,7 +287,7 @@ async def build_tdd(
             "  [DEBUG] wrote llm_system_prompt.txt and llm_user_prompt.txt "
             f"({len(system_prompt)} + {len(user_prompt)} chars)"
         )
-        _print_selection_debug(candidate_names, seed_names, selection_log, snippet_map)
+        _print_selection_debug(context_names, selected, selection_log, snippet_map)
 
     raw = await planner.call_llm(system_prompt, user_prompt)
     tdd = planner.parse_tdd(raw)

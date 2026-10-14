@@ -49,3 +49,4 @@ htmlcov/
 .DS_Store
 Thumbs.db
 jumpstart-main/
+.archify/

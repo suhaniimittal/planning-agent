@@ -17,7 +17,15 @@ def get_driver():
         uri = os.environ["NEO4J_URI"]
         user = os.environ.get("NEO4J_USER", "neo4j")
         password = os.environ["NEO4J_PASSWORD"]
-        _driver = GraphDatabase.driver(uri, auth=(user, password))
+        _driver = GraphDatabase.driver(
+            uri,
+            auth=(user, password),
+            # Two notice types Neo4j would otherwise log on nearly every
+            # query: a property not present yet on older data (e.g. `is_test`
+            # on nodes ingested before it existed — the queries fall back for
+            # that), and db.index.vector.queryNodes being deprecated.
+            notifications_disabled_classifications=["UNRECOGNIZED", "DEPRECATION"],
+        )
     return _driver
 
 
@@ -152,3 +160,27 @@ def update_service_summary(name: str, summary: str, embedding: list[float]) -> N
             summary=summary,
             embedding=embedding,
         )
+
+
+def services_with_summaries(names: list[str]) -> set[str]:
+    """Which of `names` already have a stored summary AND its embedding.
+
+    A service's summary is written once and then left alone: re-summarizing
+    unchanged code produced a differently-worded summary on every run, whose
+    embedding then scored differently, which silently reshuffled which
+    services a TDD even considered (observed: a 0.03 swing on an unchanged
+    service, larger than the gap between 3rd and 4th place).
+    """
+    if not names:
+        return set()
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            MATCH (s:Service)
+            WHERE s.name IN $names AND s.summary IS NOT NULL
+              AND s.summary <> '' AND s.summary_embedding IS NOT NULL
+            RETURN s.name AS name
+            """,
+            names=names,
+        )
+        return {r["name"] for r in result}

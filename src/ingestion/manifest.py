@@ -30,7 +30,7 @@ class ManifestError(Exception):
     callers should let this abort the run: an ingestion run with no valid
     service list has nothing to do."""
 
-
+#converts files entered in ui into 1 python object (ServiceSpec)
 @dataclass(frozen=True)
 class ServiceSpec:
     name: str
@@ -43,6 +43,7 @@ def _manifest_path() -> Path:
     return Path(override) if override else _DEFAULT_MANIFEST_PATH
 
 
+# used for local testing when taken repos from services.yaml
 def load_services(path: str | Path | None = None) -> list[ServiceSpec]:
     """Parses services.yaml into a list of ServiceSpec, in file order.
 
@@ -93,7 +94,7 @@ def load_services(path: str | Path | None = None) -> list[ServiceSpec]:
 # textarea will actually produce.
 _SPEC_LINE_RE = re.compile(r"^([^:=]+?)\s*[:=]\s*([^@\s]+)(?:@(\S+))?$")
 
-
+#function takes text and converts into list of ServiceSpec objects
 def parse_service_specs(text: str) -> list[ServiceSpec]:
     """Parses the `repos` field a user typed into the Aetherion UI form —
     the published agent's ENTIRE source of "which services exist" for this

@@ -49,7 +49,9 @@ def _slug(text: str, max_len: int = 40) -> str:
 
 
 @tool()
-async def generate_technical_design(issue_text: str, top_k: int = 5, hops: int = 2) -> dict:
+async def generate_technical_design(
+    issue_text: str, top_k: int = 5, hops: int = 2, service_names: list[str] | None = None
+) -> dict:
     """Search the service graph for services relevant to a requirement/bug
     report and produce a technical design doc: structured data plus a real
     downloadable PDF — the file a user downloads and hands, unmodified, to
@@ -59,8 +61,11 @@ async def generate_technical_design(issue_text: str, top_k: int = 5, hops: int =
     download mechanism, but nothing about it is ever exposed to the user —
     they just see a "Download TDD" button). Also published as a new
     Confluence page when CONFLUENCE_SPACE_KEY is configured — best-effort,
-    never blocks the PDF output if it fails or isn't configured."""
-    tdd = await build_tdd(issue_text, top_k=top_k, hops=hops)
+    never blocks the PDF output if it fails or isn't configured.
+
+    `service_names`: the services this run covers; None considers every
+    service in the graph."""
+    tdd = await build_tdd(issue_text, top_k=top_k, hops=hops, service_names=service_names)
     pdf_bytes = render_pdf(tdd)
 
     storage.init_client()

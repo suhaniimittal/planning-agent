@@ -95,7 +95,7 @@ def test_render_pdf_never_draws_a_line_past_the_page_edge():
     from pypdf import PdfReader
 
     long_reasoning = "This sentence is deliberately very long " * 10
-    pdf_bytes = render_pdf(_tdd(overall_reasoning=long_reasoning))
+    pdf_bytes = render_pdf(_tdd(proposed_solution=long_reasoning))
     reader = PdfReader(io.BytesIO(pdf_bytes))
     extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
 
@@ -115,6 +115,17 @@ def test_wrap_lines_breaks_a_long_path_only_after_a_slash():
 
     assert len(lines) > 1
     assert all(len(line) <= _WRAP_WIDTH for line in lines)
-    path_lines = [line.strip() for line in lines if "/" in line]
-    assert all(piece.endswith("/") for piece in path_lines[:-1])
-    assert "".join(path_lines) == path
+    assert all(line.rstrip().endswith("/") for line in lines[:-1])
+    assert "".join("".join(lines).split()) == "File:" + path
+
+
+def test_wrap_lines_keeps_a_bullet_or_label_on_the_same_line_as_its_long_path():
+    from src.query.pdf_render import _wrap_lines
+
+    path = (
+        "src/apps/client/modules/Reports/pages/CreateReport/components/EnterDetailsWizard/"
+        "components/SummaryInformation/view.tsx"
+    )
+    for prefix in ("- ", "  - modify: ", "    File: "):
+        first = _wrap_lines(prefix + path).splitlines()[0]
+        assert first.startswith(prefix + "src/apps/"), first

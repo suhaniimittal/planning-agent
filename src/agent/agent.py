@@ -63,10 +63,13 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
     workflow_id = _workflow_id()
     issue_text = payload.get("issue_text")
     repos_text = payload.get("repos") or ""
-    top_k = payload.get("top_k", 5)
-    hops = payload.get("hops", 2)
+    # An empty form field arrives as null, not as a missing key — `or` (not
+    # .get's default) is what turns both into the default.
+    top_k = payload.get("top_k") or 5
+    hops = payload.get("hops")
+    hops = 2 if hops is None else hops
     try:
-        await toolExecutor.execute(
+        ingestion = await toolExecutor.execute(
             "run_ingestion", repos_text, start_to_close_timeout=_INGESTION_TIMEOUT
         )
         result = await toolExecutor.execute(
@@ -74,6 +77,8 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
             issue_text,
             top_k,
             hops,
+            # The TDD considers only the services this run listed.
+            ingestion["services"],
             start_to_close_timeout=_TDD_TIMEOUT,
         )
 

@@ -270,129 +270,89 @@ def test_render_markdown_omits_affected_services_section_when_no_services():
     assert "## 12. Affected Files" not in md
 
 
-# --- render_text (the rich, section-numbered .txt renderer) ------------------
-
-
-def test_render_text_includes_title_and_issue_summary():
-    text = render_text(_tdd())
-    assert "Fix order totals" in text
-    assert "Orders show wrong total price" in text
-
-
-def test_render_text_omits_empty_sections():
-    text = _tdd_render()
-    # Sections with no supporting data (root cause, sequence diagram, etc.)
-    # must be omitted entirely, not printed with an empty body.
-    assert "SEQUENCE / INTERACTION FLOW" not in text
-    assert "ROOT CAUSE" not in text
-    assert "SECURITY CONSIDERATIONS" not in text
+# --- render_text (the plain-text TDD behind the PDF) ------------------------
 
 
 def _tdd_render(**overrides) -> str:
     return render_text(_tdd(**overrides))
 
 
-def test_render_text_builds_architecture_diagram_from_components():
-    """The diagram is BUILT by our code from stated facts, not hand-drawn
-    by the LLM — this is the whole point of the structured-facts restructure."""
-    text = _tdd_render(
-        current_architecture="Orders calls payment directly.",
-        current_architecture_components=[
-            ArchComponent(name="Orders", depends_on=["Payment"]),
-            ArchComponent(name="Payment"),
-        ],
-    )
-    assert "CURRENT SYSTEM / ARCHITECTURE" in text
-    assert "[Orders]" in text
-    assert "--> [Payment]" in text
-    assert "(no further dependencies)" in text
+def test_render_text_includes_title_and_summary():
+    text = render_text(_tdd())
+    assert "Fix order totals" in text
+    assert "1. SUMMARY" in text
+    assert "Orders show wrong total price" in text
 
 
-def test_render_text_builds_flow_diagram_from_steps():
-    text = _tdd_render(
-        current_flow_steps=[
-            FlowStep(step="Validate input", detail="Checks required fields are present"),
-            FlowStep(step="Process request"),
-        ]
-    )
-    assert "CURRENT FLOW" in text
-    assert "1. Validate input" in text
-    assert "Checks required fields are present" in text
-    assert "2. Process request" in text
-    assert "Validate input" in text.split("Flow:")[1]
-
-
-def test_render_text_builds_sequence_diagram_from_steps():
-    text = _tdd_render(
-        sequence_steps=[
-            SequenceStep(from_participant="Client", to_participant="Orders", action="Create order"),
-            SequenceStep(
-                from_participant="Orders",
-                to_participant="Client",
-                action="Order confirmation",
-                direction="response",
-            ),
-        ]
-    )
-    assert "SEQUENCE / INTERACTION FLOW" in text
-    assert "Client --- Create order --> Orders" in text
-    assert "Orders <-- Order confirmation --- Client" in text
-
-
-def test_render_text_omits_diagrams_when_no_components_or_steps_given():
-    text = _tdd_render()
-    assert "CURRENT FLOW" not in text
-    assert "SEQUENCE / INTERACTION FLOW" not in text
-
-
-def test_render_text_includes_requirements_with_not_specified_fallback():
+def test_render_text_numbers_sections_consecutively_and_skips_empty_ones():
     text = _tdd_render(functional_requirements=["Must not double-charge"])
-    assert "Must not double-charge" in text
-    assert "Not specified." in text  # non-functional requirements, left empty
+    headings = [line for line in text.splitlines() if line[:1].isdigit() and ". " in line and line.isupper()]
+    numbers = [int(h.split(".")[0]) for h in headings]
+    assert numbers == list(range(1, len(numbers) + 1))
+    for absent in ("ROOT CAUSE", "SECURITY", "TESTING", "RISKS"):
+        assert absent not in text
 
 
-def test_render_text_renders_testing_plan_as_table():
-    text = _tdd_render(
-        testing_plan=[
-            Scenario(category="unit", scenario="Empty cart", expected_result="Rejected with 400")
-        ]
-    )
-    assert "TESTING STRATEGY" in text
-    assert "Category" in text and "Scenario" in text and "Expected Result" in text
-    assert "Empty cart" in text
-    assert "Rejected with 400" in text
+def test_render_text_shows_each_change_as_one_block_with_file_and_check():
+    tdd = _tdd()
+    change = tdd.services[0].changes[0]
+    change.verification = "verified"
+    change.verification_note = "`calculateTotal` found in `src/.../OrdersController.java`."
+    text = render_text(tdd)
+    assert "SERVICES AND CHANGES" in text
+    assert "orders  (complexity: medium)" in text
+    assert "Change 1: calculateTotal  (modify)" in text
+    assert "    File: src/.../OrdersController.java" in text
+    assert "    Code check: VERIFIED\n" in text  # no note repeating the file
+    assert "    Change: Fix summation of item prices" in text
 
 
-def test_render_text_change_summary_table_derived_from_changes():
-    text = _tdd_render()
-    assert "CHANGE SUMMARY" in text
-    assert "calculateTotal" in text
-    assert "src/.../OrdersController.java" in text
+def test_render_text_says_why_a_service_needs_no_change():
+    tdd = _tdd()
+    tdd.services.append(ServicePlan(service="payments", complexity="low", reasoning="Never reached."))
+    text = render_text(tdd)
+    assert "payments — no change\n    Never reached." in text
 
 
-def test_render_text_groups_files_by_change_type():
+def test_render_text_lists_files_to_change_per_service_without_tables():
     tdd = _tdd()
     tdd.services[0].changes[0].change_type = "create"
     text = render_text(tdd)
-    assert "Files to Create:" in text
-    assert "src/.../OrdersController.java" in text.split("Files to Create:")[1].split("Files to Modify:")[0]
+    files = text.split("FILES TO CHANGE")[1]
+    assert "orders\n  - create: src/.../OrdersController.java" in files
+    assert "------" not in text  # no table rulers anywhere
 
 
-def test_render_text_includes_real_service_dependencies_not_llm_claims():
-    tdd = _tdd(service_dependencies=[ServiceDependency(source="orders", target="shipping")])
-    text = render_text(tdd)
-    assert "INTER-SERVICE COMMUNICATION" in text
-    assert "orders -> shipping" in text
+def test_render_text_flow_shows_today_and_after():
+    text = _tdd_render(
+        current_flow_steps=[FlowStep(step="Validate input", detail="Checks required fields")],
+        proposed_flow_steps=[FlowStep(step="Trim input"), FlowStep(step="Validate input")],
+    )
+    flow = text.split("FLOW")[1]
+    assert "Today:\n1. Validate input\n   Checks required fields" in flow
+    assert "After the change:\n1. Trim input\n2. Validate input" in flow
 
 
-def test_render_text_labels_kafka_based_dependency_edge():
-    tdd = _tdd(
+def test_render_text_architecture_uses_proposed_components_and_real_dependencies():
+    text = _tdd_render(
+        proposed_architecture="Orders calls payment directly.",
+        proposed_architecture_components=[
+            ArchComponent(name="Orders", depends_on=["Payment"]),
+            ArchComponent(name="Payment"),
+        ],
         service_dependencies=[
             ServiceDependency(source="orders", target="shipping", via="kafka:orders.created")
-        ]
+        ],
     )
-    text = render_text(tdd)
+    assert "[Orders]" in text and "--> [Payment]" in text
     assert "orders -> shipping (via kafka:orders.created)" in text
+
+
+def test_render_text_testing_is_a_list_not_a_table():
+    text = _tdd_render(
+        testing_plan=[Scenario(category="unit", scenario="Empty cart", expected_result="Rejected with 400")]
+    )
+    assert "- [unit] Empty cart\n    Expected: Rejected with 400" in text
 
 
 def test_render_text_includes_implementation_plan_as_ordered_list():
@@ -401,11 +361,20 @@ def test_render_text_includes_implementation_plan_as_ordered_list():
     assert "2. Add a test" in text
 
 
-def test_render_text_pseudocode_label_reflects_has_real_source():
+def test_render_text_sketch_label_reflects_has_real_source():
     tdd = _tdd()
+    assert "Sketch (illustrative, not real code):" in render_text(tdd)
     tdd.services[0].changes[0].has_real_source = True
-    text = render_text(tdd)
-    assert "grounded in real source" in text
+    assert "    Sketch:" in render_text(tdd)
+
+
+def test_render_text_leaves_out_restated_sections():
+    text = _tdd_render(
+        sequence_steps=[SequenceStep(from_participant="A", to_participant="B", action="call")],
+        current_architecture="restated architecture prose",
+    )
+    for gone in ("SEQUENCE", "CHANGE SUMMARY", "OVERALL REASONING", "restated architecture prose"):
+        assert gone not in text
 
 
 # --- render_confluence -------------------------------------------------
@@ -519,3 +488,21 @@ def test_change_blocks_show_the_code_check_only_when_verified():
     assert "Code check: UNVERIFIED - check manually — `fn` was not found in `ui`." in render_text(flagged)
     assert "Code check: UNVERIFIED" in render_confluence(flagged)
     assert "Code check" not in render_text(tdd(None, None))
+
+
+def test_render_text_puts_each_root_cause_finding_on_its_own_line():
+    text = _tdd_render(
+        root_cause_analysis="Confirmed: the regex is anchored — a.ts. Likely: input not trimmed. "
+        "Not the cause: the server — never reached."
+    )
+    cause = text.split("ROOT CAUSE")[1]
+    assert "\n\nLikely: input not trimmed." in cause
+    assert "\n\nNot the cause: the server" in cause
+
+
+def test_render_text_keeps_the_note_for_a_corrected_change():
+    tdd = _tdd()
+    change = tdd.services[0].changes[0]
+    change.verification = "corrected"
+    change.verification_note = "Path corrected: `calculateTotal` is in `B.java`, not `A.java`."
+    assert "Code check: CORRECTED — Path corrected" in render_text(tdd)

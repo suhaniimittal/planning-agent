@@ -57,7 +57,7 @@ def _dominant_language(classes: list[dict], functions: list[dict]) -> str | None
     counts = Counter(s["language"] for s in (*classes, *functions))
     return counts.most_common(1)[0][0] if counts else None
 
-
+# file that starts or expose a service
 def _find_entry_points(classes: list[dict], functions: list[dict], language: str | None) -> list[str]:
     if language is None:
         return []
@@ -73,7 +73,7 @@ def _find_entry_points(classes: list[dict], functions: list[dict], language: str
             found.append(path)
     return found
 
-
+# calculates method counts 
 def _top_classes(classes: list[dict], functions: list[dict], limit: int = _MAX_CLASSES_PER_SERVICE) -> list[dict]:
     method_counts = Counter(
         f["parent_class"] for f in functions if f.get("is_method") and f.get("parent_class")
@@ -81,7 +81,7 @@ def _top_classes(classes: list[dict], functions: list[dict], limit: int = _MAX_C
     ranked = sorted(classes, key=lambda c: method_counts.get(c["qualified_name"], 0), reverse=True)
     return [{"name": c["name"], "docstring": c.get("docstring")} for c in ranked[:limit]]
 
-
+# selects 
 def _top_level_functions(functions: list[dict], limit: int = _MAX_TOP_LEVEL_FUNCTIONS_PER_SERVICE) -> list[str]:
     return [f["name"] for f in functions if not f.get("is_method")][:limit]
 

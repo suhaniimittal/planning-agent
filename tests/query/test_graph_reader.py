@@ -230,3 +230,55 @@ def test_find_symbol_files_matches_name_or_qualified_tail(monkeypatch):
         "by_file": "::Modal.view",
         "by_class": ".Modal.view",
     }
+
+
+def test_summary_scores_scopes_to_the_given_services(monkeypatch):
+    driver = _patch_driver(monkeypatch, [{"name": "ui", "score": 0.6}])
+    assert graph_reader.summary_scores([0.1], ["ui"]) == {"ui": 0.6}
+    assert driver._session.last_params == {"names": ["ui"], "embedding": [0.1]}
+
+
+def test_search_service_chunks_merges_semantic_and_identifier_hits(monkeypatch):
+    class Session:
+        def __init__(self):
+            self.queries = []
+
+        def run(self, query, **params):
+            self.queries.append((query, params))
+            if "identifiers" in params:
+                return [{"function_qualified_name": "a::g", "text": "t", "score": 0.5,
+                         "identifiers": ["approveDeferredReport"]}]
+            return [{"function_qualified_name": "a::f", "text": "t", "score": 0.9, "identifiers": []}]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    session = Session()
+    monkeypatch.setattr(graph_reader, "get_driver", lambda: type("D", (), {"session": lambda self: session})())
+
+    rows = graph_reader.search_service_chunks("ui", [0.1], ["approveDeferredReport"])
+
+    assert [r["function_qualified_name"] for r in rows] == ["a::f", "a::g"]
+    assert all(p["service"] == "ui" for _, p in session.queries)
+    assert all("is_test" in q for q, _ in session.queries)  # test code always excluded
+
+
+def test_search_service_chunks_skips_the_identifier_read_when_there_are_none(monkeypatch):
+    driver = _patch_driver(monkeypatch, [])
+    graph_reader.search_service_chunks("ui", [0.1], [])
+    assert "identifiers" not in driver._session.last_params
+
+
+def test_load_symbols_and_file_context_skip_the_query_for_nothing(monkeypatch):
+    driver = _patch_driver(monkeypatch, [])
+    assert graph_reader.load_symbols([]) == []
+    assert graph_reader.load_file_context([]) == {}
+    assert driver._session.last_query is None
+
+
+def test_load_file_context_returns_sorted_unique_names(monkeypatch):
+    _patch_driver(monkeypatch, [{"service": "ui", "file_path": "a.ts", "names": ["g", "f", "Form.f", "f"]}])
+    assert graph_reader.load_file_context([("ui", "a.ts")]) == {("ui", "a.ts"): ["Form.f", "f", "g"]}
