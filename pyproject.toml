@@ -1,6 +1,6 @@
 [project]
 name = "plan-agent"
-version = "0.0.19"
+version = "0.0.22"
 description = "Aetherion SDK project for building AI agents and workflows"
 authors = [{ name = "Calfus Inc.", email = "support@calfus.com" }]
 readme = "README.md"

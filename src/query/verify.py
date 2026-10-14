@@ -42,11 +42,16 @@ def _list(paths: list[str], limit: int = 3) -> str:
     return shown + (f" (+{len(paths) - limit} more)" if len(paths) > limit else "")
 
 
+# The note for new code added to a file that already exists — a change TO
+# that file, so it is marked "modify" (see verify_change).
+_IN_EXISTING_FILE = "New code in the existing file"
+
+
 def _verify_create(service: str, path: str | None) -> tuple[str, str]:
     if path is None:
         return "unverified", "No file was given for the new code."
     if graph_reader.file_exists(service, path):
-        return "new", f"New code in the existing file `{path}`."
+        return "new", f"{_IN_EXISTING_FILE} `{path}`."
     if graph_reader.folder_exists(service, path):
         return (
             "unverified",
@@ -148,6 +153,12 @@ def verify_change(service: str, change: FileChange, shown_files: set[str]) -> No
     if change.change_type == "create":
         status, note = _verify_create(service, path)
         result = _Result(status, note, path)
+        if note.startswith(_IN_EXISTING_FILE):
+            # A new method in a file that already exists changes that file
+            # (2026-10-14). Left as "create", the file was listed under
+            # "Files to Create" and Coding wrote it from scratch, dropping
+            # everything already in it.
+            change.change_type = "modify"
     else:
         result = _verify_existing(service, path, symbol, shown_files)
     change.verification = result.status

@@ -4,7 +4,9 @@ Thin Aetherion binding covering the whole pipeline in one call: syncs the
 service graph for exactly the repos named in ``repos`` (``run_ingestion`` —
 a full clone the first time a service is ingested, a git-diff incremental
 sync with no clone every run after), then produces a technical design doc
-for ``issue_text`` (``generate_technical_design``). No pipeline logic lives
+for ``issue_text`` (``generate_technical_design``). With ``repos`` and no
+``issue_text`` it only syncs the graph — how the orchestrator refreshes it
+after a merge. No pipeline logic lives
 here — per the SDK's "no direct I/O in the agent" rule, both tools do all
 the actual clone/parse/Neo4j/LLM work; this just orchestrates the two calls
 via ``toolExecutor.execute`` and shapes the result for the platform UI.
@@ -68,10 +70,25 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
     top_k = payload.get("top_k") or 5
     hops = payload.get("hops")
     hops = 2 if hops is None else hops
+    if str(payload.get("mode") or "").strip().lower() == "discuss":
+        return await _discuss(payload, workflow_id)
     try:
         ingestion = await toolExecutor.execute(
             "run_ingestion", repos_text, start_to_close_timeout=_INGESTION_TIMEOUT
         )
+        if not str(issue_text or "").strip():
+            # Graph refresh only: the orchestrator sends this when a pull
+            # request is merged, so the next design sees the latest code.
+            # There is no requirement to design for, so no TDD is written.
+            return {
+                "status": "success",
+                "mode": "graph_sync",
+                "services": (ingestion or {}).get("services", []),
+                "results": [],
+            }
+        # The orchestrator asks for the document itself, to publish it in
+        # Confluence and give its text to Coding.
+        return_document = bool(payload.get("return_document"))
         result = await toolExecutor.execute(
             "generate_technical_design",
             issue_text,
@@ -79,6 +96,7 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
             hops,
             # The TDD considers only the services this run listed.
             ingestion["services"],
+            return_document,
             start_to_close_timeout=_TDD_TIMEOUT,
         )
 
@@ -92,10 +110,10 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
             }
         ]
 
-        return {
-            "status": "success",
-            "results": structured_results,
-        }
+        out = {"status": "success", "results": structured_results}
+        if return_document:
+            out["document"] = {k: result.get(k, "") for k in ("title", "confluence_html", "text")}
+        return out
     except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
         logger.error("planning_agent run failed: %s", error, exc_info=True)
         return {
@@ -108,3 +126,32 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
             "issue_text": issue_text,
             "details": {"workflow_id": workflow_id},
         }
+
+
+async def _discuss(payload: dict[str, Any], workflow_id: str | None) -> dict[str, Any]:
+    """A question about an existing TDD, from the comments on its page (2026-10-08)."""
+    question = str(payload.get("question") or "").strip()
+    tdd_text = str(payload.get("tdd_text") or "").strip()
+    if not question or not tdd_text:
+        return {
+            "status": "error",
+            "error": "MissingInput",
+            "message": "A design question needs both the question and the TDD's text.",
+        }
+    try:
+        answer = await toolExecutor.execute(
+            "answer_design_question",
+            question,
+            tdd_text,
+            list(payload.get("discussion") or []),
+            start_to_close_timeout=_TDD_TIMEOUT,
+        )
+    except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
+        logger.error("planning_agent discuss failed: %s", error, exc_info=True)
+        return {
+            "status": "error",
+            "error": type(error).__name__,
+            "message": f"The question could not be answered: {type(error).__name__}: {error}"[:500],
+            "details": {"workflow_id": workflow_id},
+        }
+    return {"status": "success", "mode": "discuss", **answer}

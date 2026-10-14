@@ -20,11 +20,12 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import re
 from typing import get_origin
 
 from pydantic import BaseModel, ValidationError
+
+from src.ingestion import gateway_env
 
 from .models import FileChange, ServicePlan, TechnicalDesignDoc
 
@@ -462,15 +463,15 @@ def build_user_prompt(
 
 
 def _use_gateway() -> bool:
-    return bool(os.environ.get("AGENTS_GATEWAY_KEY") and os.environ.get("AI_GATEWAY_URL"))
+    return gateway_env.use_gateway()
 
 
 async def _plan_via_gateway(system_prompt: str, user_prompt: str) -> str:
     from agent_lib.gateway.ai import AiGatewayClient
 
     async with AiGatewayClient(
-        gateway_key=os.environ["AGENTS_GATEWAY_KEY"],
-        gateway_url=os.environ["AI_GATEWAY_URL"],
+        gateway_key=gateway_env.gateway_key(),
+        gateway_url=gateway_env.gateway_url(),
     ) as client:
         reply = await client.chat(
             provider=_GATEWAY_PROVIDER,

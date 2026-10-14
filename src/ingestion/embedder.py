@@ -17,7 +17,8 @@ process exit handles it, same as graph_writer.get_driver()'s singleton.
 from __future__ import annotations
 
 import asyncio
-import os
+
+from src.ingestion import gateway_env
 
 _MODEL = "text-embedding-3-small"
 _PROVIDER = "openai"
@@ -41,7 +42,7 @@ _gateway_client_lock = asyncio.Lock()
 
 
 def _use_gateway() -> bool:
-    return bool(os.environ.get("AGENTS_GATEWAY_KEY") and os.environ.get("AI_GATEWAY_URL"))
+    return gateway_env.use_gateway()
 
 
 def _get_openai_client():
@@ -67,8 +68,8 @@ async def _get_gateway_client():
                 from agent_lib.gateway.ai import AiGatewayClient
 
                 client = AiGatewayClient(
-                    gateway_key=os.environ["AGENTS_GATEWAY_KEY"],
-                    gateway_url=os.environ["AI_GATEWAY_URL"],
+                    gateway_key=gateway_env.gateway_key(),
+                    gateway_url=gateway_env.gateway_url(),
                 )
                 _gateway_client = await client.__aenter__()
     return _gateway_client

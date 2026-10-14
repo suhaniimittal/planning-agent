@@ -120,6 +120,9 @@ def test_create_in_existing_file_or_folder_is_new(graph):
     assert in_file.verification == "new"
     assert in_folder.verification == "new"
     assert "src/report/modals" in in_folder.verification_note
+    # New code in a file that exists changes that file; a new file is created.
+    assert in_file.change_type == "modify"
+    assert in_folder.change_type == "create"
 
 
 def test_create_with_a_folder_as_the_file_or_unknown_folder_is_flagged(graph):

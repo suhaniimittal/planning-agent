@@ -10,9 +10,10 @@ from aetherion_sdk import tool
 from common_lib.storage.storage_client import storage
 
 from src.ingestion.confluence_api import ConfluenceApiError, create_page
+from src.query.design_qa import answer_question
 from src.query.pdf_render import render_pdf
 from src.query.query_flow import build_tdd
-from src.query.render import render_confluence
+from src.query.render import render_confluence, render_text
 
 _NON_SLUG_CHARS = re.compile(r"[^a-z0-9]+")
 
@@ -49,8 +50,23 @@ def _slug(text: str, max_len: int = 40) -> str:
 
 
 @tool()
+async def answer_design_question(
+    question: str, tdd_text: str, discussion: list[str] | None = None
+) -> dict:
+    """A question about a TDD ("why this approach?", "why not X?"), answered from
+    the TDD, the discussion so far and the related code — and whether the
+    design should change. Changes nothing itself."""
+    answer = await answer_question(question, tdd_text, discussion)
+    return answer.to_dict()
+
+
+@tool()
 async def generate_technical_design(
-    issue_text: str, top_k: int = 5, hops: int = 2, service_names: list[str] | None = None
+    issue_text: str,
+    top_k: int = 5,
+    hops: int = 2,
+    service_names: list[str] | None = None,
+    return_document: bool = False,
 ) -> dict:
     """Search the service graph for services relevant to a requirement/bug
     report and produce a technical design doc: structured data plus a real
@@ -64,7 +80,8 @@ async def generate_technical_design(
     never blocks the PDF output if it fails or isn't configured.
 
     `service_names`: the services this run covers; None considers every
-    service in the graph."""
+    service in the graph. `return_document`: also return the title, the
+    Confluence HTML and the plain text, for the orchestrator."""
     tdd = await build_tdd(issue_text, top_k=top_k, hops=hops, service_names=service_names)
     pdf_bytes = render_pdf(tdd)
 
@@ -75,4 +92,13 @@ async def generate_technical_design(
 
     _publish_to_confluence(tdd)
 
-    return {"s3_key": s3_key}
+    result = {"s3_key": s3_key}
+    if return_document:
+        # For the orchestrator, which publishes the TDD in the project's
+        # Confluence space and hands its text to Coding (2026-10-08).
+        result |= {
+            "title": tdd.title,
+            "confluence_html": render_confluence(tdd),
+            "text": render_text(tdd),
+        }
+    return result

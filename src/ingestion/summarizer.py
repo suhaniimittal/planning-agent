@@ -23,9 +23,10 @@ AGENTS_GATEWAY_KEY + AI_GATEWAY_URL are set, else OpenAI directly.
 from __future__ import annotations
 
 import json
-import os
 from collections import Counter
 from pathlib import PurePosixPath
+
+from src.ingestion import gateway_env
 
 _GATEWAY_PROVIDER, _GATEWAY_MODEL = "anthropic", "claude-sonnet-4-6"
 _OPENAI_MODEL = "gpt-4o"
@@ -127,15 +128,15 @@ def _build_prompt(digests: list[dict]) -> tuple[str, str]:
 
 
 def _use_gateway() -> bool:
-    return bool(os.environ.get("AGENTS_GATEWAY_KEY") and os.environ.get("AI_GATEWAY_URL"))
+    return gateway_env.use_gateway()
 
 
 async def _call_via_gateway(system_prompt: str, user_prompt: str) -> str:
     from agent_lib.gateway.ai import AiGatewayClient
 
     async with AiGatewayClient(
-        gateway_key=os.environ["AGENTS_GATEWAY_KEY"],
-        gateway_url=os.environ["AI_GATEWAY_URL"],
+        gateway_key=gateway_env.gateway_key(),
+        gateway_url=gateway_env.gateway_url(),
     ) as client:
         reply = await client.chat(
             provider=_GATEWAY_PROVIDER,
