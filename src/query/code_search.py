@@ -19,9 +19,21 @@ from __future__ import annotations
 
 import re
 
-_SENTENCE_SPLIT = re.compile(
-    r"(?<=[.!?])\s+|\n\s*\n+"
-)
+# A sentence ends at .!? followed by whitespace, or at a blank line. NOT at
+# every newline: pasted PDF text is hard-wrapped, and splitting there shreds
+# one sentence into three fragments that each pass the length filter below
+# and each spend a query slot while meaning nothing on their own.
+#
+# The lookbehinds suppress the split after an abbreviation, which is a period
+# that does not end a sentence. Without them "...whitespace (e.g. a value
+# like ..." breaks into a fragment ending at "(e.g." — observed on the
+# deferred-submit ticket, where it mutilated the sentence carrying the root
+# cause. Each lookbehind must be fixed-width, hence one per abbreviation.
+# Deliberately NOT included: a generic `(?<![A-Z]\.)` for initials, which
+# would also suppress the split after a sentence ending in an acronym
+# ("...stays stuck in DEFERRED." ), merging it with the next one.
+_ABBREVIATIONS = r"(?<!\be\.g\.)(?<!\bi\.e\.)(?<!\betc\.)(?<!\bvs\.)(?<!\bcf\.)(?<!\bapprox\.)"
+_SENTENCE_SPLIT = re.compile(rf"(?<=[.!?]){_ABBREVIATIONS}\s+|\n\s*\n+")
 # Shorter than this is a fragment ("Description", a bullet marker) with no
 # meaning of its own.
 MIN_SENTENCE_CHARS = 40
@@ -44,6 +56,7 @@ _IDENTIFIER = re.compile(r"\b[a-z]+[A-Z][A-Za-z0-9]*\b|\b[A-Z][a-z0-9]+(?:[A-Z][
 # "Form errors" — a quoted multi-word phrase, usually a UI label or log text
 _QUOTED_PHRASE = re.compile(r'"([^"\n]{4,60})"')
 
+
 def _is_boilerplate(piece: str) -> bool:
     return bool(_BOILERPLATE.match(piece))
 
@@ -58,6 +71,7 @@ def _spread(parts: list[str], limit: int) -> list[str]:
         return parts
     step = len(parts) / limit
     return [parts[int(i * step)] for i in range(limit)]
+
 
 #
 def issue_queries(issue_text: str) -> list[str]:

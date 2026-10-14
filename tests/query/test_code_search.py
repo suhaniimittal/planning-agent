@@ -21,7 +21,12 @@ def test_issue_identifiers_keep_code_names_and_quoted_phrases_only():
 
 
 def _hit(fn, score, identifiers=(), text=None):
-    return {"function_qualified_name": fn, "text": text or fn, "score": score, "identifiers": list(identifiers)}
+    return {
+        "function_qualified_name": fn,
+        "text": text or fn,
+        "score": score,
+        "identifiers": list(identifiers),
+    }
 
 
 def test_rank_functions_rolls_chunks_up_to_their_best_chunk():
@@ -35,7 +40,10 @@ def test_rank_functions_rolls_chunks_up_to_their_best_chunk():
 
 def test_rank_functions_boosts_exact_identifiers():
     ranked = code_search.rank_functions(
-        [_hit("a::meaning_only", 0.80), _hit("a::has_name", 0.75, identifiers=["approveDeferredReport"])]
+        [
+            _hit("a::meaning_only", 0.80),
+            _hit("a::has_name", 0.75, identifiers=["approveDeferredReport"]),
+        ]
     )
     assert ranked[0]["function_qualified_name"] == "a::has_name"
     assert ranked[0]["identifiers"] == ["approveDeferredReport"]
@@ -50,7 +58,10 @@ def test_rank_functions_ignores_an_identifier_that_is_everywhere():
 
 def test_rank_functions_drops_weak_matches_and_caps_the_count():
     hits = [_hit("a::top", 0.90), _hit("a::close", 0.85), _hit("a::weak", 0.70)]
-    assert [r["function_qualified_name"] for r in code_search.rank_functions(hits)] == ["a::top", "a::close"]
+    assert [r["function_qualified_name"] for r in code_search.rank_functions(hits)] == [
+        "a::top",
+        "a::close",
+    ]
 
     many = [_hit(f"a::f{i}", 0.9 - i * 0.001) for i in range(20)]
     assert len(code_search.rank_functions(many, max_functions=8)) == 8
@@ -85,3 +96,40 @@ def test_issue_identifiers_drop_trailing_punctuation_from_quoted_phrases():
     found = code_search.issue_identifiers('Click "Deselect All," then "Export to PDF."')
     assert "Deselect All" in found
     assert "Export to PDF" in found
+
+
+def test_issue_queries_keeps_a_sentence_whole_across_an_abbreviation():
+    text = (
+        "The regex is anchored at the start, so any leading whitespace (e.g. a value "
+        'like " +23480 330-20339" pasted by a candidate) fails validation.\n'
+        "Open the deferred report review screen and click Submit to see it."
+    )
+    parts = code_search.issue_queries(text)[1:]
+    assert any(p.startswith("The regex is anchored") and p.endswith("validation.") for p in parts)
+    assert not any(p.endswith("(e.g.") for p in parts)
+
+
+def test_issue_queries_still_splits_after_a_sentence_ending_in_an_acronym():
+    text = (
+        "The report stays stuck in DEFERRED status indefinitely with no cause shown.\n"
+        "The approveDeferredReport mutation is never sent to the server at all."
+    )
+    parts = code_search.issue_queries(text)[1:]
+    assert len(parts) == 2
+
+
+def test_issue_queries_does_not_split_hard_wrapped_text_at_every_newline():
+    text = (
+        "The deferred report review screen swallows validation errors instead of\n"
+        "surfacing them, so the approveDeferredReport mutation is never sent and the\n"
+        "report remains in DEFERRED status with no indication to the user."
+    )
+    assert code_search.issue_queries(text)[1:] == []  # one sentence, identical to the whole
+
+
+def test_issue_queries_always_leads_with_the_whole_ticket():
+    text = (
+        "First sentence that is comfortably long enough to survive.\n\n"
+        "Second one, also long enough."
+    )
+    assert code_search.issue_queries(text)[0] == text.strip()

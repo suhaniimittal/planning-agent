@@ -584,3 +584,167 @@ def test_system_prompt_allows_no_change_as_a_real_answer():
     not invented work to look thorough."""
     prompt = build_system_prompt()
     assert '"no change needed" IS the correct answer' in prompt
+
+
+def test_system_prompt_separates_analysis_scope_from_change_scope():
+    """A service on the reproduction path must be EXAMINED and appear with a
+    verdict, which is not the same as being changed. Conflating the two is
+    how candidate-service first vanished from the document entirely, and
+    then — once it was included — how it was waved through."""
+    prompt = build_system_prompt()
+    assert "ANALYSIS SCOPE" in prompt and "CHANGE SCOPE" in prompt
+    assert "must be EXAMINED and must APPEAR" in prompt
+    assert "Sitting on the data path is NOT by itself a reason to change" in prompt
+
+
+def test_system_prompt_treats_where_a_bad_value_is_stored_as_a_root_cause():
+    """Regression test: candidate-service persists the reported phone value
+    untrimmed (EmploymentVerificationInput.toAvro -> .setPhone(phone)), and
+    the client form later rejects it. The TDD cleared candidate-service
+    anyway. Storing a value a consumer then rejects is a cause, not an
+    adjacency.
+
+    Phrased deliberately without "where the bad input ENTERS" — that older
+    wording over-scoped into changes nobody asked for."""
+    prompt = build_system_prompt()
+    assert "ROOT CAUSE LOCATION, NOT A " in prompt
+    assert "first accepted and written down" in prompt
+    assert "where the bad input ENTERS" not in prompt
+    # both fix sites must be surfaced rather than one silently chosen
+    assert "entry-side fix and a consumer-side fix" in prompt
+    assert "Never present one as settled" in prompt
+
+
+def test_system_prompt_separates_verified_from_reported_and_inferred():
+    prompt = build_system_prompt()
+    for kind in ("VERIFIED", "REPORTED", "INFERRED", "UNKNOWN"):
+        assert kind in prompt
+    assert "merely EXISTING is not evidence" in prompt
+
+
+def test_system_prompt_forbids_clearing_a_service_using_another_services_code():
+    """Regression test: the TDD cleared candidate-service (Kotlin backend) by
+    citing a trim in ui/src/apps/candidate/... — a different service's
+    source for the same feature."""
+    prompt = build_system_prompt()
+    assert "only evidence about that service" in prompt
+    assert "Never clear a service of needing a change" in prompt
+
+
+def test_system_prompt_root_cause_format_has_hypothesis_and_unknown():
+    prompt = build_system_prompt()
+    assert "Hypothesis: <cause>" in prompt
+    assert "Unknown: <what you could not determine>" in prompt
+    assert "never establishes a cause on its own" in prompt
+
+
+def test_system_prompt_requires_every_service_in_the_component_diagram():
+    """Regression test: the rendered architecture showed three components and
+    one edge, with two dead ends — the "half-finished" diagram. Every service
+    in `services` must be a component, including no-change ones."""
+    prompt = build_system_prompt()
+    assert "EVERY service you listed in `services` MUST appear here" in prompt
+    assert "half-finished diagram" in prompt
+    assert "Appearing here is NOT a claim that a service changes" in prompt
+
+
+def test_system_prompt_requires_the_two_flow_lists_to_be_comparable():
+    prompt = build_system_prompt()
+    assert "rendered side by\nside" in prompt or "rendered side by " in prompt
+    assert "same journey at the same" in prompt
+    assert "the rendered flow looks truncated" in prompt
+
+
+def test_system_prompt_requires_a_failing_then_passing_regression_test():
+    prompt = build_system_prompt()
+    assert "FAILS" in prompt and "PASSES after your change" in prompt
+    assert "TO ADD or an EXISTING test" in prompt
+
+
+def test_system_prompt_forbids_claiming_tests_were_executed():
+    """Nothing in this pipeline runs tests, so any claim that one passed is
+    fabricated by construction."""
+    prompt = build_system_prompt()
+    assert "you have run nothing" in prompt
+    assert "never write" in prompt.lower() and "passed, failed, ran or was verified" in prompt
+
+
+def test_system_prompt_requires_each_implementation_step_to_name_a_location():
+    prompt = build_system_prompt()
+    assert "<service> <file_path> <symbol>" in prompt
+    assert "is not an implementation step" in prompt
+    assert "which `testing_plan` scenario" in prompt
+
+
+def test_system_prompt_requires_reusing_what_already_exists():
+    prompt = build_system_prompt()
+    assert "EXISTING function, component" in prompt
+    assert "adds a second mechanism beside one that already exists" in prompt
+
+
+def test_system_prompt_ends_with_a_cross_section_self_check():
+    """Sections that contradict each other cost the reader trust in all of
+    them, so consistency is checked explicitly rather than hoped for."""
+    prompt = build_system_prompt()
+    assert "SELF-CHECK BEFORE YOU RESPOND" in prompt
+    assert "no service you called \"no change needed\" also carries changes" in prompt
+    assert "nothing claims a test was run" in prompt
+
+
+def test_system_prompt_leaves_unrendered_diagram_fields_empty():
+    """current_architecture_components is never read by the renderer, and the
+    prompt used to demand it in detail while also saying sequence_steps was
+    both required and to-be-left-empty. One instruction each now."""
+    prompt = build_system_prompt()
+    assert "Leave `sequence_steps` empty" in prompt
+    assert "leave `current_architecture_" in prompt
+    assert "whenever more than one component is involved" not in prompt
+
+
+def test_system_prompt_requires_a_written_trace_of_the_reported_value():
+    """Regression test: candidate-service persists the reported phone value
+    untrimmed at EmploymentVerificationInput.toAvro -> .setPhone(phone). That
+    whole class WAS in the prompt (7.6KB, under the class-widening
+    threshold), but the model read isPhoneValid, saw non-US bypasses
+    validation, wrote "Not the cause", and never looked at the builder four
+    lines below.
+
+    An in-your-head trace can be skipped silently. Four named output lines
+    cannot: writing `Stored at:` forces the model to go find the write."""
+    prompt = build_system_prompt()
+    assert "TRACE THE REPORTED VALUE THROUGH ITS WHOLE LIFE" in prompt
+    for stage in ("Accepted at:", "Validated at:", "Stored at:", "Consumed at:"):
+        assert stage in prompt
+    assert "never leave a stage out" in prompt
+
+
+def test_system_prompt_says_a_passing_validation_is_not_exoneration():
+    """The exact reasoning that cleared candidate-service — "validation does
+    not reject it, so this service is not the cause" — must instead become a
+    reason to keep tracing to the write."""
+    prompt = build_system_prompt()
+    assert "is not exoneration" in prompt
+    assert "keep tracing to where it is written" in prompt
+    assert "still gets its `Stored at:` line" in prompt
+
+
+def test_system_prompt_defines_smallest_change_set_as_end_to_end():
+    """Regression test: with "smallest set that fully addresses the reported
+    problem", the model read "reported problem" as the SYMPTOM and proposed a
+    ui-only fix, leaving candidate-service writing untrimmed phone values via
+    EmploymentVerificationInput.toAvro -> .setPhone(phone). Redefining
+    "smallest" as end-to-end is what puts the source fix back in scope."""
+    prompt = build_system_prompt()
+    assert "SMALLEST SET THAT CORRECTLY ADDRESSES THE ISSUE END TO END" in prompt
+    assert "not the fewest files" in prompt
+    assert "frontend-only or backend-only fix by default" in prompt
+    assert "whether data is already persisted in an invalid or unnormalised state" in prompt
+
+
+def test_system_prompt_puts_the_persisting_service_in_change_scope():
+    prompt = build_system_prompt()
+    assert "needs its own change, even when fixing the consumer alone" in prompt
+    assert "Propose the normalisation " in prompt
+    # the over-scoping guard must survive the widening
+    assert "Sitting on the data path is NOT by itself a reason to change" in prompt
+    assert "merely because its file or service is part of the same data flow" in prompt

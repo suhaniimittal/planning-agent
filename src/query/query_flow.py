@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 
 from src.ingestion.embedder import embed_many
 
-from . import code_search, graph_reader, planner
+from . import code_search, graph_reader, issue_split, planner
 from .models import ServiceDependency, TechnicalDesignDoc
 from .verify import verify_tdd
 
@@ -158,7 +158,9 @@ async def build_tdd(
     # The whole ticket, then its parts. `vectors[0]` (the whole ticket) is
     # what scores services; all of them together search each service's code,
     # so a detail that only one sentence describes still finds its function.
-    queries = code_search.issue_queries(issue_text)
+    # The parts come from an LLM where possible (self-contained, references
+    # resolved) and from sentence splitting otherwise — see issue_split.
+    queries = await issue_split.issue_queries(issue_text)
     vectors = await embed_many(queries)
     embedding = vectors[0]
     identifiers = code_search.issue_identifiers(issue_text)
