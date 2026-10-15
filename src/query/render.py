@@ -187,6 +187,31 @@ def _md_section(number: int, title: str, *body_parts: str | None) -> str | None:
     return f"## {number}. {title}\n\n" + "\n\n".join(parts)
 
 
+def _kept_lists(tdd: TechnicalDesignDoc) -> list[tuple[str, list[str]]]:
+    """What the change must keep, and fit (2026-10-15) — part of the requirements,
+    so the coding agent reads them with everything else it must satisfy."""
+    out = []
+    if tdd.preserved_behavior:
+        out.append(("Existing behaviour to preserve", tdd.preserved_behavior))
+    if tdd.technology_constraints:
+        out.append(("Technology constraints", tdd.technology_constraints))
+    return out
+
+
+def _md_kept(tdd: TechnicalDesignDoc) -> list[str]:
+    return [
+        f"**{heading}:**\n\n" + "\n".join(f"- {i}" for i in items)
+        for heading, items in _kept_lists(tdd)
+    ]
+
+
+def _cf_kept(tdd: TechnicalDesignDoc) -> list[str]:
+    return [
+        f"<p><strong>{_cf_escape(heading)}:</strong></p>\n" + _cf_bullets(items)
+        for heading, items in _kept_lists(tdd)
+    ]
+
+
 def render_markdown(tdd: TechnicalDesignDoc) -> str:
     """The full TDD as Markdown, with real Mermaid diagrams — mirrors
     render_text()'s section coverage and numbering (for easy cross-
@@ -209,6 +234,7 @@ def render_markdown(tdd: TechnicalDesignDoc) -> str:
             "**Functional:**\n\n" + ("\n".join(f"- {r}" for r in tdd.functional_requirements) or "Not specified."),
             "**Non-functional:**\n\n"
             + ("\n".join(f"- {r}" for r in tdd.non_functional_requirements) or "Not specified."),
+            *_md_kept(tdd),
         )
     )
 
@@ -571,6 +597,7 @@ def render_confluence(tdd: TechnicalDesignDoc) -> str:
             "<p><strong>Functional:</strong></p>\n" + (_cf_bullets(tdd.functional_requirements) or "<p>Not specified.</p>"),
             "<p><strong>Non-functional:</strong></p>\n"
             + (_cf_bullets(tdd.non_functional_requirements) or "<p>Not specified.</p>"),
+            *_cf_kept(tdd),
         )
     )
 
@@ -697,6 +724,8 @@ def render_text(tdd: TechnicalDesignDoc) -> str:
     requirements = [_txt_bullets(tdd.functional_requirements)]
     if tdd.non_functional_requirements:
         requirements.append("Non-functional:\n" + _txt_bullets(tdd.non_functional_requirements))
+    for heading, items in _kept_lists(tdd):
+        requirements.append(f"{heading}:\n" + _txt_bullets(items))
     body.append(("Requirements", requirements))
 
     body.append(("Root Cause", [_one_finding_per_line(tdd.root_cause_analysis)]))

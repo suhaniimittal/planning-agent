@@ -9,7 +9,9 @@ from datetime import UTC, datetime
 from aetherion_sdk import tool
 from common_lib.storage.storage_client import storage
 
+from src.ingestion import github_api
 from src.ingestion.confluence_api import ConfluenceApiError, create_page
+from src.query import stack
 from src.query.design_qa import answer_question
 from src.query.pdf_render import render_pdf
 from src.query.query_flow import build_tdd
@@ -60,6 +62,31 @@ async def answer_design_question(
     return answer.to_dict()
 
 
+def technology_constraints(service_repos: dict[str, str]) -> list[str]:
+    """Each service's real stack, read from its build files on GitHub (2026-10-15).
+
+    One call lists the repository's root; only the build files there are read.
+    A repository that cannot be read adds a line saying so — the design then
+    knows its versions are unknown, rather than assuming any."""
+    out: list[str] = []
+    for name, slug in sorted(service_repos.items()):
+        repo, _, branch = slug.partition("@")
+        try:
+            present = set(github_api.list_root_files(repo, branch or None))
+            files = {
+                f: github_api.fetch_file_content(repo, f, branch or "HEAD")
+                for f in stack.BUILD_FILES
+                if f in present
+            }
+        except github_api.GitHubApiError as exc:
+            out.append(f"{name}: build files could not be read ({exc}); versions unknown.")
+            continue
+        found = stack.from_files(files)
+        prefix = f"{name}: " if len(service_repos) > 1 else ""
+        out.extend(prefix + rule for rule in found.constraints())
+    return out
+
+
 @tool()
 async def generate_technical_design(
     issue_text: str,
@@ -67,6 +94,7 @@ async def generate_technical_design(
     hops: int = 2,
     service_names: list[str] | None = None,
     return_document: bool = False,
+    service_repos: dict[str, str] | None = None,
 ) -> dict:
     """Search the service graph for services relevant to a requirement/bug
     report and produce a technical design doc: structured data plus a real
@@ -80,9 +108,17 @@ async def generate_technical_design(
     never blocks the PDF output if it fails or isn't configured.
 
     `service_names`: the services this run covers; None considers every
-    service in the graph. `return_document`: also return the title, the
+    service in the graph. `service_repos` ("name" -> "org/repo[@branch]"): the
+    repositories whose build files give the design its technology
+    constraints. `return_document`: also return the title, the
     Confluence HTML and the plain text, for the orchestrator."""
-    tdd = await build_tdd(issue_text, top_k=top_k, hops=hops, service_names=service_names)
+    tdd = await build_tdd(
+        issue_text,
+        top_k=top_k,
+        hops=hops,
+        service_names=service_names,
+        technology_constraints=technology_constraints(service_repos or {}),
+    )
     pdf_bytes = render_pdf(tdd)
 
     storage.init_client()

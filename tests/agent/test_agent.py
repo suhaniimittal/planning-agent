@@ -53,7 +53,7 @@ async def test_repos_without_a_requirement_only_refreshes_the_graph(tools):
 @pytest.mark.asyncio
 async def test_the_orchestrator_can_ask_for_the_document_itself(tools):
     recorder = tools(
-        run_ingestion={"status": "success", "services": ["bank"]},
+        run_ingestion={"status": "success", "services": ["bank"], "repos": {"bank": "o/bank"}},
         generate_technical_design={
             "s3_key": "technical_designs/x.pdf",
             "title": "Daily limit",
@@ -66,7 +66,7 @@ async def test_the_orchestrator_can_ask_for_the_document_itself(tools):
     )
     assert recorder.calls[1] == (
         "generate_technical_design",
-        ("Add a daily limit", 5, 2, ["bank"], True),
+        ("Add a daily limit", 5, 2, ["bank"], True, {"bank": "o/bank"}),
     )
     assert out["document"] == {
         "title": "Daily limit",

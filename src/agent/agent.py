@@ -97,6 +97,8 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
             # The TDD considers only the services this run listed.
             ingestion["services"],
             return_document,
+            # Their repositories: the build files give the design its versions.
+            dict(ingestion.get("repos") or {}),
             start_to_close_timeout=_TDD_TIMEOUT,
         )
 

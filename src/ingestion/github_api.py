@@ -83,6 +83,19 @@ def get_changed_files(repo: str, base: str, head: str, token: str | None = None)
     return files
 
 
+def list_root_files(repo: str, ref: str | None = None, token: str | None = None) -> list[str]:
+    """The names of the files at the root of `repo` (its default branch when
+    `ref` is None) — one call, to see which build files exist before reading."""
+    url = f"{_API_BASE}/repos/{repo}/contents"
+    params = {"ref": ref} if ref else {}
+    try:
+        resp = httpx.get(url, headers=_headers(token), params=params, timeout=_TIMEOUT)
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        raise GitHubApiError(f"could not list {repo}@{ref or 'default'}: {e}") from e
+    return [item["name"] for item in resp.json() if item.get("type") == "file"]
+
+
 def fetch_file_content(repo: str, path: str, ref: str, token: str | None = None) -> str:
     """Raw text content of one file at `ref`, via GitHub's Contents API —
     fetches exactly this one file, never the whole repo."""

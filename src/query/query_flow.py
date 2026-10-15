@@ -142,6 +142,7 @@ async def build_tdd(
     hops: int = 2,
     debug_dump_prompts: bool = False,
     service_names: list[str] | None = None,
+    technology_constraints: list[str] | None = None,
 ) -> TechnicalDesignDoc:
     """`service_names`: the services this run covers (the Repositories the
     user listed) — only those are ever considered. None considers every
@@ -276,6 +277,7 @@ async def build_tdd(
         seed_names=set(selected),
         known_dependencies=known_dependencies,
         file_context=file_context,
+        technology_constraints=technology_constraints,
     )
 
     if debug_dump_prompts:
@@ -296,6 +298,8 @@ async def build_tdd(
     # an LLM to guess — same "compute it, don't trust a guess" principle as
     # service_dependencies/has_real_source below.
     tdd.generated_at = datetime.now(UTC).isoformat()
+    # Read from the build files, not written by the model (2026-10-15).
+    tdd.technology_constraints = list(technology_constraints or [])
 
     # Real graph data, never the LLM's guess — and scoped to only services
     # the LLM actually referenced, not the whole raw candidate pool (which

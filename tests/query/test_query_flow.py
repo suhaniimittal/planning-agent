@@ -366,3 +366,23 @@ async def test_hops_above_two_are_capped(graph):
     graph.summary = {"orders": 0.9}
     await query_flow.build_tdd("issue", top_k=1, hops=5)
     assert ("expand_neighbors", ["orders"], 2) in graph.calls
+
+
+@pytest.mark.asyncio
+async def test_technology_constraints_come_from_the_build_files_never_the_model(graph):
+    """2026-10-15: the versions are a fact read from the repository; whatever the
+    model writes there is replaced, and the constraints reach its prompt."""
+    from src.query.models import TechnicalDesignDoc
+
+    graph.summary = {"orders": 0.9}
+    graph.tdd = TechnicalDesignDoc(
+        title="t",
+        issue_summary="s",
+        overall_reasoning="r",
+        services=[],
+        technology_constraints=["Language: Java 22 (invented by the model)"],
+    )
+    result = await query_flow.build_tdd(
+        "issue", top_k=1, hops=0, technology_constraints=["Language: Java 17 (from pom.xml)."]
+    )
+    assert result.technology_constraints == ["Language: Java 17 (from pom.xml)."]

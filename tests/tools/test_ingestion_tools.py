@@ -17,7 +17,11 @@ async def test_run_ingestion_parses_repos_text_and_forwards_specs(monkeypatch):
 
     assert [s.name for s in seen["specs"]] == ["orders", "payment"]
     assert seen["specs"][1].branch == "develop"
-    assert result == {"status": "success", "services": ["orders", "payment"]}
+    assert result == {
+        "status": "success",
+        "services": ["orders", "payment"],
+        "repos": {"orders": "myorg/orders-service", "payment": "myorg/payment-service@develop"},
+    }
 
 
 @pytest.mark.asyncio

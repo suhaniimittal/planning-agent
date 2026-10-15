@@ -90,4 +90,9 @@ async def run_ingestion(repos_text: str) -> dict:
     from a previous run is left completely untouched."""
     specs = _parse_repos_text(repos_text)
     await run_ingest(specs=specs)
-    return {"status": "success", "services": [s.name for s in specs]}
+    return {
+        "status": "success",
+        "services": [s.name for s in specs],
+        # Where each service lives, so the design can read its build files.
+        "repos": {s.name: s.repo + (f"@{s.branch}" if s.branch else "") for s in specs},
+    }

@@ -160,3 +160,17 @@ class TechnicalDesignDoc(BaseModel):
     risks: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
     overall_reasoning: str
+    # 2026-10-15: what the change must not break, and what it must fit.
+    preserved_behavior: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Existing behaviour of the code this change touches that must keep "
+            "working afterwards — each an observable fact from the real code shown: "
+            "a validation and its error message, a side effect, an existing feature "
+            "and what it returns. Empty only when the change touches no existing code."
+        ),
+    )
+    technology_constraints: list[str] = Field(
+        default_factory=list,
+        description="Filled from the repositories' build files — leave this empty.",
+    )

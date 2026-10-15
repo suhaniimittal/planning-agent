@@ -117,7 +117,17 @@ def build_system_prompt() -> str:
         "because it exists or could theoretically be involved.\n"
         "5. Distinguish clearly between existing behavior, proposed "
         "behavior, and the reason for the change — never conflate WHAT "
-        "changes with WHY it changes.\n"
+        "changes with WHY it changes. The project already works: extend it, "
+        "never replace it. List under `preserved_behavior` every existing "
+        "behaviour of the code you change that must keep working — each "
+        "validation with its error message, each side effect, each existing "
+        "feature — read from the real code shown; a change to shared code keeps "
+        "all of them. Earlier designs given with the requirement are decisions "
+        "already made: keep them unless the requirement changes one, and say so. "
+        "Every design must fit the `Technology constraints` given: the language "
+        "version, build tool and libraries the repository really uses — no API or "
+        "syntax from a later version, no new or upgraded dependency unless you "
+        "name it as an open question.\n"
         "6. NEVER introduce generic domain or compliance knowledge that "
         "isn't actually stated in the evidence you were given — e.g. do "
         "not mention a compliance standard (PCI DSS, GDPR, SOC 2, ...), a "
@@ -375,6 +385,7 @@ def build_user_prompt(
     seed_names: set[str] | None = None,
     known_dependencies: list[dict] | None = None,
     file_context: dict[tuple[str, str], list[str]] | None = None,
+    technology_constraints: list[str] | None = None,
 ) -> str:
     """`known_dependencies`: real CALLS edges among the candidate services,
     read from the graph BEFORE the LLM call — shown here as confirmed
@@ -407,6 +418,12 @@ def build_user_prompt(
     file_context = file_context or {}
 
     sections = [f"## Issue\n{issue_text}\n"]
+    if technology_constraints:
+        sections.append(
+            "## Technology constraints (read from the repositories' build files)\n"
+            + "\n".join(f"- {c}" for c in technology_constraints)
+            + "\n"
+        )
 
     if known_dependencies:
         edges = "\n".join(f"- {d['source']} -> {d['target']}" for d in known_dependencies)

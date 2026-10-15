@@ -506,3 +506,24 @@ def test_render_text_keeps_the_note_for_a_corrected_change():
     change.verification = "corrected"
     change.verification_note = "Path corrected: `calculateTotal` is in `B.java`, not `A.java`."
     assert "Code check: CORRECTED — Path corrected" in render_text(tdd)
+
+
+def test_what_must_keep_working_and_the_versions_are_part_of_the_requirements():
+    tdd = _tdd(
+        preserved_behavior=[
+            "transfer() still rejects a non-positive amount: 'Amount must be positive'"
+        ],
+        technology_constraints=["Language: Java 17 (from pom.xml)."],
+    )
+    page = render_confluence(tdd)
+    assert "<strong>Existing behaviour to preserve:</strong>" in page
+    assert "Amount must be positive" in page
+    assert "<strong>Technology constraints:</strong>" in page
+    text = render_text(tdd)  # what the coding agent reads
+    assert "Existing behaviour to preserve:\n" in text and "Technology constraints:\n" in text
+    assert "**Existing behaviour to preserve:**" in render_markdown(tdd)
+
+
+def test_without_them_the_requirements_read_as_before():
+    page = render_confluence(_tdd())
+    assert "Existing behaviour to preserve" not in page and "Technology constraints" not in page
