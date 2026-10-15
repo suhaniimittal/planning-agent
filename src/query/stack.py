@@ -9,23 +9,36 @@ compiled there unnoticed, because ``maven.compiler.source/target`` do not check
 the API — only ``--release`` does. So the stack is read here, deterministically,
 from the build files, never guessed:
 
-    pom.xml            Java version, Spring Boot parent, dependencies
-    build.gradle(.kts) Java version (sourceCompatibility / toolchain), plugins
+    pom.xml            Java version, Spring Boot parent, dependencies — and every
+                       module's own pom.xml, with the parent's properties
+    build.gradle(.kts) Java version (sourceCompatibility / toolchain), plugins —
+                       and gradle/libs.versions.toml, the version catalog
     package.json       Node engine, dependencies
     pyproject.toml     requires-python, dependencies
     go.mod             Go version
 
-``parse_*`` take the file's text, so a caller that fetched the file (Planning,
-through GitHub) and one that has a checkout (Coding) read it the same way.
+A dependency with no version of its own under a Spring Boot parent gets the one
+Spring Boot manages, from its published BOM (2026-10-15): "Spring Boot 3.2.5" says
+nothing about Jackson, and the code must fit the Jackson that is really there.
+
+``read_stack`` takes a repository's file list and a way to read one file, so a
+caller reading through GitHub (Planning) and one with a checkout (Coding) read
+it the same way.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import tomllib
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
+
+import httpx
 
 # How many libraries to name: enough to show the stack, few enough to read.
 MAX_LIBRARIES = 15
@@ -78,13 +91,27 @@ def _text(el: ET.Element | None) -> str:
     return (el.text or "").strip() if el is not None else ""
 
 
+@dataclass(frozen=True)
+class _Pom:
+    stack: ProjectStack
+    props: dict[str, str]
+    modules: tuple[str, ...] = ()
+    boot: str = ""  # the Spring Boot parent's version
+    unversioned: tuple[str, ...] = ()  # "group:artifact" with no version of its own
+
+
 def parse_pom(text: str) -> ProjectStack:
+    return _read_pom(text).stack
+
+
+def _read_pom(text: str, inherited: dict[str, str] | None = None) -> _Pom:
     try:
         root = _strip_ns(ET.fromstring(text))
     except ET.ParseError:
-        return ProjectStack(build_tool="Maven")
+        return _Pom(ProjectStack(build_tool="Maven"), dict(inherited or {}))
     properties = root.find("properties")
-    props = {child.tag: _text(child) for child in properties} if properties is not None else {}
+    own = {child.tag: _text(child) for child in properties} if properties is not None else {}
+    props = {**(inherited or {}), **own}
 
     def resolve(value: str) -> str:
         return re.sub(r"\$\{([^}]+)\}", lambda m: props.get(m.group(1), m.group(0)), value)
@@ -99,16 +126,21 @@ def parse_pom(text: str) -> ProjectStack:
     release = release.removeprefix("1.") if release.startswith("1.") else release
 
     frameworks: list[str] = []
+    boot = ""
     parent = root.find("parent")
     if parent is not None and _text(parent.find("groupId")) == "org.springframework.boot":
-        frameworks.append(f"Spring Boot {resolve(_text(parent.find('version')))}".strip())
+        boot = resolve(_text(parent.find("version")))
+        frameworks.append(f"Spring Boot {boot}".strip())
 
     libraries: list[str] = []
+    unversioned: list[str] = []
     for dep in root.findall("./dependencies/dependency"):
         name = f"{_text(dep.find('groupId'))}:{_text(dep.find('artifactId'))}"
         version = resolve(_text(dep.find("version")))
         libraries.append(f"{name} {version}".strip())
-    return ProjectStack(
+        if not version:
+            unversioned.append(name)
+    stack = ProjectStack(
         build_tool="Maven",
         language=f"Java {release}" if release else "",
         java_release=release,
@@ -116,6 +148,8 @@ def parse_pom(text: str) -> ProjectStack:
         frameworks=tuple(frameworks),
         libraries=tuple(libraries[:MAX_LIBRARIES]),
     )
+    modules = tuple(_text(m) for m in root.findall("./modules/module") if _text(m))
+    return _Pom(stack, props, modules, boot, tuple(unversioned))
 
 
 _GRADLE_JAVA = (
@@ -198,6 +232,193 @@ PARSERS = (
 BUILD_FILES = tuple(name for name, _ in PARSERS)
 
 
+# --- the whole picture: modules, Spring Boot's managed versions, Gradle catalogs ------
+
+SPRING_BOOT_BOM = (
+    "https://repo1.maven.org/maven2/org/springframework/boot/spring-boot-dependencies/"
+    "{v}/spring-boot-dependencies-{v}.pom"
+)
+
+
+@lru_cache(maxsize=16)
+def spring_boot_managed(version: str) -> tuple[dict[str, str], dict[str, str]]:
+    """({"group:artifact": version}, {bom group: its version}) Spring Boot ``version``
+    manages, from its published BOM; ({}, {}) when it cannot be read."""
+    if not version or os.environ.get("STACK_OFFLINE") == "1":
+        return {}, {}
+    try:
+        resp = httpx.get(SPRING_BOOT_BOM.format(v=version), timeout=10)
+        resp.raise_for_status()
+        root = _strip_ns(ET.fromstring(resp.text))
+    except (httpx.HTTPError, ET.ParseError):
+        return {}, {}
+    properties = root.find("properties")
+    props = {c.tag: _text(c) for c in properties} if properties is not None else {}
+    props.setdefault("project.version", version)
+
+    def resolve(value: str) -> str:
+        return re.sub(r"\$\{([^}]+)\}", lambda m: props.get(m.group(1), m.group(0)), value)
+
+    managed: dict[str, str] = {}
+    boms: dict[str, str] = {}
+    for dep in root.findall("./dependencyManagement/dependencies/dependency"):
+        group, artifact = _text(dep.find("groupId")), _text(dep.find("artifactId"))
+        dep_version = resolve(_text(dep.find("version")))
+        if _text(dep.find("scope")) == "import":
+            boms.setdefault(group, dep_version)
+        else:
+            managed[f"{group}:{artifact}"] = dep_version
+    return managed, boms
+
+
+def _managed_version(name: str, boot: str) -> str:
+    managed, boms = spring_boot_managed(boot)
+    if name in managed:
+        return managed[name]
+    group = name.split(":", 1)[0]
+    for bom_group, version in boms.items():
+        if group == bom_group or group.startswith(bom_group + "."):
+            return version
+    return ""
+
+
+def _with_boot_versions(found: ProjectStack, boot: str, unversioned: list[str]) -> ProjectStack:
+    if not boot or not unversioned:
+        return found
+    named = []
+    for library in found.libraries:
+        if library in unversioned:
+            version = _managed_version(library, boot)
+            library = (
+                f"{library} {version} (managed by Spring Boot {boot})"
+                if version
+                else f"{library} (version managed by Spring Boot {boot})"
+            )
+        named.append(library)
+    return replace(found, libraries=tuple(named))
+
+
+def _merged(first: ProjectStack, more: list[tuple[str, ProjectStack]]) -> ProjectStack:
+    """A multi-module build as one stack: the Java version from the first module that
+    sets it, every framework and library once."""
+    release, language, source = first.java_release, first.language, first.source
+    frameworks = list(first.frameworks)
+    libraries = list(first.libraries)
+    for path, module in more:
+        if not release and module.java_release:
+            release, language = module.java_release, module.language
+            source = module.source.replace("pom.xml", path, 1)
+        frameworks += [f for f in module.frameworks if f not in frameworks]
+        libraries += [lib for lib in module.libraries if lib not in libraries]
+    return replace(
+        first,
+        java_release=release,
+        language=language,
+        source=source,
+        frameworks=tuple(frameworks),
+        libraries=tuple(libraries[:MAX_LIBRARIES]),
+    )
+
+
+def _read_maven(paths: set[str], read: Callable[[str], str]) -> ProjectStack:
+    root = _read_pom(read("pom.xml"))
+    more: list[tuple[str, ProjectStack]] = []
+    unversioned = list(root.unversioned)
+    boot = root.boot
+    pending = [(m, root.props) for m in root.modules]
+    while pending and len(more) < 20:
+        module, inherited = pending.pop(0)
+        path = f"{module.rstrip('/')}/pom.xml"
+        if path not in paths:
+            continue
+        child = _read_pom(read(path), inherited)
+        more.append((path, child.stack))
+        unversioned += [u for u in child.unversioned if u not in unversioned]
+        boot = boot or child.boot
+        pending += [(f"{module.rstrip('/')}/{m}", child.props) for m in child.modules]
+    found = _merged(root.stack, more)
+    return _with_boot_versions(found, boot, unversioned)
+
+
+def parse_version_catalog(text: str) -> tuple[str, list[str], list[str]]:
+    """(Java version, libraries, frameworks) from gradle/libs.versions.toml."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return "", [], []
+    versions = {k: str(v) for k, v in (data.get("versions") or {}).items()}
+
+    def version_of(entry: dict) -> str:
+        v = entry.get("version")
+        if isinstance(v, dict):
+            return versions.get(str(v.get("ref", "")), "")
+        if isinstance(entry.get("version.ref"), str):
+            return versions.get(entry["version.ref"], "")
+        return str(v or "")
+
+    libraries = []
+    for entry in (data.get("libraries") or {}).values():
+        if isinstance(entry, str):
+            group, artifact, *rest = entry.split(":") + [""]
+            libraries.append(f"{group}:{artifact} {rest[0]}".strip())
+            continue
+        module = entry.get("module") or f"{entry.get('group', '')}:{entry.get('name', '')}"
+        libraries.append(f"{module} {version_of(entry)}".strip())
+    frameworks = []
+    for entry in (data.get("plugins") or {}).values():
+        if isinstance(entry, dict) and entry.get("id") == "org.springframework.boot":
+            frameworks.append(f"Spring Boot {version_of(entry)}".strip())
+    java = next((versions[k] for k in ("java", "jdk", "javaVersion") if k in versions), "")
+    return java, libraries, frameworks
+
+
+def _read_gradle(name: str, paths: set[str], read: Callable[[str], str]) -> ProjectStack:
+    found = parse_gradle(read(name))
+    found = replace(found, source=name)
+    if "gradle/libs.versions.toml" not in paths:
+        return found
+    java, libraries, frameworks = parse_version_catalog(read("gradle/libs.versions.toml"))
+    if java and not found.java_release:
+        found = replace(
+            found,
+            java_release=java,
+            language=f"Java {java}",
+            source="gradle/libs.versions.toml (versions.java)",
+        )
+    return replace(
+        found,
+        frameworks=tuple(dict.fromkeys(found.frameworks + tuple(frameworks))),
+        libraries=tuple(libraries[:MAX_LIBRARIES]),
+    )
+
+
+def read_stack(paths: list[str], read: Callable[[str], str]) -> ProjectStack:
+    """The repository's stack from its file list and a way to read one file."""
+    present = set(paths)
+    for name, parse in PARSERS:
+        if name not in present:
+            continue
+        if name == "pom.xml":
+            return _read_maven(present, read)
+        if name.startswith("build.gradle"):
+            return _read_gradle(name, present, read)
+        return parse(read(name))
+    return ProjectStack()
+
+
+_SKIP_DIRS = {".git", "node_modules", "target", "build", "dist", ".gradle", ".venv", "venv"}
+
+
+def repository_paths(repo_root: Path, depth: int = 4) -> list[str]:
+    """A checkout's file paths, relative, without build output and dependencies."""
+    out: list[str] = []
+    for current, dirs, files in os.walk(repo_root):
+        rel = Path(current).relative_to(repo_root)
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and len(rel.parts) < depth]
+        out += [str(rel / f) if rel.parts else f for f in files]
+    return out
+
+
 def from_files(files: dict[str, str]) -> ProjectStack:
     """The stack from build files already read (name -> text); the first found wins."""
     for name, parse in PARSERS:
@@ -207,9 +428,7 @@ def from_files(files: dict[str, str]) -> ProjectStack:
 
 
 def detect(repo_root: Path) -> ProjectStack:
-    """The stack of a checked-out repository, from the build file at its root."""
-    for name, parse in PARSERS:
-        path = repo_root / name
-        if path.is_file():
-            return parse(path.read_text(errors="replace"))
-    return ProjectStack()
+    """The stack of a checked-out repository: its build files, modules and catalog."""
+    return read_stack(
+        repository_paths(repo_root), lambda p: (repo_root / p).read_text(errors="replace")
+    )

@@ -10,9 +10,10 @@ for public repos.
 from __future__ import annotations
 
 import base64
-import os
 
 import httpx
+
+from src.ingestion.secret_store import secret
 
 _API_BASE = "https://api.github.com"
 _TIMEOUT = 30
@@ -25,7 +26,7 @@ class GitHubApiError(Exception):
 
 def _headers(token: str | None) -> dict:
     headers = {"Accept": "application/vnd.github+json"}
-    token = token if token is not None else os.environ.get("GITHUB_TOKEN")
+    token = token if token is not None else (secret("GITHUB_TOKEN") or None)
     if token:
         headers["Authorization"] = f"token {token}"
     return headers
@@ -83,17 +84,18 @@ def get_changed_files(repo: str, base: str, head: str, token: str | None = None)
     return files
 
 
-def list_root_files(repo: str, ref: str | None = None, token: str | None = None) -> list[str]:
-    """The names of the files at the root of `repo` (its default branch when
-    `ref` is None) — one call, to see which build files exist before reading."""
-    url = f"{_API_BASE}/repos/{repo}/contents"
-    params = {"ref": ref} if ref else {}
+def list_tree(repo: str, ref: str | None = None, token: str | None = None) -> list[str]:
+    """Every file path in `repo` (its default branch when `ref` is None), in one
+    call — what the design reads the build files and API contracts from."""
+    url = f"{_API_BASE}/repos/{repo}/git/trees/{ref or 'HEAD'}"
     try:
-        resp = httpx.get(url, headers=_headers(token), params=params, timeout=_TIMEOUT)
+        resp = httpx.get(
+            url, headers=_headers(token), params={"recursive": "1"}, timeout=_TIMEOUT
+        )
         resp.raise_for_status()
     except httpx.HTTPError as e:
         raise GitHubApiError(f"could not list {repo}@{ref or 'default'}: {e}") from e
-    return [item["name"] for item in resp.json() if item.get("type") == "file"]
+    return [item["path"] for item in resp.json().get("tree") or [] if item.get("type") == "blob"]
 
 
 def fetch_file_content(repo: str, path: str, ref: str, token: str | None = None) -> str:

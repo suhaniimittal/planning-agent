@@ -127,7 +127,15 @@ def build_system_prompt() -> str:
         "Every design must fit the `Technology constraints` given: the language "
         "version, build tool and libraries the repository really uses — no API or "
         "syntax from a later version, no new or upgraded dependency unless you "
-        "name it as an open question.\n"
+        "name it as an open question. "
+        "Between services, every API change must be backward-compatible: never "
+        "remove or rename an endpoint, field, message or event another service "
+        "uses, and never make a new field or parameter required for existing "
+        "callers — add it as optional with a safe default, or add a new versioned "
+        "endpoint and say so in `api_changes`. Read the `API contracts` given for "
+        "what exists today. When more than one service changes, fill "
+        "`rollout_order`: the order to merge and deploy them, a provider before "
+        "its consumers, every step safe on its own.\n"
         "6. NEVER introduce generic domain or compliance knowledge that "
         "isn't actually stated in the evidence you were given — e.g. do "
         "not mention a compliance standard (PCI DSS, GDPR, SOC 2, ...), a "
@@ -386,6 +394,7 @@ def build_user_prompt(
     known_dependencies: list[dict] | None = None,
     file_context: dict[tuple[str, str], list[str]] | None = None,
     technology_constraints: list[str] | None = None,
+    api_contracts: str = "",
 ) -> str:
     """`known_dependencies`: real CALLS edges among the candidate services,
     read from the graph BEFORE the LLM call — shown here as confirmed
@@ -423,6 +432,10 @@ def build_user_prompt(
             "## Technology constraints (read from the repositories' build files)\n"
             + "\n".join(f"- {c}" for c in technology_constraints)
             + "\n"
+        )
+    if api_contracts:
+        sections.append(
+            "## API contracts (current, read from the repositories)\n" + api_contracts + "\n"
         )
 
     if known_dependencies:

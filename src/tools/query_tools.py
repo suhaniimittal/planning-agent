@@ -11,7 +11,7 @@ from common_lib.storage.storage_client import storage
 
 from src.ingestion import github_api
 from src.ingestion.confluence_api import ConfluenceApiError, create_page
-from src.query import stack
+from src.query import contracts, stack
 from src.query.design_qa import answer_question
 from src.query.pdf_render import render_pdf
 from src.query.query_flow import build_tdd
@@ -62,29 +62,38 @@ async def answer_design_question(
     return answer.to_dict()
 
 
-def technology_constraints(service_repos: dict[str, str]) -> list[str]:
-    """Each service's real stack, read from its build files on GitHub (2026-10-15).
+def repository_facts(service_repos: dict[str, str]) -> tuple[list[str], str]:
+    """(technology constraints, API contracts) of each service's repository (2026-10-15).
 
-    One call lists the repository's root; only the build files there are read.
-    A repository that cannot be read adds a line saying so — the design then
-    knows its versions are unknown, rather than assuming any."""
-    out: list[str] = []
+    One call lists the repository's files; then only its build files (the root
+    one, every module's, the Gradle catalog) and its API contracts (OpenAPI,
+    AsyncAPI, protobuf) are read. A repository that cannot be read adds a line
+    saying so — the design then knows its versions are unknown."""
+    constraints: list[str] = []
+    contract_files: dict[str, list[tuple[str, str]]] = {}
     for name, slug in sorted(service_repos.items()):
         repo, _, branch = slug.partition("@")
+        ref = branch or "HEAD"
         try:
-            present = set(github_api.list_root_files(repo, branch or None))
-            files = {
-                f: github_api.fetch_file_content(repo, f, branch or "HEAD")
-                for f in stack.BUILD_FILES
-                if f in present
-            }
+            paths = github_api.list_tree(repo, branch or None)
+            def read(path: str, repo: str = repo, ref: str = ref) -> str:
+                return github_api.fetch_file_content(repo, path, ref)
+
+            found = stack.read_stack(paths, read)
+            files = [(p, read(p)) for p in contracts.contract_paths(paths)]
         except github_api.GitHubApiError as exc:
-            out.append(f"{name}: build files could not be read ({exc}); versions unknown.")
+            constraints.append(f"{name}: build files could not be read ({exc}); versions unknown.")
             continue
-        found = stack.from_files(files)
         prefix = f"{name}: " if len(service_repos) > 1 else ""
-        out.extend(prefix + rule for rule in found.constraints())
-    return out
+        constraints.extend(prefix + rule for rule in found.constraints())
+        if files:
+            contract_files[name] = files
+    return constraints, contracts.contracts_section(contract_files)
+
+
+def technology_constraints(service_repos: dict[str, str]) -> list[str]:
+    """Each service's real stack, from its build files (see repository_facts)."""
+    return repository_facts(service_repos)[0]
 
 
 @tool()
@@ -112,12 +121,14 @@ async def generate_technical_design(
     repositories whose build files give the design its technology
     constraints. `return_document`: also return the title, the
     Confluence HTML and the plain text, for the orchestrator."""
+    constraints, api_contracts = repository_facts(service_repos or {})
     tdd = await build_tdd(
         issue_text,
         top_k=top_k,
         hops=hops,
         service_names=service_names,
-        technology_constraints=technology_constraints(service_repos or {}),
+        technology_constraints=constraints,
+        api_contracts=api_contracts,
     )
     pdf_bytes = render_pdf(tdd)
 

@@ -143,6 +143,7 @@ async def build_tdd(
     debug_dump_prompts: bool = False,
     service_names: list[str] | None = None,
     technology_constraints: list[str] | None = None,
+    api_contracts: str = "",
 ) -> TechnicalDesignDoc:
     """`service_names`: the services this run covers (the Repositories the
     user listed) — only those are ever considered. None considers every
@@ -278,6 +279,7 @@ async def build_tdd(
         known_dependencies=known_dependencies,
         file_context=file_context,
         technology_constraints=technology_constraints,
+        api_contracts=api_contracts,
     )
 
     if debug_dump_prompts:

@@ -18,9 +18,10 @@ Run directly: python -m src.ingestion.ingest
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Callable
 from pathlib import PurePosixPath
+
+from src.ingestion.secret_store import secret
 
 from . import code_graph_writer, github_api, graph_writer
 from .code_parser import (
@@ -609,7 +610,7 @@ async def run(
     code_graph_writer.create_chunk_vector_index()
 
     print("\n=== Syncing services (full ingest on first run, git-diff incremental after) ===")
-    github_token = os.environ.get("GITHUB_TOKEN")
+    github_token = secret("GITHUB_TOKEN") or None
     semaphore = asyncio.Semaphore(_CODE_GRAPH_CONCURRENCY)
 
     async def _one(spec: ServiceSpec) -> tuple[str, RepoGraph | None]:

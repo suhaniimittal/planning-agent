@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import os
 
+from src.ingestion.secret_store import secret
+
 _KEY_NAMES = ("AGENTS_GATEWAY_KEY", "BIFROST_VIRTUAL_KEY", "AI_GATEWAY_KEY")
 
 
 def gateway_key() -> str:
     """The gateway key under whichever name it was given, or ""."""
-    return next((os.environ[n] for n in _KEY_NAMES if os.environ.get(n, "").strip()), "")
+    return next((v for v in (secret(n) for n in _KEY_NAMES) if v), "")
 
 
 def gateway_url() -> str:

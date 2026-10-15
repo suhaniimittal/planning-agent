@@ -174,3 +174,12 @@ class TechnicalDesignDoc(BaseModel):
         default_factory=list,
         description="Filled from the repositories' build files — leave this empty.",
     )
+    rollout_order: list[str] = Field(
+        default_factory=list,
+        description=(
+            "When more than one service changes: the order to merge and deploy them, "
+            "one step per service — '<service>: <why it goes here>' — a provider "
+            "before the services that call it, each step safe on its own. Empty when "
+            "one service changes."
+        ),
+    )

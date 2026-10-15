@@ -13,6 +13,8 @@ import os
 
 import httpx
 
+from src.ingestion.secret_store import secret
+
 _TIMEOUT = 30
 
 
@@ -30,7 +32,7 @@ def _base_url() -> str:
 
 def _auth() -> tuple[str, str]:
     email = os.environ.get("CONFLUENCE_EMAIL")
-    token = os.environ.get("CONFLUENCE_API_TOKEN")
+    token = secret("CONFLUENCE_API_TOKEN") or None
     if not email or not token:
         raise ConfluenceApiError("CONFLUENCE_EMAIL / CONFLUENCE_API_TOKEN are not set")
     return email, token

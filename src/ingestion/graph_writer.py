@@ -8,6 +8,8 @@ import os
 
 from neo4j import GraphDatabase
 
+from src.ingestion.secret_store import secret
+
 _driver = None
 
 
@@ -16,7 +18,8 @@ def get_driver():
     if _driver is None:
         uri = os.environ["NEO4J_URI"]
         user = os.environ.get("NEO4J_USER", "neo4j")
-        password = os.environ["NEO4J_PASSWORD"]
+        # A mounted secret in production, the variable on a laptop (2026-10-15).
+        password = secret("NEO4J_PASSWORD") or os.environ["NEO4J_PASSWORD"]
         _driver = GraphDatabase.driver(
             uri,
             auth=(user, password),

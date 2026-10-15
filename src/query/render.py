@@ -282,6 +282,9 @@ def render_markdown(tdd: TechnicalDesignDoc) -> str:
             13,
             "API Changes",
             *api_blocks if api_blocks else ["No API changes identified from the available documentation."],
+            ("**Rollout order (merge and deploy in this order):**\n\n"
+             + "\n".join(f"{i}. {s}" for i, s in enumerate(tdd.rollout_order, start=1)))
+            if tdd.rollout_order else None,
         )
     )
 
@@ -637,6 +640,9 @@ def render_confluence(tdd: TechnicalDesignDoc) -> str:
             13,
             "API Changes",
             *(api_blocks or ["<p>No API changes identified from the available documentation.</p>"]),
+            ("<p><strong>Rollout order (merge and deploy in this order):</strong></p>\n"
+             + _cf_numbered(tdd.rollout_order))
+            if tdd.rollout_order else None,
         )
     )
 
@@ -792,6 +798,9 @@ def render_text(tdd: TechnicalDesignDoc) -> str:
 
     plan = "\n".join(f"{i}. {step}" for i, step in enumerate(tdd.implementation_plan, start=1))
     body.append(("Implementation Plan", [plan]))
+    if tdd.rollout_order:
+        order = "\n".join(f"{i}. {step}" for i, step in enumerate(tdd.rollout_order, start=1))
+        body.append(("Rollout Order", [order]))
     body.append(("Risks", [_txt_bullets(tdd.risks)]))
     body.append(("Open Questions", [_txt_bullets(tdd.open_questions)]))
 

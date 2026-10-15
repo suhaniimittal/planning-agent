@@ -28,6 +28,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.ingestion.secret_store import secret
+
 from . import github_api
 from .code_parser import DEFAULT_DENYLIST
 
@@ -172,7 +174,7 @@ def cloned_repo(
         yield RepoCheckout(local_root, LOCAL_HEAD_SHA)
         return
 
-    token = github_token if github_token is not None else os.environ.get("GITHUB_TOKEN")
+    token = github_token if github_token is not None else (secret("GITHUB_TOKEN") or None)
     try:
         head_sha = github_api.get_remote_head_sha(slug, branch, token)
         data = github_api.download_zipball(slug, head_sha, token, timeout=timeout)
