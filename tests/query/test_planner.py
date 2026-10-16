@@ -748,3 +748,89 @@ def test_system_prompt_puts_the_persisting_service_in_change_scope():
     # the over-scoping guard must survive the widening
     assert "Sitting on the data path is NOT by itself a reason to change" in prompt
     assert "merely because its file or service is part of the same data flow" in prompt
+
+
+# ---------- bug / feature modes ----------
+
+
+def test_bug_mode_carries_the_value_trace_and_feature_mode_does_not():
+    """The trace is what located EmploymentVerificationInput.toAvro on a bug
+    ticket. It has nothing to trace on a feature request, where no reported
+    value exists."""
+    bug = build_system_prompt("bug")
+    feature = build_system_prompt("feature")
+    for probe in ("TRACE THE REPORTED VALUE", "Transformed at:", "Stored at:", "Not the cause:"):
+        assert probe in bug
+        assert probe not in feature
+
+
+def test_feature_mode_replaces_root_cause_with_gap_analysis():
+    """Regression test: the bulk-print feature ticket ran through the bug
+    prompt and had to express "compliance-service already merges PDFs" as a
+    `Not the cause:` line. Exists/Missing/Extend is the shape that fits."""
+    feature = build_system_prompt("feature")
+    bug = build_system_prompt("bug")
+    assert "GAP ANALYSIS" in feature
+    for probe in ("Exists: <capability>", "Missing: <capability", "Extend: <service>"):
+        assert probe in feature
+        assert probe not in bug
+
+
+def test_bug_mode_asks_whether_the_invalid_state_can_recur():
+    bug = build_system_prompt("bug")
+    assert "can the same invalid state be produced again" in bug
+    assert "UPSTREAM correction" in bug and "DOWNSTREAM correction" in bug
+
+
+def test_bug_mode_addresses_already_stored_data():
+    """Fixing the entry point does not clean rows already written. A bug TDD
+    has to say which change handles those."""
+    bug = build_system_prompt("bug")
+    assert "PERSISTED DATA" in bug
+    assert "whether existing records still fail after the change" in bug
+    assert "Do not recommend a data repair or migration unless" in bug
+
+
+def test_feature_mode_separates_stated_requirements_from_assumptions():
+    feature = build_system_prompt("feature")
+    assert "REQUIREMENTS BEFORE DESIGN" in feature
+    assert "Never invent a business rule" in feature
+    assert "acceptance criterion" in feature
+
+
+def test_feature_mode_requires_building_on_existing_mechanisms():
+    feature = build_system_prompt("feature")
+    assert "BUILD ON WHAT IS ALREADY THERE" in feature
+    assert "A second mechanism standing beside one that already works is wrong" in feature
+
+
+def test_both_modes_share_the_create_and_no_change_rules():
+    """These fix defects measured on the bulk-print run — a `(modify)` on a
+    symbol the text said not to change, and two no-change files listed under
+    FILES TO CHANGE. Neither is mode-specific."""
+    for mode in ("bug", "feature"):
+        prompt = build_system_prompt(mode)
+        assert "WHEN A CHANGE ADDS SOMETHING THAT DOES NOT EXIST YET" in prompt
+        assert "A CHANGE THAT CHANGES NOTHING IS NOT A CHANGE" in prompt
+
+
+def test_both_modes_share_the_whole_base():
+    """The base must not be duplicated per mode, or the two copies drift."""
+    for mode in ("bug", "feature"):
+        prompt = build_system_prompt(mode)
+        for probe in (
+            "FOUR KINDS OF KNOWING",
+            "SELF-CHECK BEFORE YOU RESPOND",
+            "WRITE FOR A BUSY DEVELOPER",
+            "only evidence about that service",
+            "EVERY service you listed in `services` MUST appear here",
+            "you have run nothing",
+            "<service> <file_path> <symbol>",
+        ):
+            assert probe in prompt, f"{probe!r} missing from {mode} mode"
+
+
+def test_an_unknown_mode_falls_back_to_bug():
+    """A malformed mode must never produce a prompt with neither block."""
+    assert build_system_prompt("refactor") == build_system_prompt("bug")
+    assert build_system_prompt("") == build_system_prompt("bug")

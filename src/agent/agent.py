@@ -68,6 +68,9 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
     top_k = payload.get("top_k") or 5
     hops = payload.get("hops")
     hops = 2 if hops is None else hops
+    # Optional override. Left unset (the normal case), the ticket is
+    # classified from its own text during the issue split.
+    mode = payload.get("mode") or None
     try:
         ingestion = await toolExecutor.execute(
             "run_ingestion", repos_text, start_to_close_timeout=_INGESTION_TIMEOUT
@@ -79,6 +82,7 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
             hops,
             # The TDD considers only the services this run listed.
             ingestion["services"],
+            mode,
             start_to_close_timeout=_TDD_TIMEOUT,
         )
 

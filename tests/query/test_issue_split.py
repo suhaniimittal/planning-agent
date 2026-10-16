@@ -151,7 +151,7 @@ async def test_split_issue_returns_the_models_chunks(monkeypatch):
         return _reply(CLEAN_CHUNKS)
 
     monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
-    assert await issue_split.split_issue(ISSUE) == CLEAN_CHUNKS
+    assert await issue_split.split_issue(ISSUE) == ("bug", CLEAN_CHUNKS)
 
 
 @pytest.mark.asyncio
@@ -176,7 +176,7 @@ async def test_split_issue_gives_up_quietly_when_the_provider_fails(monkeypatch)
         raise RuntimeError("rate limited")
 
     monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
-    assert await issue_split.split_issue(ISSUE) == []
+    assert await issue_split.split_issue(ISSUE) == ("bug", [])
 
 
 @pytest.mark.asyncio
@@ -185,7 +185,7 @@ async def test_split_issue_gives_up_on_unparseable_output(monkeypatch):
         return "I'm afraid I can't do that."
 
     monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
-    assert await issue_split.split_issue(ISSUE) == []
+    assert await issue_split.split_issue(ISSUE) == ("bug", [])
 
 
 @pytest.mark.asyncio
@@ -194,7 +194,7 @@ async def test_split_issue_does_not_cache_a_rejected_split(monkeypatch):
         return _reply(["The regex lives in PhoneValidator.ts and rejects leading whitespace."])
 
     monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
-    assert await issue_split.split_issue(ISSUE) == []
+    assert await issue_split.split_issue(ISSUE) == ("bug", [])
     assert issue_split._cache == {}
 
 
@@ -207,9 +207,10 @@ async def test_issue_queries_puts_the_whole_ticket_first(monkeypatch):
         return _reply(CLEAN_CHUNKS)
 
     monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
-    queries = await issue_split.issue_queries(ISSUE)
+    mode, queries = await issue_split.issue_queries(ISSUE)
 
     # query_flow scores services on vectors[0] alone — it must stay the whole ticket
+    assert mode in issue_split.MODES
     assert queries[0] == ISSUE.strip()
     assert queries[1:] == CLEAN_CHUNKS
 
@@ -220,7 +221,9 @@ async def test_issue_queries_falls_back_to_sentence_splitting(monkeypatch):
         raise RuntimeError("down")
 
     monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
-    assert await issue_split.issue_queries(ISSUE) == code_search.issue_queries(ISSUE)
+    mode, queries = await issue_split.issue_queries(ISSUE)
+    assert queries == code_search.issue_queries(ISSUE)
+    assert mode in issue_split.MODES
 
 
 @pytest.mark.asyncio
@@ -229,5 +232,113 @@ async def test_issue_queries_never_exceeds_the_embedding_budget(monkeypatch):
         return _reply([f"chunk {i} padded out well past the minimum length" for i in range(40)])
 
     monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
-    queries = await issue_split.issue_queries(ISSUE)
+    _, queries = await issue_split.issue_queries(ISSUE)
     assert len(queries) <= code_search.MAX_QUERY_PARTS
+
+
+# ---------- mode detection ----------
+
+BUG_TICKET = ISSUE  # the deferred-submit report above
+
+FEATURE_TICKET = (
+    "Enhancement request for mass report printing\n"
+    "Parity with Classic: the client user needs to print reports in mass from "
+    "the report dashboard.\n"
+    "As a client user, I want to select multiple completed reports and generate "
+    "a single merged PDF, so that I can distribute report documentation "
+    "without opening each report individually.\n"
+    "In Scope: multi-select report printing, generation of a single merged PDF.\n"
+    "Out of Scope: individual PDF generation for each selected report.\n"
+    "Acceptance criteria\n"
+    "Users shall be able to select multiple reports from the report dashboard.\n"
+    "Given a user has selected multiple completed reports, when the user selects "
+    "Bulk Print, then a single merged PDF shall be generated."
+)
+
+
+def test_keyword_mode_recognises_a_bug_report():
+    """Guards the bug vocabulary. Measured on the real deferred-submit ticket:
+    9 bug signals, 0 feature."""
+    mode, bug, feature = issue_split.keyword_mode(BUG_TICKET)
+    assert mode == "bug"
+    assert bug > feature
+
+
+def test_keyword_mode_recognises_a_feature_request():
+    """Guards the feature vocabulary. Measured on the real bulk-print ticket:
+    0 bug signals, 11 feature."""
+    mode, bug, feature = issue_split.keyword_mode(FEATURE_TICKET)
+    assert mode == "feature"
+    assert feature > bug
+
+
+def test_keyword_mode_falls_back_to_bug_on_a_tie():
+    """A terse ticket scores nothing either way. Bug is the safer default: the
+    bug prompt merely strains on a feature, while the feature prompt run on a
+    real bug drops the value trace that locates where a bad value is written."""
+    mode, bug, feature = issue_split.keyword_mode("Bulk print output looks odd.")
+    assert (bug, feature) == (0, 0)
+    assert mode == "bug"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ('{"mode": "feature", "chunks": []}', "feature"),
+        ('{"mode": "bug", "chunks": []}', "bug"),
+        ('{"chunks": []}', None),
+        ('{"mode": "banana", "chunks": []}', None),
+        ('{"mode": 7, "chunks": []}', None),
+        ("not json", None),
+    ],
+)
+def test_parse_mode_accepts_only_a_known_mode(raw, expected):
+    assert issue_split.parse_mode(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_split_issue_uses_the_mode_the_model_returned(monkeypatch):
+    async def call_llm(system, user):
+        assert "classify the report" in system
+        return json.dumps({"mode": "feature", "chunks": CLEAN_CHUNKS})
+
+    monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
+    mode, chunks = await issue_split.split_issue(ISSUE)
+    assert mode == "feature"  # the model wins even though the text reads as a bug
+    assert chunks == CLEAN_CHUNKS
+
+
+@pytest.mark.asyncio
+async def test_split_issue_falls_back_to_keywords_when_the_mode_is_missing(monkeypatch):
+    async def call_llm(system, user):
+        return _reply(CLEAN_CHUNKS)  # no "mode" key
+
+    monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
+    mode, chunks = await issue_split.split_issue(ISSUE)
+    assert mode == "bug"
+    assert chunks == CLEAN_CHUNKS
+
+
+@pytest.mark.asyncio
+async def test_split_issue_rejects_an_unrecognised_mode(monkeypatch):
+    async def call_llm(system, user):
+        return json.dumps({"mode": "refactor", "chunks": CLEAN_CHUNKS})
+
+    monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
+    mode, _ = await issue_split.split_issue(ISSUE)
+    assert mode == "bug"  # not "refactor" — unknown values never reach the prompt
+
+
+@pytest.mark.asyncio
+async def test_mode_is_cached_with_the_chunks(monkeypatch):
+    calls = []
+
+    async def call_llm(system, user):
+        calls.append(user)
+        return json.dumps({"mode": "feature", "chunks": CLEAN_CHUNKS})
+
+    monkeypatch.setattr(issue_split.planner, "call_llm", call_llm)
+    first = await issue_split.split_issue(ISSUE)
+    second = await issue_split.split_issue(ISSUE)
+    assert first == second == ("feature", CLEAN_CHUNKS)
+    assert len(calls) == 1  # one ticket cannot be classified two ways in a run

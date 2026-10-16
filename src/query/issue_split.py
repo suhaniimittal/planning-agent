@@ -93,8 +93,14 @@ SPLIT_SYSTEM_PROMPT = (
     'so Y stays stuck") may be preserved; one it does not assert may not be '
     "added.\n\n"
     "Keep chunks in the order they appear in the ticket.\n\n"
-    'Respond with ONLY a JSON object of the form {"chunks": ["...", '
-    '"..."]}, no markdown fences and no prose outside the JSON.'
+    'Also classify the report. "bug" — it describes something broken: a '
+    "failure, a wrong result, reproduction steps, behaviour that used to "
+    'work. "feature" — it asks for something that does not exist yet: a '
+    "new capability, acceptance criteria, a user story. Judge the whole "
+    "report, not a single phrase.\n\n"
+    'Respond with ONLY a JSON object of the form {"mode": "bug" or '
+    '"feature", "chunks": ["...", "..."]}, no markdown fences and no '
+    "prose outside the JSON."
 )
 
 # Token shapes a model could plausibly invent while rewriting, and that would
@@ -115,14 +121,104 @@ _CODE_SHAPED = re.compile(
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$")
 _FIRST_OBJECT = re.compile(r"\{.*\}", re.S)
 
+# Vocabulary that separates the two kinds of ticket. A bug report narrates a
+# failure; a feature request states what shall exist. Measured on two real
+# tickets: the deferred-submit bug scored 9 bug signals to 0 feature, and the
+# bulk-print enhancement scored 0 to 11 — no overlap in either direction.
+# Used as the fallback when the model does not classify, and as the
+# cross-check that gets logged when the two disagree.
+_BUG_SIGNALS = (
+    r"steps?\s+to\s+reproduce",
+    r"\breproduc",
+    r"\bobserve[d:]?\b",
+    r"expected\s+(behaviou?r|result)",
+    r"actual\s+(behaviou?r|result)",
+    r"\bbug\b",
+    r"\bdefect\b",
+    r"silently",
+    r"does nothing",
+    r"instead of",
+    r"stuck",
+    r"\bfails?\b",
+    r"\berror\b",
+    r"regression",
+    r"no longer",
+    r"broken",
+)
+_FEATURE_SIGNALS = (
+    r"\bas an?\b[^.\n]{0,40}\b(user|client|admin)\b",
+    r"\bi want\b",
+    r"\bso that\b",
+    r"enhancement",
+    r"\bin scope\b",
+    r"\bout of scope\b",
+    r"acceptance criteria",
+    r"\bshall\b",
+    r"\bnew (platform|feature|capability)\b",
+    r"\bparity\b",
+    r"given .{0,80}when .{0,80}then",
+    r"\bmust be able\b",
+    r"\brequirement\b",
+)
+MODES = ("bug", "feature")
+
+
+def keyword_mode(issue_text: str) -> tuple[str, int, int]:
+    """(mode, bug_hits, feature_hits) from vocabulary alone — no model call.
+
+    Ties and silence resolve to "bug": the bug prompt degrades gracefully on
+    a feature ticket, while the feature prompt run on a real bug drops the
+    value trace that locates where a bad value is written. Fail toward the
+    mode that loses less.
+    """
+    low = issue_text.lower()
+    bug = sum(1 for pattern in _BUG_SIGNALS if re.search(pattern, low))
+    feature = sum(1 for pattern in _FEATURE_SIGNALS if re.search(pattern, low))
+    return ("feature" if feature > bug else "bug"), bug, feature
+
+
 # Process-local: one agent run plans one ticket, sometimes more than once
 # (a retry, a test). Nothing persists between runs, which is fine — the point
 # is that a single ticket cannot split two different ways within a run.
-_cache: dict[str, list[str]] = {}
+_cache: dict[str, tuple[str, list[str]]] = {}
 
 
 def _cache_key(issue_text: str) -> str:
     return hashlib.sha256(issue_text.strip().encode()).hexdigest()
+
+
+def _parse_object(raw: str) -> dict | list | None:
+    """The model's reply -> the JSON value it carries, or None.
+
+    Tolerant on purpose: only the OpenAI path can ask for native JSON mode,
+    so the gateway path may wrap the object in markdown fences or prose
+    (the same asymmetry planner.parse_tdd defends against). Never raises —
+    a failure here means a failed split, not a failed run.
+    """
+    text = _FENCE.sub("", raw or "").strip()
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        match = _FIRST_OBJECT.search(text)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+
+def parse_mode(raw: str) -> str | None:
+    """The model's `mode` field, or None when absent or not a known mode.
+
+    Unknown values are discarded rather than passed through: an
+    unrecognised mode would silently fall back inside
+    build_system_prompt, hiding the fact that the model answered
+    something nonsensical.
+    """
+    data = _parse_object(raw)
+    mode = data.get("mode") if isinstance(data, dict) else None
+    return mode if mode in MODES else None
 
 
 def parse_chunks(raw: str) -> list[str]:
@@ -135,17 +231,9 @@ def parse_chunks(raw: str) -> list[str]:
     Returns [] for anything unparseable — the caller treats that as a failed
     split and falls back, rather than raising into the middle of a run.
     """
-    text = _FENCE.sub("", raw or "").strip()
-    try:
-        data = json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        match = _FIRST_OBJECT.search(text)
-        if not match:
-            return []
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return []
+    data = _parse_object(raw)
+    if data is None:
+        return []
     chunks = data.get("chunks") if isinstance(data, dict) else data
     if not isinstance(chunks, list):
         return []
@@ -190,8 +278,38 @@ def usable(chunks: list[str], issue_text: str) -> tuple[list[str], str | None]:
     return kept, None
 
 
-async def split_issue(issue_text: str) -> list[str]:
-    """`issue_text` -> self-contained chunks, or [] if the split can't be trusted.
+def _keyword_only(issue_text: str) -> str:
+    """The mode when the model gave us nothing usable."""
+    mode, bug, feature = keyword_mode(issue_text)
+    print(f"  [TDD] mode: {mode} (keywords; {bug} bug / {feature} feature signals)")
+    return mode
+
+
+def _decide_mode(raw: str, issue_text: str) -> str:
+    """The model's classification, with keywords as fallback and cross-check.
+
+    A disagreement is logged rather than resolved quietly: the model reads
+    the whole report and wins, but a run where the two differ is worth
+    noticing, because it is the shape of ticket most likely to be
+    classified wrong.
+    """
+    stated = parse_mode(raw)
+    guess, bug, feature = keyword_mode(issue_text)
+    if stated is None:
+        print(f"  [TDD] mode: {guess} (keywords; {bug} bug / {feature} feature signals)")
+        return guess
+    agreement = "agree" if stated == guess else f"DISAGREE, keywords said {guess}"
+    print(f"  [TDD] mode: {stated} (llm; keywords {agreement} — {bug} bug / {feature} feature)")
+    return stated
+
+
+async def split_issue(issue_text: str) -> tuple[str, list[str]]:
+    """`issue_text` -> (mode, chunks); chunks is [] if the split can't be trusted.
+
+    The mode is always usable: the model classifies in the same call that
+    splits, and keyword_mode decides whenever that call fails, omits the
+    field, or answers with something unrecognised. Both are cached, so one
+    ticket cannot be classified two ways within a run.
 
     Never raises: every failure path returns [] so the caller falls back to
     the regex splitter. A broken split must cost the run its improvement,
@@ -206,20 +324,21 @@ async def split_issue(issue_text: str) -> list[str]:
         )
     except Exception as e:  # noqa: BLE001 - any provider failure falls back
         print(f"  [TDD] issue split unavailable ({type(e).__name__}), using sentence split")
-        return []
+        return _keyword_only(issue_text), []
     chunks = parse_chunks(raw)
     if not chunks:
         print("  [TDD] issue split returned no usable JSON, using sentence split")
-        return []
+        return _keyword_only(issue_text), []
     kept, reason = usable(chunks, issue_text)
     if reason:
         print(f"  [TDD] issue split rejected ({reason}), using sentence split")
-        return []
-    _cache[key] = kept
-    return kept
+        return _keyword_only(issue_text), []
+    mode = _decide_mode(raw, issue_text)
+    _cache[key] = (mode, kept)
+    return mode, kept
 
 
-async def issue_queries(issue_text: str) -> list[str]:
+async def issue_queries(issue_text: str) -> tuple[str, list[str]]:
     """The whole ticket first, then its self-contained chunks.
 
     Drop-in async replacement for code_search.issue_queries, with the same
@@ -228,8 +347,8 @@ async def issue_queries(issue_text: str) -> list[str]:
     split is unavailable or untrustworthy.
     """
     whole = issue_text.strip()
-    chunks = await split_issue(issue_text)
+    mode, chunks = await split_issue(issue_text)
     if not chunks:
-        return code_search.issue_queries(issue_text)
+        return mode, code_search.issue_queries(issue_text)
     print(f"  [TDD] issue split into {len(chunks)} self-contained chunks")
-    return [whole] + chunks
+    return mode, [whole] + chunks

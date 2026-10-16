@@ -110,7 +110,7 @@ def graph(monkeypatch):
         "load_file_context": load_file_context,
     }.items():
         monkeypatch.setattr(query_flow.graph_reader, name, fn)
-    monkeypatch.setattr(query_flow.planner, "build_system_prompt", lambda: "system")
+    monkeypatch.setattr(query_flow.planner, "build_system_prompt", lambda mode=None: "system")
     monkeypatch.setattr(query_flow.planner, "build_user_prompt", build_user_prompt)
     monkeypatch.setattr(query_flow.planner, "call_llm", call_llm)
     monkeypatch.setattr(query_flow.planner, "parse_tdd", lambda raw: g.tdd)

@@ -79,9 +79,8 @@ def _referenced_service_names(tdd: TechnicalDesignDoc) -> list[str]:
 
     for service_plan in tdd.services:
         add(service_plan.service)
-    for component in (
-        list(getattr(tdd, "current_architecture_components", None) or [])
-        + list(getattr(tdd, "proposed_architecture_components", None) or [])
+    for component in list(getattr(tdd, "current_architecture_components", None) or []) + list(
+        getattr(tdd, "proposed_architecture_components", None) or []
     ):
         add(component.name)
         for dep in component.depends_on:
@@ -142,6 +141,7 @@ async def build_tdd(
     hops: int = 2,
     debug_dump_prompts: bool = False,
     service_names: list[str] | None = None,
+    mode: str | None = None,
 ) -> TechnicalDesignDoc:
     """`service_names`: the services this run covers (the Repositories the
     user listed) — only those are ever considered. None considers every
@@ -160,7 +160,10 @@ async def build_tdd(
     # so a detail that only one sentence describes still finds its function.
     # The parts come from an LLM where possible (self-contained, references
     # resolved) and from sentence splitting otherwise — see issue_split.
-    queries = await issue_split.issue_queries(issue_text)
+    detected_mode, queries = await issue_split.issue_queries(issue_text)
+    # An explicit mode from the caller wins; otherwise take what the split
+    # classified. The prompt itself falls back to bug for anything unknown.
+    mode = mode or detected_mode
     vectors = await embed_many(queries)
     embedding = vectors[0]
     identifiers = code_search.issue_identifiers(issue_text)
@@ -269,7 +272,7 @@ async def build_tdd(
         )
     )
 
-    system_prompt = planner.build_system_prompt()
+    system_prompt = planner.build_system_prompt(mode)
     user_prompt = planner.build_user_prompt(
         issue_text,
         candidate_docs,
