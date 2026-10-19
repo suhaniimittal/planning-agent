@@ -448,9 +448,16 @@ def build_system_prompt(mode: str = "bug") -> str:
         "symbol with no description) — and `acceptance_criteria`: specific, "
         "testable conditions that would confirm the change is correct, each "
         "matching a scenario in `testing_plan`. Set "
-        '`change_type` to "create" only for a symbol that doesn\'t exist '
-        'yet, "delete" only if it should be removed, and "modify" '
-        "otherwise (the default). Estimate `complexity` for each service's "
+        "`change_type` by what happens to the FILE, not to the symbol: "
+        '"create" ONLY when the file itself does not exist yet, "modify" '
+        "when the file already exists — including when the code you are "
+        'adding to it is brand new — "delete" only if it should be '
+        'removed, and "reference" for a symbol your design only reads, '
+        "calls, or depends on without editing it. New code going into an "
+        'existing file is a "modify": whoever implements a "create" does '
+        "not read the file first, so labelling it that way replaces the "
+        "file's existing contents with only your new code. Estimate "
+        "`complexity` for each service's "
         'overall change ("low", "medium", or "high"), describe '
         "`responsibility_change` (what that service's responsibilities "
         "become vs. what stays the same), list any `api_changes` (new/"
@@ -474,20 +481,33 @@ def build_system_prompt(mode: str = "bug") -> str:
         "sketch AND say in `implementation_notes` that it must be created. "
         "Presenting a hypothetical helper as an existing repository API is a "
         "failure, not a shortcut.\n\n"
-        "WHEN A CHANGE ADDS SOMETHING THAT DOES NOT EXIST YET, SAY SO. "
-        'Set `change_type` to "create", put the name of the symbol to be '
-        "CREATED in `function_or_symbol`, and name the file it belongs in "
-        "as `file_path`. The nearest existing symbol goes in `reasoning` as "
-        "the anchor you are building beside — never in `function_or_symbol`. "
-        'Labelling new work as a "modify" of a neighbouring symbol '
-        "misdirects whoever implements it, and tells them to edit a file "
-        "whose existing contents you did not actually intend to change.\n\n"
-        "A CHANGE THAT CHANGES NOTHING IS NOT A CHANGE. If you examined a "
-        "symbol and concluded it should stay exactly as it is, say that in "
-        "that service's `reasoning`. Do not add it to `changes`: every "
-        "entry there becomes a line in the reader's list of files to edit, "
-        'so a "leave this unchanged" entry sends them to a file they must '
-        "not touch.\n\n"
+        "WHEN A CHANGE ADDS SOMETHING THAT DOES NOT EXIST YET, NAME THE NEW "
+        "THING. Put the name of the symbol to be CREATED in "
+        "`function_or_symbol`, and name the file it belongs in as "
+        "`file_path`. The nearest existing symbol goes in `reasoning` as "
+        "the anchor you are building beside — never in `function_or_symbol`, "
+        "which misdirects whoever implements it onto a symbol you did not "
+        "intend to touch. Say in `change_description` that the symbol is "
+        "new. The `change_type` still follows the file, so a new symbol "
+        'going into a file that already exists is a "modify" — being new is '
+        "a fact about the symbol, not about the file.\n\n"
+        "A CHANGE THAT CHANGES NOTHING IS NOT A CHANGE. Never describe a "
+        'symbol you are leaving alone as a "modify". Every "create", '
+        '"modify" and "delete" entry becomes a line in the reader\'s list '
+        "of files to edit, so one of them saying 'no change is proposed "
+        "here' sends them to a file they must not touch. You have two "
+        "correct places to put it instead. If the symbol matters to the "
+        "design — your new code calls it, reads it, or depends on its "
+        'current behaviour — give it `change_type` "reference", describe '
+        "in `change_description` what the new code relies on it for, and "
+        "state in `implementation_notes` that this file is NOT edited. If "
+        "the symbol merely turned out to be irrelevant, leave it out of "
+        "`changes` entirely and say so in that service's `reasoning`.\n\n"
+        'A "reference" entry still has to be real and still has to earn '
+        "its place. Name a symbol you were actually shown, and include it "
+        "only when a reader implementing the change would otherwise go "
+        'looking for it. Do not pad `changes` with "reference" entries '
+        "for every symbol you happened to read.\n\n"
         "REQUIREMENTS: split `functional_requirements` (what the system must "
         "do after the change) from `non_functional_requirements` (performance, "
         "reliability, security, scalability, observability) — leave either "
@@ -574,6 +594,60 @@ def build_system_prompt(mode: str = "bug") -> str:
         "validation, sensitive data, access control — only what's actually "
         "relevant and supported by the material given, never invented "
         "security mechanisms.\n\n"
+        "TEST WORK IS PART OF THE CHANGE, NOT A TESTING RECOMMENDATION. A "
+        "`testing_plan` scenario describes what must be proved; by itself it "
+        "instructs nobody to write anything. Every scenario marked TO ADD "
+        "must ALSO appear as its own step in `implementation_plan`, placed "
+        "after the production change it covers, naming the production symbol "
+        "being tested, the scenario(s) that step implements, and the test "
+        "file it goes in. A test update required by a production change "
+        "belongs in the plan the same way. A plan that edits production code "
+        "with no step that writes the tests leaves whoever implements it free "
+        "to skip them.\n\n"
+        'A SYMBOL\'S "Tested by" LINE NAMES A TEST THAT ALREADY ASSERTS ITS '
+        "CURRENT BEHAVIOUR. Each symbol in a 'Real code symbols' section says "
+        "either which test file sits beside it or that none does. When your "
+        "change alters what that symbol returns, accepts, rejects, logs, "
+        "renders or otherwise does observably, a test in that file will very "
+        "likely assert the behaviour you are removing. Say so, and propose "
+        "updating it in the same implementation step as the production "
+        "change. Leaving a test that asserts the old behaviour is a failure "
+        "you are introducing, not a problem for someone else. You were given "
+        "the test file's PATH, never its contents, so name the file and the "
+        "behaviour that changed — never quote a test, name a test function, "
+        "or state what it currently asserts.\n\n"
+        "A TEST THAT MUST CHANGE IS A FILE CHANGE, NOT ONLY A PLAN STEP. An "
+        "implementation step describes work; only an entry in `changes` "
+        "names a file for someone to open. So when an existing test file "
+        "sits beside a symbol you are changing and your change alters what "
+        "that symbol does observably, add that TEST FILE to the same "
+        "service's `changes` as its own entry: `file_path` is the test "
+        "file's path exactly as you were given it, `change_type` is "
+        '"modify", `function_or_symbol` is the PRODUCTION symbol whose '
+        "behaviour changed, and `change_description` says which behaviour "
+        "the test must assert instead. You were given that file's PATH and "
+        "never its contents, so do not name a test function or state what "
+        "it currently asserts.\n\n"
+        'For a test file that does not exist yet, add it with "create" '
+        "ONLY when you can name its path from a layout the evidence "
+        "actually shows — a sibling test beside comparable code, or this "
+        "project's visible test folder convention. Otherwise do NOT invent "
+        "a path, and do NOT add a change without one: a change with no "
+        "`file_path` is skipped by whoever implements it, so the test "
+        "silently never gets written. Put the question of where this "
+        "project keeps tests for that code into `open_questions` "
+        "instead.\n\n"
+        "When a symbol says no test file sits beside it, do not conclude it "
+        "is untested: tests may live elsewhere in the project. Treat it as "
+        "unknown, and put the question of where this project keeps tests for "
+        "that code into `open_questions`.\n\n"
+        "For every change, `implementation_notes` states which of these is "
+        "true: new tests are required; an existing test beside the symbol "
+        "asserts the behaviour being changed and must be updated; or test "
+        "coverage cannot be determined from the evidence, in which case name "
+        "what must be inspected in `open_questions`. Understanding the "
+        "production code is not evidence that it is tested, so never claim "
+        "coverage is adequate.\n\n"
         "`testing_plan`: a list of concrete test scenarios, each with a "
         '`category` ("unit", "integration", "api", "regression", or '
         '"edge_case"), a `scenario`, and its `expected_result`. Every '
@@ -601,10 +675,17 @@ def build_system_prompt(mode: str = "bug") -> str:
         "(c) why that step is needed, and (d) which `testing_plan` scenario "
         "validates it. A step that cannot name a verified location is not "
         "an implementation step — it is an open question, and belongs "
-        "there instead. Every file appearing in any change must be "
+        "there instead. The single exception is a step that writes or "
+        "updates tests: test files are not part of the evidence you were "
+        "given, so such a step names the production symbol it covers and "
+        "the test file path it proposes, marked as proposed rather than "
+        "existing — unless a test file was listed beside that symbol, in "
+        "which case name that file. Every file appearing in any change must be "
         "justified by at least one step. Do not pad the plan with generic "
         'steps ("review the code", "deploy") your analysis does not '
-        "support.\n\n"
+        "support. Do NOT number the steps yourself — they are a list and the "
+        'rendering step numbers them, so a step beginning with its own "1." '
+        'is printed as "1. 1.".\n\n'
         "Be as thorough as the documentation actually supports — but if "
         "something isn't described in the docs, say so in `open_questions` "
         "rather than inventing plausible-sounding detail. Thoroughness means "
@@ -655,6 +736,10 @@ def build_system_prompt(mode: str = "bug") -> str:
         "scenario;\n"
         "- `open_questions` and `risks` do not contradict certainty claimed "
         "elsewhere;\n"
+        "- every change has test work in `implementation_plan`, or a reason "
+        "grounded in the evidence that it needs none;\n"
+        "- every symbol whose behaviour changes and that named a test file "
+        "beside it has that file in a step;\n"
         "- nothing claims a test was run.\n\n"
         "Respond with ONLY one JSON object matching this schema, no markdown "
         "fences, no prose outside the JSON:\n" + schema
@@ -665,7 +750,10 @@ _MAX_FILE_CONTEXT_NAMES = 20
 
 
 def _format_code_symbol(
-    symbol: dict, snippet: str | None, file_neighbors: list[str] | None = None
+    symbol: dict,
+    snippet: str | None,
+    file_neighbors: list[str] | None = None,
+    tests_beside: list[str] | None = None,
 ) -> str:
     location = f"{symbol['file_path']}:{symbol['line_start']}-{symbol['line_end']}"
     line = f"- `{location}` `{symbol['qualified_name']}` — `{symbol['signature']}`"
@@ -680,6 +768,14 @@ def _format_code_symbol(
         hidden = len(others) - _MAX_FILE_CONTEXT_NAMES
         more = f" (+{hidden} more)" if hidden > 0 else ""
         line += f"\n  Also defined in this file: {shown}{more}"
+    if tests_beside is not None:
+        # Paths only — enough to tell the model a test exists and must be
+        # updated, without test source competing with the real code.
+        if tests_beside:
+            named = ", ".join(f"`{t}`" for t in tests_beside)
+            line += f"\n  Tested by (existing test file beside it): {named}"
+        else:
+            line += "\n  No test file sits beside this one in its folder."
     if snippet:
         line += f"\n  ```{symbol.get('language') or ''}\n{snippet}\n  ```"
     return line
@@ -693,6 +789,7 @@ def build_user_prompt(
     seed_names: set[str] | None = None,
     known_dependencies: list[dict] | None = None,
     file_context: dict[tuple[str, str], list[str]] | None = None,
+    sibling_tests: dict[tuple[str, str], list[str]] | None = None,
 ) -> str:
     """`known_dependencies`: real CALLS edges among the candidate services,
     read from the graph BEFORE the LLM call — shown here as confirmed
@@ -723,6 +820,7 @@ def build_user_prompt(
     code_symbols_by_service = code_symbols_by_service or {}
     snippets_by_key = snippets_by_key or {}
     file_context = file_context or {}
+    sibling_tests = sibling_tests or {}
 
     sections = [f"## Issue\n{issue_text}\n"]
 
@@ -772,6 +870,7 @@ def build_user_prompt(
                     symbol,
                     snippets_by_key.get((doc["name"], symbol["qualified_name"])),
                     file_context.get((doc["name"], symbol["file_path"])),
+                    sibling_tests.get((doc["name"], symbol["file_path"])),
                 )
                 for symbol in code_symbols
             ]

@@ -834,3 +834,78 @@ def test_an_unknown_mode_falls_back_to_bug():
     """A malformed mode must never produce a prompt with neither block."""
     assert build_system_prompt("refactor") == build_system_prompt("bug")
     assert build_system_prompt("") == build_system_prompt("bug")
+
+
+# ---------- test work as implementation work ----------
+
+
+def test_prompt_requires_a_step_that_writes_the_tests():
+    """Regression test: the implementation plans of four real TDDs listed only
+    production edits. The coding agent worked through the plan, wrote no
+    tests, and CI went red. A scenario in `testing_plan` instructs nobody."""
+    for mode in ("bug", "feature"):
+        prompt = build_system_prompt(mode)
+        assert "TEST WORK IS PART OF THE CHANGE" in prompt
+        assert "must ALSO appear as its own step in `implementation_plan`" in prompt
+
+
+def test_prompt_lets_a_test_step_name_an_unverified_location():
+    """The verified-location rule is what deleted the test step: test files are
+    never in the evidence, so a step that writes one cannot name a location the
+    model saw. Without this exception the new rule and the old one contradict."""
+    prompt = build_system_prompt("bug")
+    assert "The single exception is a step that writes or updates tests" in prompt
+    assert "marked as proposed rather than existing" in prompt
+
+
+def test_prompt_treats_a_sibling_test_file_as_a_contradiction_risk():
+    """Regression test: a TDD told the coding agent to replace ReportForm's
+    console logging. ReportForm/view.test.tsx asserted that logging. One test
+    of 17,737 failed and blocked the merge."""
+    prompt = build_system_prompt("bug")
+    assert '"Tested by" LINE NAMES A TEST THAT ALREADY ASSERTS' in prompt
+    assert "propose updating it in the same implementation step" in prompt
+    assert "never quote a test, name a test function" in prompt
+
+
+def test_prompt_does_not_read_absence_of_a_sibling_test_as_untested():
+    prompt = build_system_prompt("bug")
+    assert "do not conclude it is untested" in prompt
+    assert "tests may live elsewhere in the project" in prompt
+
+
+def test_self_check_covers_test_work():
+    prompt = build_system_prompt("bug")
+    assert "every change has test work in `implementation_plan`" in prompt
+
+
+def test_user_prompt_names_a_test_file_sitting_beside_a_symbol():
+    symbol = {
+        "file_path": "src/apps/client/modules/Reports/components/ReportForm/view.tsx",
+        "line_start": 1, "line_end": 9, "qualified_name": "ReportForm/view.tsx::ReportForm",
+        "name": "ReportForm", "signature": "ReportForm", "docstring": None,
+        "language": "typescript", "matched_identifiers": [],
+    }
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [symbol]}, {},
+        sibling_tests={
+            ("ui", symbol["file_path"]): [
+                "src/apps/client/modules/Reports/components/ReportForm/view.test.tsx"
+            ]
+        },
+    )
+    assert "Tested by (existing test file beside it)" in prompt
+    assert "ReportForm/view.test.tsx" in prompt
+
+
+def test_user_prompt_says_so_when_no_test_sits_beside_a_symbol():
+    symbol = {
+        "file_path": "a/b/view.tsx", "line_start": 1, "line_end": 2,
+        "qualified_name": "a/b/view.tsx::X", "name": "X", "signature": "X",
+        "docstring": None, "language": "typescript", "matched_identifiers": [],
+    }
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [symbol]}, {},
+        sibling_tests={("ui", "a/b/view.tsx"): []},
+    )
+    assert "No test file sits beside this one in its folder." in prompt

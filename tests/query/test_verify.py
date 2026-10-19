@@ -103,8 +103,20 @@ def test_made_up_symbol_in_a_folder_is_flagged_with_related_files(graph):
     assert "elsewhere/x.ts" not in c.verification_note
 
 
-def test_real_file_without_the_symbol_is_flagged(graph):
+def test_a_modify_naming_a_symbol_the_file_lacks_is_new_code(graph):
+    """`change_type` follows the FILE, so new code in an existing file arrives
+    as a "modify" whose symbol isn't there yet. That is the normal way to add
+    code, not a verification failure."""
     c = _check(_change("src/report/ReportDetails.tsx", "addDownloadButton"))
+    assert c.verification == "new"
+    assert "New code in the existing file" in c.verification_note
+    assert c.file_path == "src/report/ReportDetails.tsx"
+
+
+def test_a_delete_of_a_symbol_that_is_not_there_stays_unverified(graph):
+    """Nothing to remove — the "it's new code" reading only makes sense for a
+    modify."""
+    c = _check(_change("src/report/ReportDetails.tsx", "addDownloadButton", change_type="delete"))
     assert c.verification == "unverified"
     assert "may need to be created" in c.verification_note
 
@@ -176,7 +188,60 @@ def test_component_glued_to_its_file_name_is_corrected_to_the_real_symbol(graph)
     assert c.file_path == "src/report/modals/PreAdverseActionModal/view.tsx"
 
 
-def test_dotted_name_with_no_matching_part_stays_unverified(graph):
+def test_dotted_name_with_no_matching_part_is_not_corrected(graph):
+    """No part of the dotted name is a real symbol in that file, so nothing is
+    renamed. The file is real, so adding to it is still "new" code."""
     c = _check(_change("src/report/ReportDetails.tsx", "Nope.alsoNope"))
-    assert c.verification == "unverified"
+    assert c.verification == "new"
     assert c.function_or_symbol == "Nope.alsoNope"
+
+
+def test_a_test_file_change_is_verified_by_path_not_by_symbol(monkeypatch):
+    """A test change names the PRODUCTION symbol it covers, which lives in the
+    production file — so the ordinary symbol lookup would "correct" the test
+    path into the source path and turn "update this test" back into "edit this
+    source file"."""
+    monkeypatch.setattr(
+        verify.graph_reader, "find_symbol_files", lambda s, sym: ["src/ReportForm/view.tsx"]
+    )
+    monkeypatch.setattr(
+        verify.graph_reader, "file_exists", lambda s, p: p == "src/ReportForm/view.test.tsx"
+    )
+    change = _change("src/ReportForm/view.test.tsx", "ReportForm")
+    verify.verify_change("ui", change, set())
+    assert change.file_path == "src/ReportForm/view.test.tsx"
+    assert change.verification == "verified"
+
+
+def test_a_new_test_file_beside_an_existing_folder_is_new_not_unverified(monkeypatch):
+    monkeypatch.setattr(verify.graph_reader, "find_symbol_files", lambda s, sym: [])
+    monkeypatch.setattr(verify.graph_reader, "file_exists", lambda s, p: False)
+    monkeypatch.setattr(verify.graph_reader, "folder_exists", lambda s, p: p == "src/ReportForm")
+    change = _change("src/ReportForm/view.test.tsx", "ReportForm", change_type="create")
+    verify.verify_change("ui", change, set())
+    assert change.verification == "new"
+    assert change.file_path == "src/ReportForm/view.test.tsx"
+
+
+def test_a_create_on_a_file_that_already_exists_becomes_a_modify(monkeypatch):
+    """The failure this exists to stop: a consumer acting on "create" does not
+    read the file first, so it replaces the file's contents with only the new
+    code. `change_type` describes the FILE, so this is a modify."""
+    monkeypatch.setattr(
+        verify.graph_reader, "file_exists", lambda s, p: p == "src/schema/compliance.graphqls"
+    )
+    change = _change("src/schema/compliance.graphqls", "BulkPrintTypes", change_type="create")
+    verify.verify_change("reports-api", change, set())
+    assert change.change_type == "modify"
+    assert change.verification == "new"
+    assert "New code in the existing file" in change.verification_note
+
+
+def test_a_create_of_a_genuinely_new_file_stays_a_create(monkeypatch):
+    monkeypatch.setattr(verify.graph_reader, "file_exists", lambda s, p: False)
+    monkeypatch.setattr(verify.graph_reader, "folder_exists", lambda s, p: p == "src/service")
+    change = _change("src/service/BulkPrint.kt", "BulkPrint", change_type="create")
+    verify.verify_change("reports-api", change, set())
+    assert change.change_type == "create"
+    assert change.verification == "new"
+    assert "New file in the existing folder" in change.verification_note

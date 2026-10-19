@@ -282,3 +282,15 @@ def test_load_symbols_and_file_context_skip_the_query_for_nothing(monkeypatch):
 def test_load_file_context_returns_sorted_unique_names(monkeypatch):
     _patch_driver(monkeypatch, [{"service": "ui", "file_path": "a.ts", "names": ["g", "f", "Form.f", "f"]}])
     assert graph_reader.load_file_context([("ui", "a.ts")]) == {("ui", "a.ts"): ["Form.f", "f", "g"]}
+
+
+def test_load_sibling_tests_skips_pairs_with_no_folder_or_already_a_test(monkeypatch):
+    """Guards the pre-query filter: a bare filename has no folder to look in,
+    and a test file's own folder is not a lookup worth making."""
+    called = []
+    monkeypatch.setattr(
+        graph_reader, "get_driver", lambda: (_ for _ in ()).throw(AssertionError("queried"))
+    )
+    assert graph_reader.load_sibling_tests([("ui", "view.tsx")]) == {}
+    assert graph_reader.load_sibling_tests([("ui", "a/b/view.test.tsx")]) == {}
+    assert called == []

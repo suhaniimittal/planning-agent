@@ -261,16 +261,18 @@ async def build_tdd(
             )
     _widen_to_small_classes(parent_of, code_symbols_by_service, snippet_map)
 
-    file_context = graph_reader.load_file_context(
-        sorted(
-            {
-                (service, symbol["file_path"])
-                for service, symbols_ in code_symbols_by_service.items()
-                for symbol in symbols_
-                if symbol.get("file_path")
-            }
-        )
+    shown_files = sorted(
+        {
+            (service, symbol["file_path"])
+            for service, symbols_ in code_symbols_by_service.items()
+            for symbol in symbols_
+            if symbol.get("file_path")
+        }
     )
+    file_context = graph_reader.load_file_context(shown_files)
+    # Paths only, looked up AFTER the files are chosen — test code still never
+    # competes in the search (see graph_reader.load_sibling_tests).
+    sibling_tests = graph_reader.load_sibling_tests(shown_files)
 
     system_prompt = planner.build_system_prompt(mode)
     user_prompt = planner.build_user_prompt(
@@ -281,6 +283,7 @@ async def build_tdd(
         seed_names=set(selected),
         known_dependencies=known_dependencies,
         file_context=file_context,
+        sibling_tests=sibling_tests,
     )
 
     if debug_dump_prompts:

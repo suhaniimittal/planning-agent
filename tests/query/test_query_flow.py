@@ -46,6 +46,7 @@ class FakeGraph:
         self.neighbors = []
         self.edges = []
         self.file_context = {}
+        self.sibling_tests = {}
         self.calls = []
         self.prompt = {}
         self.tdd = FakeTdd()
@@ -83,6 +84,10 @@ def graph(monkeypatch):
         g.calls.append(("load_symbols", list(pairs)))
         return [g.symbols[p] for p in pairs if p in g.symbols]
 
+    def load_sibling_tests(pairs):
+        g.calls.append(("load_sibling_tests", list(pairs)))
+        return g.sibling_tests
+
     def load_file_context(pairs):
         g.calls.append(("load_file_context", list(pairs)))
         return {p: g.file_context.get(p, []) for p in pairs}
@@ -108,6 +113,7 @@ def graph(monkeypatch):
         "get_edges_among": get_edges_among,
         "load_symbols": load_symbols,
         "load_file_context": load_file_context,
+        "load_sibling_tests": load_sibling_tests,
     }.items():
         monkeypatch.setattr(query_flow.graph_reader, name, fn)
     monkeypatch.setattr(query_flow.planner, "build_system_prompt", lambda mode=None: "system")

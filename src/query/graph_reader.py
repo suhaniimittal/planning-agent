@@ -7,7 +7,7 @@ kept separate since the two paths have different callers and failure modes
 from __future__ import annotations
 
 from src.ingestion.graph_writer import get_driver
-from src.ingestion.test_paths import CYPHER_TEST_PATH_RE
+from src.ingestion.test_paths import CYPHER_TEST_PATH_RE, is_test_path
 
 
 def vector_search_services(embedding: list[float], k: int = 5) -> list[dict]:
@@ -124,7 +124,9 @@ def load_code_symbols_for_services(names: list[str]) -> list[dict]:
         return [dict(r) for r in result]
 
 
-def vector_search_chunks(embedding: list[float], service_names: list[str], k: int = 50) -> list[dict]:
+def vector_search_chunks(
+    embedding: list[float], service_names: list[str], k: int = 50
+) -> list[dict]:
     """Top-k Chunk nodes by cosine similarity to `embedding`, rolled up to
     the Function each one belongs to, restricted to `service_names`.
 
@@ -366,3 +368,62 @@ def load_file_context(
             rows=rows,
         )
         return {(r["service"], r["file_path"]): sorted(set(r["names"])) for r in result}
+
+
+def load_sibling_tests(
+    service_file_pairs: list[tuple[str, str]],
+) -> dict[tuple[str, str], list[str]]:
+    """{(service, file_path): [test file paths in the SAME folder]}.
+
+    Test code is deliberately absent from search_service_chunks — test
+    functions echo an issue's wording closely enough to crowd real code out
+    of the results (ui alone holds 1,097 test files; reports-api holds more
+    test chunks than real ones). This does not relax that: it runs AFTER the
+    files to change have been chosen, and only looks beside them.
+
+    The planner otherwise proposes behaviour changes with no idea that a
+    test asserts the current behaviour — observed for real, when a TDD said
+    to replace ReportForm's console logging and the existing
+    ReportForm/view.test.tsx failed on the next CI run.
+
+    Only the paths are returned, never the test source: naming the file a
+    coding agent must update is the actionable part, and the body would
+    reintroduce exactly the crowding this avoids.
+    """
+    by_folder: dict[tuple[str, str], list[str]] = {}
+    for service, path in service_file_pairs:
+        if "/" not in path or is_test_path(path):
+            continue
+        by_folder.setdefault((service, path.rsplit("/", 1)[0]), []).append(path)
+    if not by_folder:
+        return {}
+
+    lookups = [{"service": s, "folder": f} for s, f in by_folder]
+    with get_driver().session() as session:
+        rows = session.run(
+            """
+            UNWIND $lookups AS lookup
+            MATCH (f:File {service: lookup.service})
+            WHERE f.file_path STARTS WITH lookup.folder + '/'
+              AND NOT f.file_path CONTAINS lookup.folder + '//'
+              AND f.file_path =~ $test_re
+            RETURN lookup.service AS service, lookup.folder AS folder,
+                   f.file_path AS file_path
+            """,
+            lookups=lookups,
+            test_re=CYPHER_TEST_PATH_RE,
+        )
+        found: dict[tuple[str, str], list[str]] = {}
+        for row in rows:
+            folder = row["folder"]
+            rest = row["file_path"][len(folder) + 1 :]
+            if "/" in rest:  # a deeper folder, not a sibling
+                continue
+            found.setdefault((row["service"], folder), []).append(row["file_path"])
+
+    siblings: dict[tuple[str, str], list[str]] = {}
+    for (service, folder), paths in by_folder.items():
+        tests = sorted(found.get((service, folder), []))
+        for path in paths:
+            siblings[(service, path)] = [t for t in tests if t != path]
+    return siblings
