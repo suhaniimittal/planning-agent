@@ -294,3 +294,18 @@ def test_load_sibling_tests_skips_pairs_with_no_folder_or_already_a_test(monkeyp
     assert graph_reader.load_sibling_tests([("ui", "view.tsx")]) == {}
     assert graph_reader.load_sibling_tests([("ui", "a/b/view.test.tsx")]) == {}
     assert called == []
+
+
+def test_new_test_path_puts_the_convention_infix_before_the_extension():
+    assert (
+        graph_reader.new_test_path("a/b/employmentVerificationForm.ts", ".test.")
+        == "a/b/employmentVerificationForm.test.ts"
+    )
+    assert graph_reader.new_test_path("view.tsx", ".spec.") == "view.spec.tsx"
+
+
+def test_new_test_path_is_none_for_a_file_with_no_extension():
+    """Nothing to put the infix in front of — better no suggestion than a
+    path the planner would then present as measured."""
+    assert graph_reader.new_test_path("a/Makefile", ".test.") is None
+    assert graph_reader.new_test_path("a/.gitignore", ".test.") is None

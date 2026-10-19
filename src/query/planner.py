@@ -628,15 +628,20 @@ def build_system_prompt(mode: str = "bug") -> str:
         "the test must assert instead. You were given that file's PATH and "
         "never its contents, so do not name a test function or state what "
         "it currently asserts.\n\n"
-        'For a test file that does not exist yet, add it with "create" '
-        "ONLY when you can name its path from a layout the evidence "
-        "actually shows — a sibling test beside comparable code, or this "
-        "project's visible test folder convention. Otherwise do NOT invent "
-        "a path, and do NOT add a change without one: a change with no "
-        "`file_path` is skipped by whoever implements it, so the test "
-        "silently never gets written. Put the question of where this "
-        "project keeps tests for that code into `open_questions` "
-        "instead.\n\n"
+        "WHEN A SYMBOL NAMES WHERE A NEW TEST BELONGS, WRITE THE TEST "
+        "THERE. A symbol with no test beside it may still say where one "
+        'would go ("a new test for it belongs at ...") — that path was '
+        "measured from this service's own layout, not guessed, so use it "
+        "exactly as given: add a change with that `file_path` and "
+        '`change_type` "create", with `function_or_symbol` naming the '
+        "production symbol the test covers. Every scenario you marked TO "
+        "ADD for that symbol must be covered by one of these changes.\n\n"
+        "Only when no path is given anywhere do you leave the test out: "
+        "do NOT invent a path, and do NOT add a change without one — a "
+        "change with no `file_path` is skipped by whoever implements it, "
+        "so the test silently never gets written. Put the question of "
+        "where this project keeps tests for that code into "
+        "`open_questions` instead.\n\n"
         "When a symbol says no test file sits beside it, do not conclude it "
         "is untested: tests may live elsewhere in the project. Treat it as "
         "unknown, and put the question of where this project keeps tests for "
@@ -754,6 +759,7 @@ def _format_code_symbol(
     snippet: str | None,
     file_neighbors: list[str] | None = None,
     tests_beside: list[str] | None = None,
+    new_test_path: str | None = None,
 ) -> str:
     location = f"{symbol['file_path']}:{symbol['line_start']}-{symbol['line_end']}"
     line = f"- `{location}` `{symbol['qualified_name']}` — `{symbol['signature']}`"
@@ -774,6 +780,15 @@ def _format_code_symbol(
         if tests_beside:
             named = ", ".join(f"`{t}`" for t in tests_beside)
             line += f"\n  Tested by (existing test file beside it): {named}"
+        elif new_test_path:
+            # Where a NEW test belongs, measured from this service's own
+            # habit (graph_reader.test_naming_conventions) — without it the
+            # model is left with nowhere to put the test and can only ask
+            # the question, which leaves the test unwritten.
+            line += (
+                "\n  No test file sits beside this one. Tests in this service sit "
+                f"beside the code they cover, so a new test for it belongs at `{new_test_path}`."
+            )
         else:
             line += "\n  No test file sits beside this one in its folder."
     if snippet:
@@ -790,6 +805,7 @@ def build_user_prompt(
     known_dependencies: list[dict] | None = None,
     file_context: dict[tuple[str, str], list[str]] | None = None,
     sibling_tests: dict[tuple[str, str], list[str]] | None = None,
+    new_test_paths: dict[tuple[str, str], str] | None = None,
 ) -> str:
     """`known_dependencies`: real CALLS edges among the candidate services,
     read from the graph BEFORE the LLM call — shown here as confirmed
@@ -821,6 +837,7 @@ def build_user_prompt(
     snippets_by_key = snippets_by_key or {}
     file_context = file_context or {}
     sibling_tests = sibling_tests or {}
+    new_test_paths = new_test_paths or {}
 
     sections = [f"## Issue\n{issue_text}\n"]
 
@@ -871,6 +888,7 @@ def build_user_prompt(
                     snippets_by_key.get((doc["name"], symbol["qualified_name"])),
                     file_context.get((doc["name"], symbol["file_path"])),
                     sibling_tests.get((doc["name"], symbol["file_path"])),
+                    new_test_paths.get((doc["name"], symbol["file_path"])),
                 )
                 for symbol in code_symbols
             ]

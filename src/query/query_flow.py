@@ -273,6 +273,19 @@ async def build_tdd(
     # Paths only, looked up AFTER the files are chosen — test code still never
     # competes in the search (see graph_reader.load_sibling_tests).
     sibling_tests = graph_reader.load_sibling_tests(shown_files)
+    # Where a NEW test would go, for the shown files that have none beside
+    # them. Only for services whose tests demonstrably sit beside their
+    # code — a service with a mirrored test tree gets nothing here rather
+    # than a path nobody measured, and the planner asks instead.
+    conventions = graph_reader.test_naming_conventions(selected)
+    new_test_paths = {}
+    for service, file_path in shown_files:
+        infix = conventions.get(service)
+        if not infix or sibling_tests.get((service, file_path)):
+            continue
+        suggested = graph_reader.new_test_path(file_path, infix)
+        if suggested:
+            new_test_paths[(service, file_path)] = suggested
 
     system_prompt = planner.build_system_prompt(mode)
     user_prompt = planner.build_user_prompt(
@@ -284,6 +297,7 @@ async def build_tdd(
         known_dependencies=known_dependencies,
         file_context=file_context,
         sibling_tests=sibling_tests,
+        new_test_paths=new_test_paths,
     )
 
     if debug_dump_prompts:

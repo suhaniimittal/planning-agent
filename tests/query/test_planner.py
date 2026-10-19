@@ -909,3 +909,49 @@ def test_user_prompt_says_so_when_no_test_sits_beside_a_symbol():
         sibling_tests={("ui", "a/b/view.tsx"): []},
     )
     assert "No test file sits beside this one in its folder." in prompt
+
+
+def _ui_symbol(file_path: str) -> dict:
+    return {
+        "file_path": file_path, "line_start": 1, "line_end": 9,
+        "qualified_name": f"{file_path}::X", "name": "X", "signature": "X",
+        "docstring": None, "language": "typescript", "matched_identifiers": [],
+    }
+
+
+def test_a_symbol_with_no_sibling_test_is_told_where_a_new_one_belongs():
+    """Without a path the model can only ask where tests live, and the test
+    never gets written — a coding agent acts on file changes, not questions."""
+    path = "src/forms/employmentVerificationForm.ts"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        sibling_tests={("ui", path): []},
+        new_test_paths={("ui", path): "src/forms/employmentVerificationForm.test.ts"},
+    )
+    assert "No test file sits beside this one." in prompt
+    assert "belongs at `src/forms/employmentVerificationForm.test.ts`" in prompt
+
+
+def test_an_existing_sibling_test_wins_over_a_suggested_path():
+    path = "src/forms/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        sibling_tests={("ui", path): ["src/forms/view.test.tsx"]},
+        new_test_paths={("ui", path): "src/forms/view.test.tsx"},
+    )
+    assert "Tested by (existing test file beside it): `src/forms/view.test.tsx`" in prompt
+    assert "belongs at" not in prompt
+
+
+def test_a_service_with_no_measured_convention_still_just_says_there_is_no_test():
+    """A mirrored test tree (src/test/kotlin) yields no convention, and the
+    model is asked where tests live rather than handed a made-up path."""
+    path = "src/main/kotlin/Foo.kt"
+    prompt = build_user_prompt(
+        "issue", [{"name": "reports-api", "summary": "s"}],
+        {"reports-api": [_ui_symbol(path)]}, {},
+        sibling_tests={("reports-api", path): []},
+        new_test_paths={},
+    )
+    assert "No test file sits beside this one in its folder." in prompt
+    assert "belongs at" not in prompt

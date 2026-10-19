@@ -370,6 +370,72 @@ def load_file_context(
         return {(r["service"], r["file_path"]): sorted(set(r["names"])) for r in result}
 
 
+# A sibling-test convention counts only when it is clearly the project's
+# habit, not an accident of a few files — below these the service is left
+# with no convention and the planner asks where tests live instead.
+_CONVENTION_MIN_FILES = 5
+_CONVENTION_MIN_SHARE = 0.3
+_SIBLING_TEST_INFIXES = (".test.", ".spec.")
+
+
+def test_naming_conventions(services: list[str]) -> dict[str, str]:
+    """{service: ".test." | ".spec."} for services whose tests demonstrably
+    sit BESIDE the code they cover, named for it.
+
+    Measured, never assumed: a test file counts only when removing the infix
+    from its own path names a real non-test file in the same folder. That is
+    what makes a derived path ("employmentVerificationForm.test.ts" beside
+    "employmentVerificationForm.ts") evidence rather than a guess — the
+    planner is forbidden from inventing test paths, and without this it can
+    only put "where do tests for this live?" into open_questions, which
+    leaves the test unwritten.
+
+    Services whose tests live in a mirrored tree instead (src/test/kotlin
+    beside src/main/kotlin) are deliberately absent: no infix pairs there,
+    so nothing is claimed about them.
+    """
+    if not services:
+        return {}
+    with get_driver().session() as session:
+        rows = session.run(
+            """
+            UNWIND $services AS service
+            MATCH (t:File {service: service})
+            WHERE t.file_path =~ $test_re
+            WITH service, t, count(t) AS _
+            WITH service, collect(t.file_path) AS test_paths
+            UNWIND $infixes AS infix
+            UNWIND test_paths AS test_path
+            WITH service, infix, test_paths, test_path
+            WHERE test_path CONTAINS infix
+            OPTIONAL MATCH (s:File {service: service, file_path: replace(test_path, infix, '.')})
+            RETURN service, infix, size(test_paths) AS total,
+                   count(s) AS paired
+            """,
+            services=list(services),
+            test_re=CYPHER_TEST_PATH_RE,
+            infixes=list(_SIBLING_TEST_INFIXES),
+        )
+        best: dict[str, tuple[int, str]] = {}
+        for row in rows:
+            paired, total = row["paired"], row["total"]
+            if paired < _CONVENTION_MIN_FILES or paired < total * _CONVENTION_MIN_SHARE:
+                continue
+            if paired > best.get(row["service"], (0, ""))[0]:
+                best[row["service"]] = (paired, row["infix"])
+    return {service: infix for service, (_, infix) in best.items()}
+
+
+def new_test_path(file_path: str, infix: str) -> str | None:
+    """Where a new test for `file_path` belongs under `infix`, or None for a
+    path with no extension to put the infix in front of."""
+    folder, _, name = file_path.rpartition("/")
+    stem, dot, ext = name.rpartition(".")
+    if not dot or not stem:
+        return None
+    return f"{folder}/{stem}{infix}{ext}" if folder else f"{stem}{infix}{ext}"
+
+
 def load_sibling_tests(
     service_file_pairs: list[tuple[str, str]],
 ) -> dict[tuple[str, str], list[str]]:
