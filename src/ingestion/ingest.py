@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Callable
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from . import code_graph_writer, github_api, graph_writer
 from .code_parser import (
@@ -41,6 +41,7 @@ from .repo_fetcher import (
     cloned_repo,
     local_folder_fingerprint,
     local_repo_root,
+    service_list_fingerprint,
 )
 from .summarizer import SummarizerError, build_digest, generate_summaries
 from .test_paths import is_test_path
@@ -197,7 +198,9 @@ async def _embed_chunks(
                 for fn, chunk in batch:
                     try:
                         vector = await embed(chunk.text)
-                    except Exception as e:  # noqa: BLE001 - one bad embed call must never abort the run
+                    except (
+                        Exception
+                    ) as e:  # noqa: BLE001 - one bad embed call must never abort the run
                         print(
                             f"    [CHUNK-EMBED SKIP] {service_name}: "
                             f"{fn.qualified_name}::chunk{chunk.index}: {e}"
@@ -269,8 +272,8 @@ async def _ingest_full(
     ingested (next run retries a full ingest, not a silent permanent skip).
     """
     try:
-        graph, references_by_file, commit_sha, blob_shas = (
-            await asyncio.to_thread(_clone_and_parse_full, spec, github_token, known_service_names)
+        graph, references_by_file, commit_sha, blob_shas = await asyncio.to_thread(
+            _clone_and_parse_full, spec, github_token, known_service_names
         )
     except RepoFetchError as e:
         print(f"  [SKIP] {spec.name}: {e}")
@@ -314,9 +317,13 @@ async def _ingest_full(
     code_graph_writer.upsert_functions(spec.name, [_function_row(f) for f in graph.functions])
 
     class_pairs = [(c.file_path, c.qualified_name) for c in graph.classes]
-    top_level_fn_pairs = [(f.file_path, f.qualified_name) for f in graph.functions if not f.is_method]
+    top_level_fn_pairs = [
+        (f.file_path, f.qualified_name) for f in graph.functions if not f.is_method
+    ]
     method_pairs = [
-        (f.parent_class, f.qualified_name) for f in graph.functions if f.is_method and f.parent_class
+        (f.parent_class, f.qualified_name)
+        for f in graph.functions
+        if f.is_method and f.parent_class
     ]
 
     code_graph_writer.create_has_file_edges(spec.name, file_paths)
@@ -400,9 +407,16 @@ async def _ingest_incremental(
             print(f"  [INCREMENTAL] {spec.name}: removed {path}")
             continue
 
-        if status == "renamed" and previous_path and sha and sha == existing_blob_shas.get(previous_path):
+        if (
+            status == "renamed"
+            and previous_path
+            and sha
+            and sha == existing_blob_shas.get(previous_path)
+        ):
             code_graph_writer.rename_file(spec.name, previous_path, path)
-            print(f"  [INCREMENTAL] {spec.name}: renamed {previous_path} -> {path} (content unchanged)")
+            print(
+                f"  [INCREMENTAL] {spec.name}: renamed {previous_path} -> {path} (content unchanged)"
+            )
             continue
 
         if sha and sha == existing_blob_shas.get(path):
@@ -502,6 +516,37 @@ async def _ingest_incremental(
         print(f"  [DEPENDENCIES] {spec.name} -> {sorted(targets)}")
 
 
+async def _rescan_dependencies_only(
+    spec: ServiceSpec, root: Path, known_service_names: set[str]
+) -> None:
+    """Recompute this service's CALLS edges and nothing else.
+
+    Runs when the folder is untouched but the service LIST changed — adding
+    a service means every file must be re-checked for references to the new
+    name, while not one line of this service's own code has moved. The
+    expensive half of ingestion (parse, chunk, embed) is therefore skipped
+    entirely: this is a text scan, no model calls, no cost.
+
+    Reuses the same per-file storage the incremental GitHub path uses — each
+    File node carries its own `references`, and the service's edges are the
+    union of them, recomputed from the graph rather than from a second scan.
+    """
+    references_by_file = await asyncio.to_thread(
+        find_service_references, root, spec.name, known_service_names
+    )
+    existing = await asyncio.to_thread(code_graph_writer.load_file_blob_shas, spec.name)
+    rows = [
+        {"file_path": path, "references": sorted(references_by_file.get(path, ()))}
+        for path in existing
+    ]
+    if rows:
+        await asyncio.to_thread(code_graph_writer.upsert_files, spec.name, rows)
+    targets = await asyncio.to_thread(code_graph_writer.get_aggregated_file_references, spec.name)
+    await asyncio.to_thread(graph_writer.set_service_dependencies, spec.name, sorted(targets))
+    if targets:
+        print(f"  [DEPENDENCIES] {spec.name} -> {sorted(targets)}")
+
+
 async def sync_service(
     spec: ServiceSpec, github_token: str | None, known_service_names: set[str]
 ) -> RepoGraph | None:
@@ -528,12 +573,27 @@ async def sync_service(
     if local_root is not None:
         # Taken BEFORE ingesting: a file edited mid-ingest leaves the stored
         # fingerprint stale, so the next run re-ingests rather than skips.
-        fingerprint = await asyncio.to_thread(
-            local_folder_fingerprint, local_root, known_service_names
-        )
+        fingerprint = await asyncio.to_thread(local_folder_fingerprint, local_root)
+        services_fp = service_list_fingerprint(known_service_names)
         state = graph_writer.load_service_state(spec.name)
         if state and state.get("local_fingerprint") == fingerprint:
-            print(f"  [UP TO DATE] {spec.name}: local folder unchanged since last ingest")
+            # The code is untouched. The only thing that can still be stale
+            # is this service's dependency links, and only if the set of
+            # service names changed since they were computed.
+            if state.get("services_fingerprint") == services_fp:
+                print(f"  [UP TO DATE] {spec.name}: local folder unchanged since last ingest")
+                return None
+            print(
+                f"  [DEPENDENCIES ONLY] {spec.name}: code unchanged, "
+                "service list changed — rescanning references"
+            )
+            await _rescan_dependencies_only(spec, local_root, known_service_names)
+            graph_writer.set_service_commit(
+                spec.name,
+                None,
+                local_fingerprint=fingerprint,
+                services_fingerprint=services_fp,
+            )
             return None
         print(f"  [LOCAL] {spec.name}: reading code from {local_root}")
         graph, commit_sha = await _ingest_full(spec, github_token, known_service_names)
@@ -541,7 +601,12 @@ async def sync_service(
             # Clear any stored GitHub commit: the graph now holds local code,
             # so the next GitHub-mode run must re-ingest fully, not report
             # "up to date" against a commit it no longer reflects.
-            graph_writer.set_service_commit(spec.name, None, local_fingerprint=fingerprint)
+            graph_writer.set_service_commit(
+                spec.name,
+                None,
+                local_fingerprint=fingerprint,
+                services_fingerprint=services_fp,
+            )
         return graph
 
     try:
@@ -564,7 +629,9 @@ async def sync_service(
             graph_writer.set_service_commit(spec.name, commit_sha)
         return graph
 
-    await _ingest_incremental(spec, github_token, known_service_names, state["commit_sha"], head_sha)
+    await _ingest_incremental(
+        spec, github_token, known_service_names, state["commit_sha"], head_sha
+    )
     graph_writer.set_service_commit(spec.name, head_sha)
     return None
 

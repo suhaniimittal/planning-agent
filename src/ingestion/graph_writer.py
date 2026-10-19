@@ -82,7 +82,8 @@ def load_service_state(name: str) -> dict | None:
         result = session.run(
             """
             MATCH (s:Service {name: $name})
-            RETURN s.commit_sha AS commit_sha, s.local_fingerprint AS local_fingerprint
+            RETURN s.commit_sha AS commit_sha, s.local_fingerprint AS local_fingerprint,
+                   s.services_fingerprint AS services_fingerprint
             """,
             name=name,
         )
@@ -92,11 +93,15 @@ def load_service_state(name: str) -> dict | None:
         return {
             "commit_sha": record["commit_sha"],
             "local_fingerprint": record["local_fingerprint"],
+            "services_fingerprint": record["services_fingerprint"],
         }
 
 
 def set_service_commit(
-    name: str, commit_sha: str | None, local_fingerprint: str | None = None
+    name: str,
+    commit_sha: str | None,
+    local_fingerprint: str | None = None,
+    services_fingerprint: str | None = None,
 ) -> None:
     """Records which commit `name` is currently ingested at — the anchor
     the git-diff incremental sync compares against next run. None clears
@@ -105,7 +110,13 @@ def set_service_commit(
     `local_fingerprint` is set only after a local-mode ingest (see
     repo_fetcher.local_folder_fingerprint); every other write clears it, so
     a graph rebuilt from GitHub is never mistaken for an unchanged local
-    folder."""
+    folder.
+
+    `services_fingerprint` records WHICH services existed when this
+    service's dependency links were last computed. It moves when a
+    service is added or removed, and nothing else does — which is what
+    lets ingest.py re-run the cheap edge scan on its own instead of
+    re-ingesting a service whose own code never changed."""
     from datetime import UTC, datetime
 
     with get_driver().session() as session:
@@ -113,12 +124,14 @@ def set_service_commit(
             """
             MATCH (s:Service {name: $name})
             SET s.commit_sha = $commit_sha, s.last_ingested_at = $last_ingested_at,
-                s.local_fingerprint = $local_fingerprint
+                s.local_fingerprint = $local_fingerprint,
+                s.services_fingerprint = $services_fingerprint
             """,
             name=name,
             commit_sha=commit_sha,
             last_ingested_at=datetime.now(UTC).isoformat(),
             local_fingerprint=local_fingerprint,
+            services_fingerprint=services_fingerprint,
         )
 
 

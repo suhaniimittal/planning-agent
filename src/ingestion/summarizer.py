@@ -28,7 +28,21 @@ from collections import Counter
 from pathlib import PurePosixPath
 
 _GATEWAY_PROVIDER, _GATEWAY_MODEL = "anthropic", "claude-sonnet-4-6"
-_OPENAI_MODEL = "gpt-4o"
+# gpt-5.4, matching planner.py. These summaries are the FIRST gate in the
+# query flow — a service whose summary does not match a ticket's wording is
+# dropped before its code is ever searched — so they are worth the same model
+# and the same determinism settings as the TDD call itself.
+_OPENAI_MODEL = "gpt-5.4"
+# 0, not the API default of 1.0: a summary is written once and then frozen,
+# but a service whose code changes gets re-summarized, and reworded text
+# moves its embedding — which silently reshuffles which services a ticket
+# considers at all. Same reasoning as planner.py.
+_TEMPERATURE = 0
+_SEED = 7
+# A thinking model spends part of this budget before writing anything, so it
+# has to cover both the reasoning and ~3 sentences per service. The old 8000
+# was an output-only ceiling for gpt-4o.
+_OPENAI_MAX_COMPLETION_TOKENS = 16000
 
 _MAX_CLASSES_PER_SERVICE = 15
 _MAX_TOP_LEVEL_FUNCTIONS_PER_SERVICE = 20
@@ -57,8 +71,11 @@ def _dominant_language(classes: list[dict], functions: list[dict]) -> str | None
     counts = Counter(s["language"] for s in (*classes, *functions))
     return counts.most_common(1)[0][0] if counts else None
 
+
 # file that starts or expose a service
-def _find_entry_points(classes: list[dict], functions: list[dict], language: str | None) -> list[str]:
+def _find_entry_points(
+    classes: list[dict], functions: list[dict], language: str | None
+) -> list[str]:
     if language is None:
         return []
     file_paths = {s["file_path"] for s in (*classes, *functions)}
@@ -73,16 +90,22 @@ def _find_entry_points(classes: list[dict], functions: list[dict], language: str
             found.append(path)
     return found
 
-# calculates method counts 
-def _top_classes(classes: list[dict], functions: list[dict], limit: int = _MAX_CLASSES_PER_SERVICE) -> list[dict]:
+
+# calculates method counts
+def _top_classes(
+    classes: list[dict], functions: list[dict], limit: int = _MAX_CLASSES_PER_SERVICE
+) -> list[dict]:
     method_counts = Counter(
         f["parent_class"] for f in functions if f.get("is_method") and f.get("parent_class")
     )
     ranked = sorted(classes, key=lambda c: method_counts.get(c["qualified_name"], 0), reverse=True)
     return [{"name": c["name"], "docstring": c.get("docstring")} for c in ranked[:limit]]
 
-# selects 
-def _top_level_functions(functions: list[dict], limit: int = _MAX_TOP_LEVEL_FUNCTIONS_PER_SERVICE) -> list[str]:
+
+# selects
+def _top_level_functions(
+    functions: list[dict], limit: int = _MAX_TOP_LEVEL_FUNCTIONS_PER_SERVICE
+) -> list[str]:
     return [f["name"] for f in functions if not f.get("is_method")][:limit]
 
 
@@ -162,7 +185,9 @@ async def _call_via_openai(system_prompt: str, user_prompt: str) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        max_tokens=8000,
+        max_completion_tokens=_OPENAI_MAX_COMPLETION_TOKENS,
+        temperature=_TEMPERATURE,
+        seed=_SEED,
     )
     return resp.choices[0].message.content
 

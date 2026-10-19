@@ -113,11 +113,18 @@ def test_create_vector_index_passes_dimensions(monkeypatch):
 
 
 def test_load_service_state_returns_commit_sha_when_node_exists(monkeypatch):
-    _patch_driver(monkeypatch, [{"commit_sha": "abc123", "local_fingerprint": "fp1"}])
+    _patch_driver(
+        monkeypatch,
+        [{"commit_sha": "abc123", "local_fingerprint": "fp1", "services_fingerprint": "sf1"}],
+    )
 
     state = graph_writer.load_service_state("orders")
 
-    assert state == {"commit_sha": "abc123", "local_fingerprint": "fp1"}
+    assert state == {
+        "commit_sha": "abc123",
+        "local_fingerprint": "fp1",
+        "services_fingerprint": "sf1",
+    }
 
 
 def test_load_service_state_returns_none_when_service_never_ingested(monkeypatch):
@@ -127,11 +134,14 @@ def test_load_service_state_returns_none_when_service_never_ingested(monkeypatch
 
 
 def test_load_service_state_handles_node_with_no_commit_sha_yet(monkeypatch):
-    _patch_driver(monkeypatch, [{"commit_sha": None, "local_fingerprint": None}])
+    _patch_driver(
+        monkeypatch, [{"commit_sha": None, "local_fingerprint": None, "services_fingerprint": None}]
+    )
 
     assert graph_writer.load_service_state("orders") == {
         "commit_sha": None,
         "local_fingerprint": None,
+        "services_fingerprint": None,
     }
 
 
