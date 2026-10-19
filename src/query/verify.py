@@ -99,6 +99,17 @@ def _verify_existing(
     is nothing to remove."""
     found_in = graph_reader.find_symbol_files(service, symbol) if symbol else []
 
+    # A production change never means the test copy of a same-named symbol
+    # (a Cypress page object, a fixture builder). A genuine test change was
+    # already routed to _verify_test_file by its own path, so everything
+    # reaching here wants the real file — and dropping the test copies is
+    # what turns "exists in 2 files, which one is unclear" into the one
+    # answer, instead of an UNVERIFIED change nobody may act on.
+    if len(found_in) > 1:
+        non_test = [f for f in found_in if not is_test_path(f)]
+        if non_test:
+            found_in = non_test
+
     if path is not None and path in found_in:
         return _Result("verified", f"`{symbol}` found in `{path}`.", path)
 

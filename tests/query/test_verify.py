@@ -245,3 +245,31 @@ def test_a_create_of_a_genuinely_new_file_stays_a_create(monkeypatch):
     assert change.change_type == "create"
     assert change.verification == "new"
     assert "New file in the existing folder" in change.verification_note
+
+
+def test_a_same_named_test_helper_does_not_make_a_symbol_ambiguous(monkeypatch):
+    """`SummaryInformation` is both a React component and a Cypress page
+    object. Counting both left the change UNVERIFIED with no file, which a
+    coding agent is told to skip — so the production fix went unwritten."""
+    monkeypatch.setattr(
+        verify.graph_reader,
+        "find_symbol_files",
+        lambda s, sym: [
+            "acceptance-tests/cypress/client/pages/CreateOrder/summaryInformationPage.ts",
+            "src/apps/client/modules/Reports/.../SummaryInformation/view.tsx",
+        ],
+    )
+    change = _change(None, "SummaryInformation")
+    verify.verify_change("ui", change, set())
+    assert change.verification == "corrected"
+    assert change.file_path == "src/apps/client/modules/Reports/.../SummaryInformation/view.tsx"
+
+
+def test_a_symbol_in_two_real_files_is_still_ambiguous(monkeypatch):
+    monkeypatch.setattr(
+        verify.graph_reader, "find_symbol_files", lambda s, sym: ["src/a/x.ts", "src/b/x.ts"]
+    )
+    change = _change(None, "X")
+    verify.verify_change("ui", change, set())
+    assert change.verification == "unverified"
+    assert "exists in 2 files" in change.verification_note
