@@ -63,11 +63,12 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
     workflow_id = _workflow_id()
     issue_text = payload.get("issue_text")
     repos_text = payload.get("repos") or ""
-    # An empty form field arrives as null, not as a missing key — `or` (not
-    # .get's default) is what turns both into the default.
-    top_k = payload.get("top_k") or 5
+    # An empty form field arrives as null, not as a missing key, and both
+    # mean "use the default". Deliberately passed on AS None rather than
+    # resolved here: a second copy of the numbers in this workflow silently
+    # overrode the real defaults, so generate_technical_design owns them.
+    top_k = payload.get("top_k")
     hops = payload.get("hops")
-    hops = 2 if hops is None else hops
     # Optional override. Left unset (the normal case), the ticket is
     # classified from its own text during the issue split.
     mode = payload.get("mode") or None

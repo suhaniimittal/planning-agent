@@ -76,8 +76,8 @@ def _stamp(generated_at: str | None) -> str:
 @tool()
 async def generate_technical_design(
     issue_text: str,
-    top_k: int = 8,
-    hops: int = 0,
+    top_k: int | None = None,
+    hops: int | None = None,
     service_names: list[str] | None = None,
     mode: str | None = None,
 ) -> dict:
@@ -94,9 +94,13 @@ async def generate_technical_design(
 
     `service_names`: the services this run covers; None considers every
     service in the graph."""
-    tdd = await build_tdd(
-        issue_text, top_k=top_k, hops=hops, service_names=service_names, mode=mode
-    )
+    # Only what the caller actually chose is forwarded, so build_tdd's own
+    # signature stays the single definition of what top_k and hops default
+    # to — nothing here restates the numbers.
+    chosen = {
+        name: value for name, value in (("top_k", top_k), ("hops", hops)) if value is not None
+    }
+    tdd = await build_tdd(issue_text, service_names=service_names, mode=mode, **chosen)
     pdf_bytes = render_pdf(tdd)
 
     storage.init_client()
