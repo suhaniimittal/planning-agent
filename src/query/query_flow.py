@@ -17,9 +17,6 @@ from . import code_search, graph_reader, issue_split, planner
 from .models import ServiceDependency, TechnicalDesignDoc
 from .verify import verify_tdd
 
-# Services beyond top_k whose code is also searched before choosing — so a
-# service with a generic summary can still win on its code.
-_CODE_EVIDENCE_EXTRA = 3
 # A service's rank = this weight x summary match + the rest x best code match.
 _SUMMARY_WEIGHT = 0.5
 # Functions up to this long are shown whole; longer ones by their best chunk.
@@ -147,11 +144,10 @@ async def build_tdd(
     user listed) — only those are ever considered. None considers every
     service in the graph.
 
-    `top_k` is the most services the TDD may involve. It defaults high
-    deliberately: the shortlist is built on SUMMARY score alone, so a
-    service whose summary reads generically is cut before its code is
-    ever searched — ui, whose summary describes React plumbing, was lost
-    that way on a ticket about its own form validation.
+    `top_k` is the most services the TDD may involve. It is a cap on the
+    answer, not on the search: every service in the run has its code read
+    before any of them are ranked, so this never decides which services
+    were allowed to compete.
 
     `hops` widens only the BACKGROUND context: services reached over CALLS
     edges, shown by summary and never given code to change. It defaults to
@@ -178,16 +174,27 @@ async def build_tdd(
     embedding = vectors[0]
     identifiers = code_search.issue_identifiers(issue_text)
 
-    # 1. Which services. Summary similarity alone misjudges a service whose
-    #    summary is generic — a large UI repo ranked 4th of 6 for a bug in
-    #    its own form validation — so the services' own code gets a vote:
-    #    every service on the shortlist is searched, and its best function
-    #    match counts as much as its summary match. A service the issue
-    #    names outright is always included.
+    # 1. Which services. EVERY service in the run has its code searched —
+    #    nothing is eliminated on its summary first. Summary similarity
+    #    misjudges a service whose summary is generic: a large UI repo
+    #    ranked 4th of 6 for a bug in its own form validation, and was cut
+    #    before a line of that code was read. Ranking only afterwards, on
+    #    summary AND code together, is what makes that impossible.
+    #
+    #    This is affordable because `service_names` is the list a person
+    #    typed into the form, and because the searches below run in
+    #    parallel: measured on a 12-service graph, the extra services are
+    #    the small ones (~0.1s each) while the slowest was already being
+    #    searched. A run large enough to need a budget should get one
+    #    measured in CHUNKS SCANNED, which is what actually costs — not in
+    #    services, and not guessed.
     summary = graph_reader.summary_scores(embedding, service_names)
     by_summary = sorted(summary, key=lambda name: -summary[name])
+    # A subset of by_summary (services_named_in filters the list it is
+    # given), so it needs no separate place in the shortlist — only in the
+    # selection below, where it overrides the ranking.
     named = code_search.services_named_in(issue_text, by_summary)
-    shortlist = list(dict.fromkeys(named + by_summary[: top_k + _CODE_EVIDENCE_EXTRA]))
+    shortlist = by_summary
 
     # 2. What code, per service: each service's own top chunks (never a
     #    shared top-k a large service can monopolize), test code excluded.

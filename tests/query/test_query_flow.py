@@ -158,8 +158,29 @@ async def test_code_evidence_can_outrank_a_better_summary_match(graph):
 
     assert set(graph.prompt["seed_names"]) == {"ui", "candidate"}
     assert set(graph.prompt["code"]) == {"ui", "candidate"}
-    # the shortlist that got searched is wider than top_k (2 + 3 extra)
+    # every service in the run was searched, not just the top few by summary
     assert set(_searched(graph)) == {"compliance", "reports", "candidate", "ui", "pdf"}
+
+
+@pytest.mark.asyncio
+async def test_no_service_is_cut_before_its_code_is_searched(graph):
+    """The one the previous test cannot catch: with more services than any
+    old shortlist would have held, the WORST summary match still gets its
+    code read — and wins on it. A shortlist built on summary alone would
+    have dropped `ui` here before anyone looked at a line of it."""
+    graph.summary = {
+        "a": 0.70, "b": 0.69, "c": 0.68, "d": 0.67, "e": 0.66,
+        "f": 0.65, "g": 0.64, "h": 0.63, "i": 0.62, "ui": 0.10,
+    }
+    graph.hits = {"ui": [_hit("form.ts::validationSchema", 0.95)]}
+    for s, rows in graph.hits.items():
+        for h in rows:
+            graph.symbols[(s, h["function_qualified_name"])] = _fn(s, h["function_qualified_name"])
+
+    await query_flow.build_tdd("issue", top_k=2, hops=0)
+
+    assert set(_searched(graph)) == set(graph.summary)
+    assert "ui" in graph.prompt["seed_names"]
 
 
 @pytest.mark.asyncio
