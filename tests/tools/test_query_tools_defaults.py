@@ -26,12 +26,12 @@ def test_the_agent_workflow_names_no_default_of_its_own():
         assert forbidden not in source, forbidden
 
 
-def test_the_form_help_text_matches_the_real_defaults():
-    """The numbers users read in the Aetherion form live in metadata.json and
-    drifted out of step with the code."""
+def test_the_form_does_not_offer_top_k_or_hops():
+    """Deliberately not on the form: both are retrieval tuning, not something
+    a person filing a ticket should have to answer, and the help text beside
+    them went stale the moment the defaults changed. Leaving them out is what
+    makes build_tdd's signature the only place they are set."""
     triggers = json.loads((_ROOT / "src" / "agent" / "metadata.json").read_text())["config"][
         "triggers"
     ]
-    described = {t["name"]: t["description"] for t in triggers}
-    assert f"({_default(build_tdd, 'top_k')})" in described["top_k"]
-    assert f"({_default(build_tdd, 'hops')}, off)" in described["hops"]
+    assert [t["name"] for t in triggers] == ["issue_text", "repos"]
