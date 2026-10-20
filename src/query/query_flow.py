@@ -137,7 +137,7 @@ def _widen_to_small_classes(
 
 async def build_tdd(
     issue_text: str,
-    top_k: int = 5,
+    top_k: int = 8,
     hops: int = 2,
     debug_dump_prompts: bool = False,
     service_names: list[str] | None = None,
@@ -147,7 +147,11 @@ async def build_tdd(
     user listed) — only those are ever considered. None considers every
     service in the graph.
 
-    `top_k` is the most services the TDD may involve; `hops` widens only the
+    `top_k` is the most services the TDD may involve. It defaults high
+    deliberately: the shortlist is built on SUMMARY score alone, so a
+    service whose summary reads generically is cut before its code is
+    ever searched — ui, whose summary describes React plumbing, was lost
+    that way on a ticket about its own form validation. `hops` widens only the
     BACKGROUND context (graph-connected services shown by summary, never
     given code to change).
 

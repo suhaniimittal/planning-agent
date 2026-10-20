@@ -19,7 +19,9 @@ async def main():
         "instead of being rejected."
     )
 
-    tdd = await build_tdd(issue, top_k=5, hops=1, debug_dump_prompts=True)
+    # top_k and hops deliberately not passed — the defaults apply, and
+    # either can be added here by hand for a one-off run.
+    tdd = await build_tdd(issue, debug_dump_prompts=True)
 
     text = render_text(tdd)
     print(text)
