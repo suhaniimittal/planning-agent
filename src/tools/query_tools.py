@@ -77,7 +77,7 @@ def _stamp(generated_at: str | None) -> str:
 async def generate_technical_design(
     issue_text: str,
     top_k: int = 8,
-    hops: int = 2,
+    hops: int = 0,
     service_names: list[str] | None = None,
     mode: str | None = None,
 ) -> dict:

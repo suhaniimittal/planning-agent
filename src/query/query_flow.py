@@ -138,7 +138,7 @@ def _widen_to_small_classes(
 async def build_tdd(
     issue_text: str,
     top_k: int = 8,
-    hops: int = 2,
+    hops: int = 0,
     debug_dump_prompts: bool = False,
     service_names: list[str] | None = None,
     mode: str | None = None,
@@ -151,9 +151,15 @@ async def build_tdd(
     deliberately: the shortlist is built on SUMMARY score alone, so a
     service whose summary reads generically is cut before its code is
     ever searched — ui, whose summary describes React plumbing, was lost
-    that way on a ticket about its own form validation. `hops` widens only the
-    BACKGROUND context (graph-connected services shown by summary, never
-    given code to change).
+    that way on a ticket about its own form validation.
+
+    `hops` widens only the BACKGROUND context: services reached over CALLS
+    edges, shown by summary and never given code to change. It defaults to
+    0 — off. Every neighbour becomes its own "no change" block in the
+    document, and on a graph this densely connected one hop already reaches
+    most of it, so the tail cost it adds is real while the context it buys
+    is not. Pass 1 or 2 when a change's blast radius across services is
+    the actual question.
 
     `debug_dump_prompts=True` writes the exact system/user prompt sent to
     the LLM to llm_system_prompt.txt / llm_user_prompt.txt in the current
