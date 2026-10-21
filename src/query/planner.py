@@ -824,7 +824,7 @@ def build_user_prompt(
     distinguish them.
 
     Every candidate service only ever gets its short, code-derived `summary`
-    (see summarizer.py) — there is no longer a separate "full doc" tier to
+    (each repository's committed SERVICE.md) — there is no separate tier of
     choose between; the real per-symbol detail comes entirely from
     `code_symbols_by_service`/`snippets_by_key` when a service's code graph
     matched. A seed with no matched code, or a graph-neighbor pulled in via

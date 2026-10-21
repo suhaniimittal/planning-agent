@@ -11,14 +11,14 @@ from src.ingestion.test_paths import CYPHER_TEST_PATH_RE, is_test_path
 
 
 def vector_search_services(embedding: list[float], k: int = 5) -> list[dict]:
-    """Top-k services by cosine similarity on summary_embedding.
+    """Top-k services by cosine similarity on doc_embedding.
 
     Returns [{"name": str, "score": float}, ...], descending score.
     """
     with get_driver().session() as session:
         result = session.run(
             """
-            CALL db.index.vector.queryNodes('service_summary_index', $k, $embedding)
+            CALL db.index.vector.queryNodes('service_doc_index', $k, $embedding)
             YIELD node, score
             RETURN node.name AS name, score
             ORDER BY score DESC
@@ -79,11 +79,10 @@ def get_edges_among(names: list[str]) -> list[dict]:
 
 
 def load_candidate_docs(names: list[str]) -> list[dict]:
-    """name + summary for exactly these service names — the short,
-    code-derived overview generated at ingestion time (see
-    src/ingestion/summarizer.py). There's no separate "full doc" tier
-    anymore: real per-symbol detail comes from load_code_symbols_for_services/
-    load_source_snippets instead, not a markdown document."""
+    """name + description for exactly these service names — the SERVICE.md
+    each repository commits (see src/ingestion/service_doc.py). Per-symbol
+    detail comes from load_symbols/load_file_context instead; this is only
+    what the service is FOR."""
     if not names:
         return []
     with get_driver().session() as session:
@@ -91,7 +90,7 @@ def load_candidate_docs(names: list[str]) -> list[dict]:
             """
             MATCH (s:Service)
             WHERE s.name IN $names
-            RETURN s.name AS name, s.summary AS summary
+            RETURN s.name AS name, s.doc AS summary
             """,
             names=names,
         )
@@ -248,16 +247,25 @@ _NOT_TEST = "NOT coalesce(c.is_test, c.file_path =~ $test_re)"
 
 
 def summary_scores(embedding: list[float], names: list[str] | None = None) -> dict[str, float]:
-    """{service: cosine(issue embedding, summary embedding)} for `names`
-    (every summarized service when None). Exact, not the vector index's
-    approximate top-k — a run never has more than a few dozen services."""
+    """{service: cosine(issue embedding, its SERVICE.md embedding)} for
+    `names` (every service when None). Exact, not the vector index's
+    approximate top-k — a run never has more than a few dozen services.
+
+    A service with no committed SERVICE.md scores 0.0 rather than being left
+    out. Omitting it would delete it from the run: callers build the search
+    shortlist from these names, so a service missing here is never searched
+    and never appears in the design, with nothing said about it. Scoring 0
+    instead costs it half its combined score and leaves it to win on its
+    code, which it can.
+    """
     with get_driver().session() as session:
         result = session.run(
             """
             MATCH (s:Service)
-            WHERE s.summary_embedding IS NOT NULL AND ($names IS NULL OR s.name IN $names)
+            WHERE $names IS NULL OR s.name IN $names
             RETURN s.name AS name,
-                   vector.similarity.cosine(s.summary_embedding, $embedding) AS score
+                   CASE WHEN s.doc_embedding IS NULL THEN 0.0
+                        ELSE vector.similarity.cosine(s.doc_embedding, $embedding) END AS score
             """,
             names=names,
             embedding=embedding,

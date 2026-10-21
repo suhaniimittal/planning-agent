@@ -65,19 +65,23 @@ def test_upsert_service_node_removes_stale_md_derived_properties(monkeypatch):
     assert "s.summary_is_fallback" in query
 
 
-def test_update_service_summary_sets_summary_and_embedding(monkeypatch):
+def test_update_service_doc_sets_doc_embedding_and_hash(monkeypatch):
     driver = _patch_driver(monkeypatch)
 
-    graph_writer.update_service_summary("orders", "Handles order placement.", [0.1, 0.2])
+    graph_writer.update_service_doc("orders", "# orders\n\nPlacing orders.", [0.1, 0.2], "abc123")
 
     query, params = driver._session.queries[0]
     assert "MATCH (s:Service {name: $name})" in query
-    assert "s.summary = $summary" in query
-    assert "s.summary_embedding = $embedding" in query
+    assert "s.doc = $doc" in query
+    assert "s.doc_embedding = $embedding" in query
+    # stored so the next run can tell an edited SERVICE.md from an unchanged
+    # one — the file, not the commit, decides whether this moves.
+    assert "s.doc_hash = $doc_hash" in query
     assert params == {
         "name": "orders",
-        "summary": "Handles order placement.",
+        "doc": "# orders\n\nPlacing orders.",
         "embedding": [0.1, 0.2],
+        "doc_hash": "abc123",
     }
 
 
@@ -108,7 +112,7 @@ def test_create_vector_index_passes_dimensions(monkeypatch):
     graph_writer.create_vector_index(dimensions=1536)
 
     query, params = driver._session.queries[0]
-    assert "CREATE VECTOR INDEX service_summary_index" in query
+    assert "CREATE VECTOR INDEX service_doc_index" in query
     assert params == {"dimensions": 1536}
 
 

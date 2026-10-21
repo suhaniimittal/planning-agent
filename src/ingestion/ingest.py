@@ -43,7 +43,7 @@ from .repo_fetcher import (
     local_repo_root,
     service_list_fingerprint,
 )
-from .summarizer import SummarizerError, build_digest, generate_summaries
+from . import service_doc
 from .test_paths import is_test_path
 
 # How many repos to sync concurrently — serially syncing 40-50 repos would
@@ -555,7 +555,7 @@ async def sync_service(
     ingest, or a per-file incremental sync.
 
     Returns the freshly-parsed RepoGraph only when a FULL ingest just
-    happened (used to build this service's summarizer digest without a
+    happened (used to write this service's code graph without a
     second clone) — an incremental run or an unchanged/skip never returns
     one, since no full RepoGraph exists for those; the caller builds the
     digest from Neo4j directly in that case (see run() below).
@@ -694,48 +694,66 @@ async def run(
 
     results = await asyncio.gather(*(_one(spec) for spec in specs))
 
-    print("\n=== Generating code-derived service summaries (one batched LLM call) ===")
-    # A summary is written ONCE and then left alone. Re-summarizing unchanged
-    # code rewords the summary every run, which moves its embedding, which
-    # silently reshuffles which services a TDD considers at all — the same
-    # ticket then gets a different answer for no real reason. Only a service
-    # whose code actually changed this run, or one that has no summary yet,
-    # is sent to the model.
-    already_summarized = graph_writer.services_with_summaries([name for name, _ in results])
-    digests = []
-    for name, graph in results:
-        if graph is not None:
-            # A full ingest just happened — build the digest from the
-            # RepoGraph already in memory, no extra read.
-            classes = [_class_row(c) for c in graph.classes]
-            functions = [_function_row(f) for f in graph.functions]
-            digests.append(build_digest(name, classes, functions))
-        elif name not in already_summarized:
-            # Unchanged this run but has no summary yet (first-ever run, or a
-            # previous summarizer failure) — rebuild the digest from the
-            # service's CURRENT state in Neo4j, never from a repo clone.
-            classes, functions = code_graph_writer.load_current_symbols(name)
-            if classes or functions:
-                digests.append(build_digest(name, classes, functions))
+    print("\n=== Reading each service's SERVICE.md ===")
+    await _sync_service_docs(specs, github_token)
 
-    kept = sorted(name for name, graph in results if graph is None and name in already_summarized)
-    if kept:
-        print(f"  keeping existing summaries (code unchanged): {', '.join(kept)}")
 
-    if not digests:
-        print("  every service already has a summary — nothing to regenerate")
-        return
+def _read_service_doc(spec: ServiceSpec, github_token: str | None) -> str | None:
+    """A service's committed SERVICE.md, from wherever this run can reach it.
 
+    Local mode reads the folder. GitHub mode asks the API for that one file
+    rather than the checkout, because an incremental run never clones — it
+    fetches only the files the Compare API says changed, so there is no tree
+    to look in. One small request per service covers both kinds of run.
+    """
     try:
-        summaries = await generate_summaries(digests)
-    except SummarizerError as e:
-        print(f"  [SUMMARIZER SKIP] batched call failed, no summaries written this run: {e}")
-        return
+        local_root = local_repo_root(spec.name)
+    except RepoFetchError:
+        local_root = None
+    if local_root is not None:
+        return service_doc.read_local_service_doc(local_root)
+    try:
+        text = github_api.fetch_file_content(
+            spec.repo, service_doc.SERVICE_DOC_FILENAME, spec.branch or "HEAD", github_token
+        )
+    except github_api.GitHubApiError:
+        return None
+    return text if text.strip() else None
 
-    for name, summary_text in summaries.items():
-        embedding = await embed(summary_text)
-        graph_writer.update_service_summary(name, summary_text, embedding)
-        print(f"  updated summary: {name}: {summary_text[:80]!r}...")
+
+async def _sync_service_docs(specs: list[ServiceSpec], github_token: str | None) -> None:
+    """Embeds each service's SERVICE.md, skipping any whose text is unchanged.
+
+    Keyed on the text's own hash rather than on the commit: a commit that
+    touches only code must not move a service's embedding, and editing the
+    doc must take effect even when no code changed.
+    """
+    stored = graph_writer.service_doc_hashes([spec.name for spec in specs])
+    unchanged: list[str] = []
+    for spec in specs:
+        text = await asyncio.to_thread(_read_service_doc, spec, github_token)
+        if text is None:
+            # Deliberately not fatal, and deliberately loud. The service is
+            # still ingested and still searched; it scores 0 on the doc half
+            # and has to win on its code (see graph_reader.summary_scores).
+            print(
+                f"  [NO DOC] {spec.name}: no {service_doc.SERVICE_DOC_FILENAME} — "
+                "this service will score 0 on the description half of its ranking"
+            )
+            continue
+        note = service_doc.oversize_note(spec.name, text)
+        if note:
+            print(note)
+        text_hash = service_doc.doc_hash(text)
+        if stored.get(spec.name) == text_hash:
+            unchanged.append(spec.name)
+            continue
+        embedding = await embed(text)
+        graph_writer.update_service_doc(spec.name, text, embedding, text_hash)
+        first_line = text.strip().splitlines()[0][:70]
+        print(f"  embedded {spec.name}: {len(text)} chars, starting {first_line!r}")
+    if unchanged:
+        print(f"  unchanged, left alone: {', '.join(sorted(unchanged))}")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import pytest
 
-from src.ingestion import github_api, ingest
+from src.ingestion import github_api, ingest, service_doc
 from src.ingestion.code_parser import CodeChunk, ParsedSymbol, RepoGraph
 from src.ingestion.manifest import ServiceSpec
 
@@ -1028,7 +1028,9 @@ _MANIFEST = [
 def _patch_run_dependencies(monkeypatch):
     calls = {
         "upsert_service_node": [],
-        "update_service_summary": [],
+        "update_service_doc": [],
+        "docs": {},
+        "stored_hashes": {},
     }
 
     monkeypatch.setattr(ingest, "load_services", lambda: list(_MANIFEST))
@@ -1044,19 +1046,24 @@ def _patch_run_dependencies(monkeypatch):
         lambda name, repo: calls["upsert_service_node"].append((name, repo)),
     )
     monkeypatch.setattr(ingest.graph_writer, "create_vector_index", lambda: None)
-    # No service has a stored summary unless a test says otherwise, so the
-    # summarizer runs as it always did; the "keep what we have" path has its
-    # own test below.
-    calls["already_summarized"] = set()
+    # No service has a stored doc unless a test says otherwise, so anything
+    # with a SERVICE.md is embedded; the "leave it alone" path has its own
+    # test below.
     monkeypatch.setattr(
-        ingest.graph_writer, "services_with_summaries", lambda names: calls["already_summarized"]
+        ingest.graph_writer, "service_doc_hashes", lambda names: dict(calls["stored_hashes"])
     )
     monkeypatch.setattr(
         ingest.graph_writer,
-        "update_service_summary",
-        lambda name, summary, embedding: calls["update_service_summary"].append(
-            (name, summary, embedding)
+        "update_service_doc",
+        lambda name, doc, embedding, doc_hash: calls["update_service_doc"].append(
+            (name, doc, embedding, doc_hash)
         ),
+    )
+    # Where the file comes from (a local folder or the GitHub API) is
+    # _read_service_doc's business; these tests only care what run() does
+    # with the text.
+    monkeypatch.setattr(
+        ingest, "_read_service_doc", lambda spec, token: calls["docs"].get(spec.name)
     )
 
     async def fake_sync_service(spec, github_token, known_service_names):
@@ -1066,11 +1073,6 @@ def _patch_run_dependencies(monkeypatch):
     monkeypatch.setattr(ingest.code_graph_writer, "create_code_indexes", lambda: None)
     monkeypatch.setattr(ingest.code_graph_writer, "create_chunk_vector_index", lambda: None)
     monkeypatch.setattr(ingest.code_graph_writer, "load_current_symbols", lambda name: ([], []))
-
-    async def fake_generate_summaries(digests):
-        return {}
-
-    monkeypatch.setattr(ingest, "generate_summaries", fake_generate_summaries)
 
     return calls
 
@@ -1193,238 +1195,71 @@ def _repo_graph_with_one_class() -> RepoGraph:
 
 
 @pytest.mark.asyncio
-async def test_run_writes_code_derived_summary_from_fresh_repo_graph(monkeypatch):
+async def test_run_embeds_each_service_doc(monkeypatch):
     calls = _patch_run_dependencies(monkeypatch)
+    calls["docs"] = {"orders": "# orders\n\nPlacing and tracking orders."}
 
-    async def fake_sync_service(spec, github_token, known_service_names):
-        return _repo_graph_with_one_class() if spec.name == "orders" else None
+    await ingest.run(service_filter=["orders"])
 
-    monkeypatch.setattr(ingest, "sync_service", fake_sync_service)
+    assert len(calls["update_service_doc"]) == 1
+    name, doc, embedding, doc_hash = calls["update_service_doc"][0]
+    assert name == "orders"
+    assert doc == "# orders\n\nPlacing and tracking orders."
+    assert embedding == [0.1, 0.2]
+    assert doc_hash == service_doc.doc_hash(doc)
 
-    async def fake_generate_summaries(digests):
-        assert {d["service"] for d in digests} == {"orders"}
-        return {"orders": "Handles order placement."}
 
-    monkeypatch.setattr(ingest, "generate_summaries", fake_generate_summaries)
+@pytest.mark.asyncio
+async def test_run_leaves_an_unchanged_doc_alone(monkeypatch):
+    """Re-embedding identical text is wasted work, and the hash is kept on
+    the TEXT so a commit that only touches code never moves the embedding."""
+    calls = _patch_run_dependencies(monkeypatch)
+    doc = "# orders\n\nPlacing and tracking orders."
+    calls["docs"] = {"orders": doc}
+    calls["stored_hashes"] = {"orders": service_doc.doc_hash(doc)}
+
+    await ingest.run(service_filter=["orders"])
+
+    assert calls["update_service_doc"] == []
+
+
+@pytest.mark.asyncio
+async def test_run_re_embeds_an_edited_doc(monkeypatch):
+    """The counterpart: editing SERVICE.md must take effect even though no
+    code changed. Keying on the commit instead would never notice."""
+    calls = _patch_run_dependencies(monkeypatch)
+    calls["docs"] = {"orders": "# orders\n\nNow with returns."}
+    calls["stored_hashes"] = {"orders": service_doc.doc_hash("# orders\n\nOld text.")}
+
+    await ingest.run(service_filter=["orders"])
+
+    assert [name for name, _, _, _ in calls["update_service_doc"]] == ["orders"]
+
+
+@pytest.mark.asyncio
+async def test_a_service_with_no_doc_is_reported_and_the_run_continues(capsys, monkeypatch):
+    """Deliberately not fatal. The service is still ingested and still
+    searched — it scores 0 on the description half (see
+    graph_reader.summary_scores) and has to win on its code."""
+    calls = _patch_run_dependencies(monkeypatch)
+    calls["docs"] = {"shipping": "# shipping\n\nLabels and tracking."}
 
     await ingest.run()
 
-    assert calls["update_service_summary"] == [("orders", "Handles order placement.", [0.1, 0.2])]
+    assert [name for name, _, _, _ in calls["update_service_doc"]] == ["shipping"]
+    assert "[NO DOC] orders" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
-async def test_run_builds_digest_from_neo4j_when_no_fresh_repo_graph(monkeypatch):
-    """An incremental sync (or an already-up-to-date service) never returns
-    a fresh RepoGraph — the digest must come from Neo4j's current state
-    instead, never a repo clone."""
+async def test_an_oversize_doc_says_so_rather_than_truncating_silently(capsys, monkeypatch):
     calls = _patch_run_dependencies(monkeypatch)
+    calls["docs"] = {"orders": "x" * (service_doc.MAX_EMBED_BYTES + 1)}
 
-    async def fake_sync_service(spec, github_token, known_service_names):
-        return None
+    await ingest.run(service_filter=["orders"])
 
-    monkeypatch.setattr(ingest, "sync_service", fake_sync_service)
-
-    def fake_load_current_symbols(name):
-        if name == "orders":
-            return (
-                [
-                    {
-                        "qualified_name": "app.py::OrderService",
-                        "name": "OrderService",
-                        "file_path": "app.py",
-                        "language": "python",
-                        "docstring": None,
-                    }
-                ],
-                [],
-            )
-        return [], []
-
-    monkeypatch.setattr(ingest.code_graph_writer, "load_current_symbols", fake_load_current_symbols)
-
-    async def fake_generate_summaries(digests):
-        assert {d["service"] for d in digests} == {"orders"}
-        return {"orders": "Handles order placement."}
-
-    monkeypatch.setattr(ingest, "generate_summaries", fake_generate_summaries)
-
-    await ingest.run()
-
-    assert calls["update_service_summary"] == [("orders", "Handles order placement.", [0.1, 0.2])]
-
-
-@pytest.mark.asyncio
-async def test_run_skips_summarizer_entirely_when_no_service_has_any_symbols(monkeypatch):
-    calls = _patch_run_dependencies(monkeypatch)
-
-    async def fake_generate_summaries(digests):
-        raise AssertionError(
-            "generate_summaries must not be called when there are no symbols anywhere"
-        )
-
-    monkeypatch.setattr(ingest, "generate_summaries", fake_generate_summaries)
-
-    await ingest.run()
-
-    assert calls["update_service_summary"] == []
-
-
-@pytest.mark.asyncio
-async def test_run_writes_no_summary_when_summarizer_call_fails(monkeypatch):
-    calls = _patch_run_dependencies(monkeypatch)
-
-    async def fake_sync_service(spec, github_token, known_service_names):
-        return _repo_graph_with_one_class() if spec.name == "orders" else None
-
-    monkeypatch.setattr(ingest, "sync_service", fake_sync_service)
-
-    async def failing_generate_summaries(digests):
-        raise ingest.SummarizerError("provider unavailable")
-
-    monkeypatch.setattr(ingest, "generate_summaries", failing_generate_summaries)
-
-    await ingest.run()  # must not raise
-
-    assert calls["update_service_summary"] == []
-
-
-@pytest.mark.asyncio
-async def test_sync_service_local_mode_full_ingests_changed_folder_and_stores_fingerprint(
-    monkeypatch, tmp_path
-):
-    monkeypatch.setenv("USE_LOCAL_REPO", "true")
-    monkeypatch.setenv("LOCAL_REPO_PATH", str(tmp_path))
-
-    def fail_github(*a, **k):
-        raise AssertionError("must not call GitHub in local mode")
-
-    monkeypatch.setattr(github_api, "get_remote_head_sha", fail_github)
-    # even a service already "up to date" on GitHub gets fully re-ingested
-    monkeypatch.setattr(
-        ingest.graph_writer,
-        "load_service_state",
-        lambda name: {
-            "commit_sha": "abc",
-            "local_fingerprint": "old-fingerprint",
-            "services_fingerprint": None,
-        },
-    )
-
-    graph = RepoGraph(classes=[], functions=[])
-
-    async def fake_full(spec, token, names):
-        return graph, "local"
-
-    commits = []
-    monkeypatch.setattr(ingest, "_ingest_full", fake_full)
-    monkeypatch.setattr(
-        ingest.graph_writer,
-        "set_service_commit",
-        lambda name, sha, **k: commits.append((name, sha, k.get("local_fingerprint"))),
-    )
-
-    spec = ServiceSpec(name="orders", repo="org/orders-service")
-    result = await ingest.sync_service(spec, None, {"orders"})
-
-    assert result is graph
-    expected = ingest.local_folder_fingerprint(tmp_path)
-    assert commits == [("orders", None, expected)]
-
-
-@pytest.mark.asyncio
-async def test_sync_service_local_mode_skips_unchanged_folder(monkeypatch, tmp_path):
-    monkeypatch.setenv("USE_LOCAL_REPO", "true")
-    monkeypatch.setenv("LOCAL_REPO_PATH", str(tmp_path))
-    (tmp_path / "app.py").write_text("def f(): pass")
-    fingerprint = ingest.local_folder_fingerprint(tmp_path)
-    monkeypatch.setattr(
-        ingest.graph_writer,
-        "load_service_state",
-        lambda name: {
-            "commit_sha": None,
-            "local_fingerprint": fingerprint,
-            "services_fingerprint": ingest.service_list_fingerprint({"orders"}),
-        },
-    )
-
-    async def fail_full(*a):
-        raise AssertionError("an unchanged folder must not be re-ingested")
-
-    monkeypatch.setattr(ingest, "_ingest_full", fail_full)
-
-    spec = ServiceSpec(name="orders", repo="org/orders-service")
-    assert await ingest.sync_service(spec, None, {"orders"}) is None
-
-
-@pytest.mark.asyncio
-async def test_sync_service_local_mode_bad_path_skips(monkeypatch, tmp_path):
-    monkeypatch.setenv("USE_LOCAL_REPO", "true")
-    monkeypatch.setenv("LOCAL_REPO_PATH", str(tmp_path / "missing"))
-
-    async def fail_full(*a):
-        raise AssertionError("must not ingest with a bad local path")
-
-    monkeypatch.setattr(ingest, "_ingest_full", fail_full)
-
-    spec = ServiceSpec(name="orders", repo="org/orders-service")
-    assert await ingest.sync_service(spec, None, {"orders"}) is None
-
-
-@pytest.mark.asyncio
-async def test_run_keeps_an_existing_summary_when_the_code_did_not_change(monkeypatch):
-    """A summary is written once. Re-summarizing unchanged code reworded it
-    every run, which moved its embedding, which silently reshuffled which
-    services a TDD considered at all — the same ticket then got a different
-    answer for no real reason."""
-    calls = _patch_run_dependencies(monkeypatch)
-    calls["already_summarized"] = {"orders", "shipping"}
-
-    async def unchanged(spec, github_token, known_service_names):
-        return None  # nothing re-ingested this run
-
-    monkeypatch.setattr(ingest, "sync_service", unchanged)
-
-    def must_not_be_read(name):
-        raise AssertionError(f"built a digest for {name}, which already has a summary")
-
-    monkeypatch.setattr(ingest.code_graph_writer, "load_current_symbols", must_not_be_read)
-
-    async def must_not_be_called(digests):
-        raise AssertionError("called the summarizer with nothing to summarize")
-
-    monkeypatch.setattr(ingest, "generate_summaries", must_not_be_called)
-
-    await ingest.run()
-
-    assert calls["update_service_summary"] == []
-
-
-@pytest.mark.asyncio
-async def test_run_summarizes_a_service_whose_code_changed_even_if_it_has_a_summary(monkeypatch):
-    """Keeping summaries must not mean stale ones: a service that was really
-    re-ingested this run gets re-summarized from its fresh graph."""
-    calls = _patch_run_dependencies(monkeypatch)
-    calls["already_summarized"] = {"orders", "shipping"}
-    graph = RepoGraph(classes=[_class_symbol("Order", "order.py")], functions=[])
-
-    async def changed(spec, github_token, known_service_names):
-        return graph if spec.name == "orders" else None
-
-    monkeypatch.setattr(ingest, "sync_service", changed)
-    monkeypatch.setattr(ingest.code_graph_writer, "load_current_symbols", lambda name: ([], []))
-
-    seen = {}
-
-    async def fake_summaries(digests):
-        seen["names"] = [d["service"] for d in digests]
-        return {"orders": "fresh summary"}
-
-    monkeypatch.setattr(ingest, "generate_summaries", fake_summaries)
-
-    await ingest.run()
-
-    assert seen["names"] == ["orders"]  # only the one that changed
-    assert [name for name, _, _ in calls["update_service_summary"]] == ["orders"]
+    assert "[DOC TOO LONG] orders" in capsys.readouterr().out
+    # degraded, not dropped — the first 8,000 bytes are still embedded
+    assert [name for name, _, _, _ in calls["update_service_doc"]] == ["orders"]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,5 @@
 """Neo4j writes for Service nodes: one per service, keyed by name, with a
-code-derived summary (see summarizer.py) attached after its code graph is
+committed description (see service_doc.py) attached after its code graph is
 built."""
 
 from __future__ import annotations
@@ -33,8 +33,8 @@ def create_vector_index(dimensions: int = 1536) -> None:
     with get_driver().session() as session:
         session.run(
             """
-            CREATE VECTOR INDEX service_summary_index IF NOT EXISTS
-            FOR (s:Service) ON (s.summary_embedding)
+            CREATE VECTOR INDEX service_doc_index IF NOT EXISTS
+            FOR (s:Service) ON (s.doc_embedding)
             OPTIONS {indexConfig: {
               `vector.dimensions`: $dimensions,
               `vector.similarity_function`: 'cosine'
@@ -47,8 +47,8 @@ def create_vector_index(dimensions: int = 1536) -> None:
 def upsert_service_node(name: str, repo: str) -> None:
     """Creates/updates the Service node from its manifest entry alone —
     name and repo are all that's known before its code graph is built;
-    `summary`/`summary_embedding` are set afterward by
-    update_service_summary().
+    `doc`/`doc_embedding`/`doc_hash` are set afterward by
+    update_service_doc().
 
     Also strips any leftover properties from the old RepoDocAI/md-based
     pipeline (`full_doc`/`domain`/`entry_points`/`external_systems`/
@@ -158,42 +158,48 @@ def set_service_dependencies(source: str, targets: list[str]) -> None:
         )
 
 
-def update_service_summary(name: str, summary: str, embedding: list[float]) -> None:
-    """Overwrite the summary/embedding on an already-written Service node —
-    used by the code-derived batched summarizer, which runs after every
-    service's code graph has been built this run."""
+def update_service_doc(name: str, doc: str, embedding: list[float], doc_hash: str) -> None:
+    """Overwrite a Service node's committed description and its embedding.
+
+    `doc_hash` is stored alongside so the next run can tell an edited
+    SERVICE.md from an unchanged one and skip re-embedding — the file, not
+    the code, is what decides whether this moves."""
     with get_driver().session() as session:
         session.run(
             """
             MATCH (s:Service {name: $name})
-            SET s.summary = $summary,
-                s.summary_embedding = $embedding
+            SET s.doc = $doc,
+                s.doc_embedding = $embedding,
+                s.doc_hash = $doc_hash
             """,
             name=name,
-            summary=summary,
+            doc=doc,
             embedding=embedding,
+            doc_hash=doc_hash,
         )
 
 
-def services_with_summaries(names: list[str]) -> set[str]:
-    """Which of `names` already have a stored summary AND its embedding.
+def service_doc_hashes(names: list[str]) -> dict[str, str]:
+    """{service: stored doc hash} for those of `names` that already have a
+    description AND its embedding.
 
-    A service's summary is written once and then left alone: re-summarizing
-    unchanged code produced a differently-worded summary on every run, whose
-    embedding then scored differently, which silently reshuffled which
-    services a TDD even considered (observed: a 0.03 swing on an unchanged
-    service, larger than the gap between 3rd and 4th place).
+    Lets a run re-embed only the services whose SERVICE.md actually changed.
+    Re-embedding an unchanged description would be wasted work, and when the
+    text came from a model rather than a file it was worse than wasted: the
+    rewording moved the embedding and silently reshuffled which services a
+    TDD considered (observed: a 0.03 swing on an unchanged service, larger
+    than the gap between 3rd and 4th place).
     """
     if not names:
-        return set()
+        return {}
     with get_driver().session() as session:
         result = session.run(
             """
             MATCH (s:Service)
-            WHERE s.name IN $names AND s.summary IS NOT NULL
-              AND s.summary <> '' AND s.summary_embedding IS NOT NULL
-            RETURN s.name AS name
+            WHERE s.name IN $names AND s.doc IS NOT NULL
+              AND s.doc <> '' AND s.doc_embedding IS NOT NULL
+            RETURN s.name AS name, s.doc_hash AS doc_hash
             """,
             names=names,
         )
-        return {r["name"] for r in result}
+        return {r["name"]: r["doc_hash"] for r in result}

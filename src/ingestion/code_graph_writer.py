@@ -320,7 +320,7 @@ def get_aggregated_file_references(service: str) -> list[str]:
 
 def load_current_symbols(service: str) -> tuple[list[dict], list[dict]]:
     """(classes, functions) currently in the graph for `service`, each a
-    plain dict shaped for summarizer.build_digest — used to rebuild a
+    plain dict of class/function rows — formerly used to rebuild a
     service's summary digest WITHOUT a fresh RepoGraph (an incremental run
     only reparses the files that changed, so it never has the service's
     full symbol set in memory; this reads it back from Neo4j instead,

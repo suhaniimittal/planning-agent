@@ -43,7 +43,7 @@ def test_vector_search_services_passes_k_and_embedding_params(monkeypatch):
 def test_vector_search_services_query_uses_correct_index_name(monkeypatch):
     driver = _patch_driver(monkeypatch, [])
     graph_reader.vector_search_services([0.1], k=5)
-    assert "service_summary_index" in driver._session.last_query
+    assert "service_doc_index" in driver._session.last_query
 
 
 def test_expand_neighbors_query_uses_undirected_calls_pattern(monkeypatch):
@@ -98,7 +98,7 @@ def test_load_candidate_docs_returns_name_and_summary_for_given_names(monkeypatc
             "summary": "Handles order creation and lookup.",
         }
     ]
-    assert "s.summary AS summary" in driver._session.last_query
+    assert "s.doc AS summary" in driver._session.last_query
     assert "full_doc" not in driver._session.last_query
     assert driver._session.last_params == {"names": ["orders"]}
 
@@ -309,3 +309,17 @@ def test_new_test_path_is_none_for_a_file_with_no_extension():
     path the planner would then present as measured."""
     assert graph_reader.new_test_path("a/Makefile", ".test.") is None
     assert graph_reader.new_test_path("a/.gitignore", ".test.") is None
+
+
+def test_a_service_with_no_doc_scores_zero_rather_than_vanishing(monkeypatch):
+    """Omitting it would delete the service from the run: the search
+    shortlist is built from these names, so a service missing here is never
+    searched and never appears in the design, with nothing said about it."""
+    driver = _patch_driver(monkeypatch, [{"name": "ui", "score": 0.4}, {"name": "kafka", "score": 0.0}])
+
+    scores = graph_reader.summary_scores([0.1, 0.2], ["ui", "kafka"])
+
+    assert scores == {"ui": 0.4, "kafka": 0.0}
+    query = driver._session.last_query
+    assert "s.doc_embedding IS NULL THEN 0.0" in query
+    assert "WHERE s.doc_embedding IS NOT NULL" not in query
