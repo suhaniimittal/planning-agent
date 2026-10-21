@@ -792,17 +792,24 @@ async def _sync_service_docs(specs: list[ServiceSpec], github_token: str | None)
                 "this service will score 0 on the description half of its ranking"
             )
             continue
-        note = service_doc.oversize_note(spec.name, text)
+        # The whole file is stored on the node and shown to the planner; a
+        # trimmed extract of it is what gets embedded (see
+        # service_doc.embedding_text), so the size warning is about the
+        # extract — that is the text the 8000-byte cap actually truncates.
+        to_embed = service_doc.embedding_text(text)
+        note = service_doc.oversize_note(spec.name, to_embed)
         if note:
             print(note)
         text_hash = service_doc.doc_hash(text)
         if stored.get(spec.name) == text_hash:
             unchanged.append(spec.name)
             continue
-        embedding = await embed(text)
+        embedding = await embed(to_embed)
         graph_writer.update_service_doc(spec.name, text, embedding, text_hash)
         first_line = text.strip().splitlines()[0][:70]
-        print(f"  embedded {spec.name}: {len(text)} chars, starting {first_line!r}")
+        dropped = len(text) - len(to_embed)
+        trimmed = f", {dropped} chars of exclusions not embedded" if dropped > 0 else ""
+        print(f"  embedded {spec.name}: {len(text)} chars{trimmed}, starting {first_line!r}")
     if unchanged:
         print(f"  unchanged, left alone: {', '.join(sorted(unchanged))}")
 

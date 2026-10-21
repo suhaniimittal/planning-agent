@@ -1223,6 +1223,34 @@ async def test_run_embeds_each_service_doc(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_stores_the_whole_doc_but_embeds_it_without_the_exclusions(monkeypatch):
+    """The planner reads the stored text and can reason about "does not";
+    the embedding cannot, and a section about what a service avoids reads to
+    it as a section about those very topics."""
+    calls = _patch_run_dependencies(monkeypatch)
+    doc = (
+        "# orders\n\n## What this service does\n\nPlacing orders.\n\n"
+        "## What it does NOT do\n\nIt does not send email.\n"
+    )
+    calls["docs"] = {"orders": doc}
+    embedded: list[str] = []
+
+    async def capture(text):
+        embedded.append(text)
+        return [0.1, 0.2]
+
+    monkeypatch.setattr(ingest, "embed", capture)
+
+    await ingest.run(service_filter=["orders"])
+
+    _, stored, _, _ = calls["update_service_doc"][0]
+    assert stored == doc
+    assert "does not send email" in stored
+    assert "does not send email" not in embedded[0]
+    assert "Placing orders." in embedded[0]
+
+
+@pytest.mark.asyncio
 async def test_run_leaves_an_unchanged_doc_alone(monkeypatch):
     """Re-embedding identical text is wasted work, and the hash is kept on
     the TEXT so a commit that only touches code never moves the embedding."""

@@ -36,3 +36,76 @@ def test_oversize_counts_bytes_not_characters():
     text = "é" * (service_doc.MAX_EMBED_BYTES // 2 + 1)
     assert len(text) < service_doc.MAX_EMBED_BYTES
     assert service_doc.oversize_note("ui", text) is not None
+
+
+def test_embedding_text_drops_the_exclusions_section():
+    """The section listing what a service does NOT do is written to push it
+    down on tickets about those topics; in an embedding it pulls it up,
+    because embeddings have no representation of negation."""
+    doc = (
+        "# notifications-service\n\n"
+        "## What this service does\n\nSends SMS.\n\n"
+        "## What it does NOT do\n\nIt does not send email or manage CC lists.\n"
+    )
+
+    embedded = service_doc.embedding_text(doc)
+
+    assert "Sends SMS." in embedded
+    assert "CC lists" not in embedded
+    assert "What it does NOT do" not in embedded
+
+
+def test_embedding_text_resumes_at_the_next_heading_of_the_same_level():
+    doc = (
+        "## What it owns\n\nThe screens.\n\n"
+        "## Out of scope\n\nBilling.\n\n"
+        "## Key flows\n\nLogin.\n"
+    )
+
+    embedded = service_doc.embedding_text(doc)
+
+    assert "The screens." in embedded
+    assert "Login." in embedded
+    assert "Billing." not in embedded
+
+
+def test_embedding_text_takes_subsections_of_the_exclusions_with_it():
+    doc = "## Exclusions\n\nNot ours:\n\n### Email\n\nSent elsewhere.\n\n## Key flows\n\nLogin.\n"
+
+    embedded = service_doc.embedding_text(doc)
+
+    assert "Sent elsewhere." not in embedded
+    assert "Login." in embedded
+
+
+def test_embedding_text_keeps_a_doc_that_has_no_exclusions_section():
+    doc = "# ui\n\n## What this service does\n\nThe screens.\n"
+
+    assert service_doc.embedding_text(doc) == doc.strip()
+
+
+def test_embedding_text_falls_back_to_the_whole_doc_if_nothing_survives():
+    """A doc that is nothing but its exclusions would otherwise embed the
+    empty string, which scores against every ticket alike."""
+    doc = "## What it does NOT do\n\nAnything at all.\n"
+
+    assert service_doc.embedding_text(doc) == doc.strip()
+
+
+def test_doc_hash_changes_when_the_embedding_derivation_changes(monkeypatch):
+    """Every service must re-embed once after the embedded text starts being
+    derived differently, without anyone editing a SERVICE.md."""
+    before = service_doc.doc_hash("# ui\n\nThe screens.")
+    monkeypatch.setattr(service_doc, "DOC_EMBED_VERSION", service_doc.DOC_EMBED_VERSION + 1)
+
+    assert service_doc.doc_hash("# ui\n\nThe screens.") != before
+
+
+def test_doc_hash_covers_the_exclusions_section_too():
+    """The whole file is stored on the node and read by the planner, so an
+    edit confined to the exclusions must still refresh it — even though it
+    leaves the embedding unchanged."""
+    base = "# ui\n\n## What it does NOT do\n\nBilling.\n"
+    edited = "# ui\n\n## What it does NOT do\n\nBilling and payroll.\n"
+
+    assert service_doc.doc_hash(base) != service_doc.doc_hash(edited)
