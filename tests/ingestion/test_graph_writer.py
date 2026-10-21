@@ -65,6 +65,19 @@ def test_upsert_service_node_removes_stale_md_derived_properties(monkeypatch):
     assert "s.summary_is_fallback" in query
 
 
+def test_upsert_service_node_removes_the_generated_summary_it_replaced(monkeypatch):
+    """A service matched against its committed SERVICE.md must not keep the
+    LLM-written summary that preceded it: the two describe the same service
+    differently, and only `doc` is read. Eleven nodes still carried one."""
+    driver = _patch_driver(monkeypatch)
+
+    graph_writer.upsert_service_node("orders", "org/orders-service")
+
+    query, _ = driver._session.queries[0]
+    assert "s.summary" in query
+    assert "s.summary_embedding" in query
+
+
 def test_update_service_doc_sets_doc_embedding_and_hash(monkeypatch):
     driver = _patch_driver(monkeypatch)
 

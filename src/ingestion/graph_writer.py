@@ -52,11 +52,17 @@ def upsert_service_node(name: str, repo: str) -> None:
 
     Also strips any leftover properties from the old RepoDocAI/md-based
     pipeline (`full_doc`/`domain`/`entry_points`/`external_systems`/
-    `key_symbols`/`summary_is_fallback`) — a Service node ingested before
-    this redesign otherwise keeps that stale data forever, since a plain
-    `SET` never removes a property it doesn't mention. This makes
-    re-ingesting an old node self-healing instead of needing a manual
-    Cypher cleanup.
+    `key_symbols`/`summary_is_fallback`) and from the generated-summary
+    pipeline that preceded SERVICE.md (`summary`/`summary_embedding`) — a
+    Service node ingested before either redesign otherwise keeps that stale
+    data forever, since a plain `SET` never removes a property it doesn't
+    mention. This makes re-ingesting an old node self-healing instead of
+    needing a manual Cypher cleanup.
+
+    `summary` in particular is not merely unused but misleading: it is an
+    LLM's description of parsed code, sitting next to the repository's own
+    committed `doc`, and the two disagree. Eleven services still carried
+    one after the switch.
     """
     with get_driver().session() as session:
         session.run(
@@ -64,7 +70,8 @@ def upsert_service_node(name: str, repo: str) -> None:
             MERGE (s:Service {name: $name})
             SET s.repo = $repo
             REMOVE s.full_doc, s.domain, s.entry_points, s.external_systems,
-                   s.key_symbols, s.summary_is_fallback
+                   s.key_symbols, s.summary_is_fallback,
+                   s.summary, s.summary_embedding
             """,
             name=name,
             repo=repo,
