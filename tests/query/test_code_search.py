@@ -56,15 +56,30 @@ def test_rank_functions_ignores_an_identifier_that_is_everywhere():
     assert all(r["identifiers"] == [] for r in ranked)
 
 
-def test_rank_functions_drops_weak_matches_and_caps_the_count():
+def test_rank_functions_keeps_the_best_scores_and_caps_the_count():
+    """No relevance floor. One was removed: being relative to each service's
+    own best score, it cut a service whose matches dropped off sharply after
+    a strong hit, and spared one whose matches were uniformly mediocre —
+    measured on a real ticket, 20 functions down to 6 for the service the
+    bug was actually in, while two irrelevant services kept all 20."""
     hits = [_hit("a::top", 0.90), _hit("a::close", 0.85), _hit("a::weak", 0.70)]
     assert [r["function_qualified_name"] for r in code_search.rank_functions(hits)] == [
         "a::top",
         "a::close",
+        "a::weak",
     ]
 
     many = [_hit(f"a::f{i}", 0.9 - i * 0.001) for i in range(20)]
     assert len(code_search.rank_functions(many, max_functions=8)) == 8
+
+
+def test_an_identifier_match_still_beats_a_higher_score():
+    """The cap is now the only thing that cuts, so a named function has to
+    win its place on the identifier bonus rather than on a floor."""
+    weak_but_named = _hit("a::named", 0.50, identifiers=["approveDeferredReport"])
+    strong = [_hit(f"a::f{i}", 0.90) for i in range(8)]
+    kept = code_search.rank_functions(strong + [weak_but_named], max_functions=3)
+    assert "a::named" in [r["function_qualified_name"] for r in kept]
 
 
 def test_rank_functions_handles_no_hits():

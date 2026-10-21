@@ -104,7 +104,6 @@ def issue_identifiers(issue_text: str) -> list[str]:
 def rank_functions(
     hits: list[dict],
     max_functions: int = 20,
-    keep_within: float = 0.12,
     identifier_bonus: float = 0.08,
     max_identifier_hits: int = 25,
 ) -> list[dict]:
@@ -115,9 +114,19 @@ def rank_functions(
     identifier found in more than `max_identifier_hits` chunks, which is too
     common in this service to mean anything. A function containing an
     issue identifier always gets a place — it's the strongest signal there
-    is; the remaining places go to functions within `keep_within` of the
-    service's best score (weak matches are noise, not context). At most
+    is; the remaining places go to the best remaining scores, at most
     `max_functions` in all.
+
+    There was a relevance floor here, dropping anything more than a fixed
+    distance below the service's own best score. It was removed because the
+    idea is backwards, not because the distance was wrong: the floor is
+    relative to each service's best, so a service whose matches drop off
+    sharply after a strong top hit is cut hard, while one whose matches are
+    uniformly mediocre keeps everything. Measured on a real ticket, it took
+    the service the bug was actually in from 20 functions to 6 while leaving
+    two irrelevant services at 20. Telling a weakly-matching service apart
+    needs an absolute measure, or a comparison across services — not a
+    window on its own distribution.
 
     Returns [{"function_qualified_name", "text", "score", "identifiers"}],
     best first; `text` is the best-scoring chunk.
@@ -155,11 +164,8 @@ def rank_functions(
         for e in by_function.values()
     ]
     ranked.sort(key=lambda r: -r["score"])
-    if not ranked:
-        return []
-    floor = ranked[0]["score"] - keep_within
     named = [r for r in ranked if r["identifiers"]][:max_functions]
-    rest = [r for r in ranked if not r["identifiers"] and r["score"] >= floor]
+    rest = [r for r in ranked if not r["identifiers"]]
     kept = (named + rest)[:max_functions]
     kept.sort(key=lambda r: -r["score"])
     return kept
