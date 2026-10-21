@@ -7,7 +7,7 @@ kept separate since the two paths have different callers and failure modes
 from __future__ import annotations
 
 from src.ingestion.graph_writer import get_driver
-from src.ingestion.test_paths import CYPHER_TEST_PATH_RE, is_test_path
+from src.ingestion.test_paths import CYPHER_SPEC_FILE_RE, CYPHER_TEST_PATH_RE, is_test_path
 
 
 def vector_search_services(embedding: list[float], k: int = 5) -> list[dict]:
@@ -508,9 +508,26 @@ def tests_naming(
     (search_service_chunks excludes test chunks for exactly that reason —
     test prose echoes a ticket's wording and outscores the code it tests).
 
-    Matched against a test's chunks, but the chunks are only the finding
-    aid; load_test_sources then reads the whole file, because a test file
-    reaches the graph as a small fraction of itself and never the fixture.
+    Matched against the test file's OWN STORED TEXT, not its chunks. Chunks
+    fail here for the same reason that made this lookup necessary at all: a
+    test file's chunks are a fraction of it. Measured against the live
+    graph, searching chunks for the ATS ticket's field found one file — a
+    29,652-char suite — and missed the three focused specs (1,605 / 2,235 /
+    3,920 chars) that hold the fixture worth copying, because their chunks
+    are 172-331 characters and do not contain it.
+
+    Chunks were tried as a second arm and dropped: they added 17.4s per
+    lookup, against 0.11s for the stored text alone, to contribute only
+    that one long suite — which smallest-first would never have shown.
+    MAX_TEST_SOURCE_CHARS therefore bounds what is FINDABLE as well as what
+    is shown; a term buried past it in a very long test is not reachable,
+    and the planner falls back to writing a new test as it did before.
+
+    Restricted to files whose NAME says they are a spec. A generated type
+    declaration under cypress/support/@types/ is test-path code but is not
+    a test, and eight of them match this ticket's field while being the
+    shortest matches of all — smallest-first would have shown the planner
+    nothing but type stubs.
     """
     if not service_symbol_terms:
         return {}
@@ -525,15 +542,14 @@ def tests_naming(
         rows = session.run(
             """
             UNWIND $lookups AS lookup
-            MATCH (c:Chunk {service: lookup.service})
-            WHERE coalesce(c.is_test, c.file_path =~ $test_re)
-              AND any(term IN lookup.terms WHERE c.text CONTAINS term)
-            MATCH (f:Function)-[:HAS_CHUNK]->(c)
+            MATCH (f:File {service: lookup.service})
+            WHERE f.file_path =~ $spec_re
+              AND any(term IN lookup.terms WHERE coalesce(f.source, '') CONTAINS term)
             RETURN lookup.service AS service, lookup.symbol AS symbol,
-                   split(f.qualified_name, '::')[0] AS file_path
+                   f.file_path AS file_path
             """,
             lookups=lookups,
-            test_re=CYPHER_TEST_PATH_RE,
+            spec_re=CYPHER_SPEC_FILE_RE,
         )
         found: dict[tuple[str, str], set[str]] = {}
         for row in rows:

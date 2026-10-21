@@ -25,5 +25,22 @@ _TEST_PATH = re.compile(_PATTERN)
 CYPHER_TEST_PATH_RE = f".*({_PATTERN}).*"
 
 
+# A narrower question than is_test_path: not "is this test code?" but "is
+# this a spec file whose setup is worth copying?". The difference is the
+# folder rule above — a generated GraphQL type declaration under
+# cypress/support/@types/ lives in a test folder and matches is_test_path,
+# but it is a type stub, not a test. Measured: searching ui's test files for
+# the field in the ATS ticket returns eight such stubs alongside the three
+# real specs, and they are the SHORTEST matches, so a smallest-first rule
+# would show the planner nothing but type declarations.
+_SPEC_FILENAME = (
+    r"[A-Za-z0-9_](Test|Tests|Spec)\.(kt|java|scala)$"
+    r"|\.(spec|test|cy)\.(ts|tsx|js|jsx)$"
+    r"|(^|/)test_[^/]+\.py$"
+    r"|_test\.py$"
+)
+CYPHER_SPEC_FILE_RE = f".*({_SPEC_FILENAME})"
+
+
 def is_test_path(file_path: str | None) -> bool:
     return bool(file_path) and _TEST_PATH.search(file_path) is not None

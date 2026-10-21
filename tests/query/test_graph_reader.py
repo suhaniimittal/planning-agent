@@ -348,10 +348,29 @@ def test_tests_naming_finds_tests_by_content_not_by_folder(monkeypatch):
         ]
     }
     query = driver._session.last_query
-    # only test chunks, and a plain name match — this runs after the files to
+    # the file's own stored text, not its chunks: a test file's chunks are a
+    # fraction of it and do not contain the fixture
+    assert "coalesce(f.source, '') CONTAINS term" in query
+    # a plain CONTAINS, not a vector search — this runs after the files to
     # change are chosen, so it can never take a slot from real code
-    assert "coalesce(c.is_test" in query
-    assert "any(term IN lookup.terms WHERE c.text CONTAINS term)" in query
+    assert "queryNodes" not in query
+
+
+def test_tests_naming_ignores_test_path_files_that_are_not_specs(monkeypatch):
+    """A generated GraphQL type declaration under cypress/support/@types/ is
+    test-path code but is not a test. Eight of them match the ATS ticket's
+    field, and they are the SHORTEST matches, so smallest-first would show
+    the planner nothing but type stubs."""
+    driver = _patch_driver(monkeypatch, [])
+
+    graph_reader.tests_naming([("ui", "X", ["field"])])
+
+    assert "f.file_path =~ $spec_re" in driver._session.last_query
+    spec_re = driver._session.last_params["spec_re"]
+    import re
+
+    assert re.fullmatch(spec_re, "a/view.test.tsx")
+    assert not re.fullmatch(spec_re, "a/cypress/support/graphql/@types/Settings.ts")
 
 
 def test_tests_naming_also_matches_the_issue_identifiers_a_symbol_touches(monkeypatch):
