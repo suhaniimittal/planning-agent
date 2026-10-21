@@ -52,6 +52,20 @@ from .test_paths import is_test_path
 # otherwise dominate ingestion runtime; unbounded concurrency risks GitHub
 # rate limits and disk/CPU contention (for first-ingestion clones), so a
 # small fixed pool instead.
+# Bump this whenever a service's graph would come out DIFFERENT from the
+# same source — a change to parsing, chunking, what a chunk is embedded as,
+# or what is stored on a node. Not for a comment, a log line or a refactor
+# that produces identical output.
+#
+# Without it, "has this service changed?" only ever asked whether the FILES
+# changed. Improving how code is embedded therefore had no effect on any
+# already-ingested service, silently, and the only way to pick it up was to
+# know to go and clear the stored fingerprints by hand.
+#
+# 1 — the first version to record this at all. Its predecessors embedded a
+#     chunk as its code alone and stored no imports.
+PIPELINE_VERSION = 1
+
 _CODE_GRAPH_CONCURRENCY = 4
 
 # How many chunk-embedding requests to have in flight at once, per service — a
@@ -589,7 +603,11 @@ async def sync_service(
         fingerprint = await asyncio.to_thread(local_folder_fingerprint, local_root)
         services_fp = service_list_fingerprint(known_service_names)
         state = graph_writer.load_service_state(spec.name)
-        if state and state.get("local_fingerprint") == fingerprint:
+        if (
+            state
+            and state.get("local_fingerprint") == fingerprint
+            and state.get("pipeline_version") == PIPELINE_VERSION
+        ):
             # The code is untouched. The only thing that can still be stale
             # is this service's dependency links, and only if the set of
             # service names changed since they were computed.
@@ -606,6 +624,7 @@ async def sync_service(
                 None,
                 local_fingerprint=fingerprint,
                 services_fingerprint=services_fp,
+                pipeline_version=PIPELINE_VERSION,
             )
             return None
         print(f"  [LOCAL] {spec.name}: reading code from {local_root}")
@@ -619,6 +638,7 @@ async def sync_service(
                 None,
                 local_fingerprint=fingerprint,
                 services_fingerprint=services_fp,
+                pipeline_version=PIPELINE_VERSION,
             )
         return graph
 
@@ -632,20 +652,38 @@ async def sync_service(
 
     state = graph_writer.load_service_state(spec.name)
 
-    if state and state.get("commit_sha") == head_sha:
+    if (
+        state
+        and state.get("commit_sha") == head_sha
+        and state.get("pipeline_version") == PIPELINE_VERSION
+    ):
         print(f"  [UP TO DATE] {spec.name} @ {head_sha[:8]}")
         return None
+
+    if state and state.get("commit_sha") == head_sha:
+        # Same commit, older pipeline: the files are identical but the graph
+        # built from them would not be, so a per-file diff has nothing to
+        # work from and this has to be a full ingest.
+        print(f"  [REBUILD] {spec.name}: same commit, built by an older pipeline")
+        graph, commit_sha = await _ingest_full(spec, github_token, known_service_names)
+        if commit_sha:
+            graph_writer.set_service_commit(
+                spec.name, commit_sha, pipeline_version=PIPELINE_VERSION
+            )
+        return graph
 
     if not state or not state.get("commit_sha"):
         graph, commit_sha = await _ingest_full(spec, github_token, known_service_names)
         if commit_sha:
-            graph_writer.set_service_commit(spec.name, commit_sha)
+            graph_writer.set_service_commit(
+                spec.name, commit_sha, pipeline_version=PIPELINE_VERSION
+            )
         return graph
 
     await _ingest_incremental(
         spec, github_token, known_service_names, state["commit_sha"], head_sha
     )
-    graph_writer.set_service_commit(spec.name, head_sha)
+    graph_writer.set_service_commit(spec.name, head_sha, pipeline_version=PIPELINE_VERSION)
     return None
 
 

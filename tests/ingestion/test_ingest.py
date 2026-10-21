@@ -894,7 +894,7 @@ async def test_ingest_incremental_noop_when_no_files_changed(monkeypatch):
 async def test_sync_service_skips_when_up_to_date(monkeypatch):
     monkeypatch.setattr(github_api, "get_remote_head_sha", lambda repo, branch, token: "abc")
     monkeypatch.setattr(
-        ingest.graph_writer, "load_service_state", lambda name: {"commit_sha": "abc"}
+        ingest.graph_writer, "load_service_state", lambda name: {"commit_sha": "abc", "pipeline_version": ingest.PIPELINE_VERSION}
     )
 
     async def fail_full(*a):
@@ -928,7 +928,7 @@ async def test_sync_service_does_full_ingest_when_never_ingested(monkeypatch):
     monkeypatch.setattr(
         ingest.graph_writer,
         "set_service_commit",
-        lambda name, sha: set_commit_calls.append((name, sha)),
+        lambda name, sha, **kw: set_commit_calls.append((name, sha)),
     )
 
     spec = ServiceSpec(name="orders", repo="org/orders-service")
@@ -953,7 +953,7 @@ async def test_sync_service_does_full_ingest_when_state_has_no_commit_sha(monkey
     monkeypatch.setattr(
         ingest.graph_writer,
         "set_service_commit",
-        lambda name, sha: set_commit_calls.append((name, sha)),
+        lambda name, sha, **kw: set_commit_calls.append((name, sha)),
     )
 
     spec = ServiceSpec(name="orders", repo="org/orders-service")
@@ -975,7 +975,7 @@ async def test_sync_service_does_not_advance_commit_when_full_ingest_fails(monke
     monkeypatch.setattr(
         ingest.graph_writer,
         "set_service_commit",
-        lambda name, sha: set_commit_calls.append((name, sha)),
+        lambda name, sha, **kw: set_commit_calls.append((name, sha)),
     )
 
     spec = ServiceSpec(name="orders", repo="org/orders-service")
@@ -989,7 +989,7 @@ async def test_sync_service_does_not_advance_commit_when_full_ingest_fails(monke
 async def test_sync_service_does_incremental_when_commit_differs(monkeypatch):
     monkeypatch.setattr(github_api, "get_remote_head_sha", lambda repo, branch, token: "head_sha")
     monkeypatch.setattr(
-        ingest.graph_writer, "load_service_state", lambda name: {"commit_sha": "base_sha"}
+        ingest.graph_writer, "load_service_state", lambda name: {"commit_sha": "base_sha", "pipeline_version": ingest.PIPELINE_VERSION}
     )
 
     incremental_calls = []
@@ -1002,7 +1002,7 @@ async def test_sync_service_does_incremental_when_commit_differs(monkeypatch):
     monkeypatch.setattr(
         ingest.graph_writer,
         "set_service_commit",
-        lambda name, sha: set_commit_calls.append((name, sha)),
+        lambda name, sha, **kw: set_commit_calls.append((name, sha)),
     )
 
     spec = ServiceSpec(name="orders", repo="org/orders-service")
@@ -1298,6 +1298,7 @@ async def test_adding_a_service_rescans_dependencies_without_reingesting(monkeyp
             "local_fingerprint": fingerprint,
             # computed back when only "orders" existed
             "services_fingerprint": ingest.service_list_fingerprint({"orders"}),
+            "pipeline_version": ingest.PIPELINE_VERSION,
         },
     )
 
@@ -1334,3 +1335,61 @@ async def test_adding_a_service_rescans_dependencies_without_reingesting(monkeyp
     assert deps == [("orders", ["payments"])]
     # and the new list fingerprint is stored, so the next run is a clean skip
     assert commits == [("orders", ingest.service_list_fingerprint({"orders", "payments"}))]
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_folder_is_reingested_when_the_pipeline_moved(monkeypatch, tmp_path):
+    """The fingerprint only ever asked whether the FILES changed. So
+    improving how code is parsed or embedded had no effect on any service
+    already in the graph — silently — and the only way to pick it up was to
+    know to clear the stored fingerprints by hand."""
+    monkeypatch.setenv("USE_LOCAL_REPO", "true")
+    monkeypatch.setenv("LOCAL_REPO_PATH", str(tmp_path))
+    (tmp_path / "app.py").write_text("def f(): pass")
+    fingerprint = ingest.local_folder_fingerprint(tmp_path)
+
+    monkeypatch.setattr(
+        ingest.graph_writer,
+        "load_service_state",
+        lambda name: {
+            "commit_sha": None,
+            "local_fingerprint": fingerprint,  # the files are identical
+            "services_fingerprint": ingest.service_list_fingerprint({"orders"}),
+            "pipeline_version": ingest.PIPELINE_VERSION - 1,  # built by older code
+        },
+    )
+    full_ingests = []
+
+    async def fake_full(spec, token, names):
+        full_ingests.append(spec.name)
+        return None, None
+
+    monkeypatch.setattr(ingest, "_ingest_full", fake_full)
+    monkeypatch.setattr(ingest.graph_writer, "set_service_commit", lambda *a, **k: None)
+
+    await ingest.sync_service(ServiceSpec(name="orders", repo="org/o"), None, {"orders"})
+
+    assert full_ingests == ["orders"]
+
+
+@pytest.mark.asyncio
+async def test_the_current_pipeline_version_is_recorded_so_the_next_run_can_skip(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("USE_LOCAL_REPO", "true")
+    monkeypatch.setenv("LOCAL_REPO_PATH", str(tmp_path))
+    (tmp_path / "app.py").write_text("def f(): pass")
+    monkeypatch.setattr(ingest.graph_writer, "load_service_state", lambda name: None)
+    written = {}
+
+    async def fake_full(spec, token, names):
+        return None, "sha"
+
+    monkeypatch.setattr(ingest, "_ingest_full", fake_full)
+    monkeypatch.setattr(
+        ingest.graph_writer, "set_service_commit", lambda *a, **k: written.update(k)
+    )
+
+    await ingest.sync_service(ServiceSpec(name="orders", repo="org/o"), None, {"orders"})
+
+    assert written["pipeline_version"] == ingest.PIPELINE_VERSION

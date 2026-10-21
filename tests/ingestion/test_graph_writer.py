@@ -119,7 +119,14 @@ def test_create_vector_index_passes_dimensions(monkeypatch):
 def test_load_service_state_returns_commit_sha_when_node_exists(monkeypatch):
     _patch_driver(
         monkeypatch,
-        [{"commit_sha": "abc123", "local_fingerprint": "fp1", "services_fingerprint": "sf1"}],
+        [
+            {
+                "commit_sha": "abc123",
+                "local_fingerprint": "fp1",
+                "services_fingerprint": "sf1",
+                "pipeline_version": 1,
+            }
+        ],
     )
 
     state = graph_writer.load_service_state("orders")
@@ -128,6 +135,9 @@ def test_load_service_state_returns_commit_sha_when_node_exists(monkeypatch):
         "commit_sha": "abc123",
         "local_fingerprint": "fp1",
         "services_fingerprint": "sf1",
+        # which version of the parsing/embedding code built this graph —
+        # a mismatch forces a rebuild from the same unchanged source
+        "pipeline_version": 1,
     }
 
 
@@ -139,13 +149,24 @@ def test_load_service_state_returns_none_when_service_never_ingested(monkeypatch
 
 def test_load_service_state_handles_node_with_no_commit_sha_yet(monkeypatch):
     _patch_driver(
-        monkeypatch, [{"commit_sha": None, "local_fingerprint": None, "services_fingerprint": None}]
+        monkeypatch,
+        [
+            {
+                "commit_sha": None,
+                "local_fingerprint": None,
+                "services_fingerprint": None,
+                "pipeline_version": None,
+            }
+        ],
     )
 
     assert graph_writer.load_service_state("orders") == {
         "commit_sha": None,
         "local_fingerprint": None,
         "services_fingerprint": None,
+        # None for a service ingested before this was recorded — unequal to
+        # any version, so it rebuilds rather than being trusted
+        "pipeline_version": None,
     }
 
 

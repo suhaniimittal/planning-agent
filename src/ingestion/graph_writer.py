@@ -83,7 +83,8 @@ def load_service_state(name: str) -> dict | None:
             """
             MATCH (s:Service {name: $name})
             RETURN s.commit_sha AS commit_sha, s.local_fingerprint AS local_fingerprint,
-                   s.services_fingerprint AS services_fingerprint
+                   s.services_fingerprint AS services_fingerprint,
+                   s.pipeline_version AS pipeline_version
             """,
             name=name,
         )
@@ -94,6 +95,9 @@ def load_service_state(name: str) -> dict | None:
             "commit_sha": record["commit_sha"],
             "local_fingerprint": record["local_fingerprint"],
             "services_fingerprint": record["services_fingerprint"],
+            # None for a service ingested before this was recorded, which
+            # compares unequal to any version and so forces a rebuild.
+            "pipeline_version": record["pipeline_version"],
         }
 
 
@@ -102,6 +106,7 @@ def set_service_commit(
     commit_sha: str | None,
     local_fingerprint: str | None = None,
     services_fingerprint: str | None = None,
+    pipeline_version: int | None = None,
 ) -> None:
     """Records which commit `name` is currently ingested at — the anchor
     the git-diff incremental sync compares against next run. None clears
@@ -116,7 +121,11 @@ def set_service_commit(
     service's dependency links were last computed. It moves when a
     service is added or removed, and nothing else does — which is what
     lets ingest.py re-run the cheap edge scan on its own instead of
-    re-ingesting a service whose own code never changed."""
+    re-ingesting a service whose own code never changed.
+
+    `pipeline_version` records which version of the parsing/chunking/
+    embedding code built this graph, so improving that code invalidates
+    every service by itself rather than needing someone to remember."""
     from datetime import UTC, datetime
 
     with get_driver().session() as session:
@@ -125,13 +134,15 @@ def set_service_commit(
             MATCH (s:Service {name: $name})
             SET s.commit_sha = $commit_sha, s.last_ingested_at = $last_ingested_at,
                 s.local_fingerprint = $local_fingerprint,
-                s.services_fingerprint = $services_fingerprint
+                s.services_fingerprint = $services_fingerprint,
+                s.pipeline_version = $pipeline_version
             """,
             name=name,
             commit_sha=commit_sha,
             last_ingested_at=datetime.now(UTC).isoformat(),
             local_fingerprint=local_fingerprint,
             services_fingerprint=services_fingerprint,
+            pipeline_version=pipeline_version,
         )
 
 
