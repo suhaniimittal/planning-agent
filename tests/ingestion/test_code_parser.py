@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from src.ingestion import code_parser
+
 from src.ingestion.code_parser import (
     _CHUNK_TARGET_CHARS,
     LANGUAGE_BY_EXTENSION,
@@ -574,3 +576,43 @@ def test_parse_repo_mixes_real_symbols_and_tracked_only_files(tmp_path):
 
     assert any(f.name == "handler" for f in graph.functions)
     assert graph.tracked_files == {"index.html": "html"}
+
+
+def test_extract_imports_takes_the_block_at_the_top_and_stops_at_real_code():
+    """Nothing else in the pipeline records imports — parse_file extracts
+    only classes and functions — which is why generated code invents module
+    paths."""
+    source = (
+        'import React from "react";\n'
+        "// a comment between imports\n"
+        'import { render } from "@testing-library/react";\n'
+        "\n"
+        'import stubs from "../../stubs";\n'
+        "\n"
+        "export const x = 1;\n"
+        'import { late } from "nope";\n'
+    )
+    assert code_parser.extract_imports(source) == (
+        'import React from "react";\n'
+        'import { render } from "@testing-library/react";\n'
+        'import stubs from "../../stubs";'
+    )
+
+
+def test_extract_imports_handles_every_language_this_parser_reads():
+    assert "from pathlib import Path" in code_parser.extract_imports(
+        "from pathlib import Path\nimport os\n\ndef f(): pass\n"
+    )
+    assert "import com.asurint.Thing" in code_parser.extract_imports(
+        "package com.asurint\n\nimport com.asurint.Thing\n\nclass X\n"
+    )
+    assert 'export { a } from "./a"' in code_parser.extract_imports('export { a } from "./a";\n')
+
+
+def test_extract_imports_is_empty_when_a_file_imports_nothing():
+    assert code_parser.extract_imports("def f():\n    return 1\n") == ""
+
+
+def test_extract_imports_is_capped():
+    source = "\n".join(f'import a{i} from "m{i}";' for i in range(200))
+    assert len(code_parser.extract_imports(source)) <= code_parser.MAX_IMPORT_CHARS

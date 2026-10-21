@@ -287,6 +287,9 @@ async def build_tdd(
         }
     )
     file_context = graph_reader.load_file_context(shown_files)
+    # How this file imports things, so code written for it uses module paths
+    # that exist rather than invented ones.
+    file_imports = graph_reader.load_file_imports(shown_files)
     # Paths only, looked up AFTER the files are chosen — test code still never
     # competes in the search (see graph_reader.load_sibling_tests).
     sibling_tests = graph_reader.load_sibling_tests(shown_files)
@@ -326,6 +329,7 @@ async def build_tdd(
         seed_names=set(selected),
         known_dependencies=known_dependencies,
         file_context=file_context,
+        file_imports=file_imports,
         sibling_tests=sibling_tests,
         tests_by_symbol=tests_by_symbol,
         new_test_paths=new_test_paths,

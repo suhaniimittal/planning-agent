@@ -85,6 +85,12 @@ class RepoGraph:
     # the file exists and can be told to edit it as a whole, and so it's
     # still covered by the cross-service dependency scan).
     tracked_files: dict[str, str] = field(default_factory=dict)
+    # file_path -> its import lines, verbatim. Nothing else in the pipeline
+    # records them: parse_file() extracts only classes and functions, so the
+    # lines above them are lost. That gap is why generated code invents
+    # module paths — a new test file importing a props type that is not
+    # exported, a component importing "@client/hooks" which does not exist.
+    file_imports: dict[str, str] = field(default_factory=dict)
     files_parsed: int = 0
     files_skipped_unsupported: int = 0
     files_skipped_oversized: int = 0
@@ -720,6 +726,39 @@ DEFAULT_DENYLIST: set[str] = {
 
 DEFAULT_MAX_FILE_SIZE_BYTES = 2_000_000
 
+# An import line in every language this parser handles: Python's `import x`
+# and `from x import y`, JS/TS's `import ... from "..."` and re-exports,
+# Kotlin/Java's `import x.y.Z`. Matched as text rather than through
+# tree-sitter because it is the same shape everywhere and needs no grammar.
+_IMPORT_LINE = re.compile(r"^\s*(?:import\b|from\s+\S+\s+import\b|export\s.*\bfrom\b)")
+# Imports live at the top of a file; reading further is wasted work and
+# risks picking up a dynamic import() buried in a function body.
+_IMPORT_SCAN_LINES = 120
+# Enough for a long import block, short enough that several files' worth
+# still leaves room for the code itself in a prompt.
+MAX_IMPORT_CHARS = 1200
+
+
+def extract_imports(source: str) -> str:
+    """The import lines at the top of `source`, in order, as one block.
+
+    Blank lines and comments between imports are dropped; the first run of
+    real code ends the scan. Returns "" when a file imports nothing.
+    """
+    kept: list[str] = []
+    for line in source.splitlines()[:_IMPORT_SCAN_LINES]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("//", "#", "/*", "*", "*/")):
+            continue
+        if _IMPORT_LINE.match(line):
+            kept.append(line.rstrip())
+            continue
+        if kept:
+            break  # past the import block
+    block = "\n".join(kept)
+    return block[:MAX_IMPORT_CHARS]
+
+
 LANGUAGE_BY_EXTENSION: dict[str, str] = {
     ".py": "python",
     ".java": "java",
@@ -928,6 +967,13 @@ def parse_repo(
                 graph.files_failed += 1
                 continue
             graph.files_parsed += 1
+            rel_path = str(path.relative_to(repo_root).as_posix())
+            try:
+                imports = extract_imports(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                imports = ""
+            if imports:
+                graph.file_imports[rel_path] = imports
             for symbol in symbols:
                 if symbol.kind == "class":
                     graph.classes.append(symbol)

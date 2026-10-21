@@ -66,7 +66,12 @@ def create_chunk_vector_index(dimensions: int = 1536) -> None:
 
 
 def upsert_files(service: str, records: list[dict]) -> None:
-    """Each record: {"file_path": str, "language": str}."""
+    """Each record: {"file_path": str, "language": str}, optionally with
+    "imports" — the file's import lines verbatim. Stored on the File node
+    rather than as a symbol because imports belong to the file, not to any
+    class or function in it, and nothing searches them: they are shown to
+    the planner so that code written for this file uses module paths that
+    exist."""
     _run_batched(
         """
         UNWIND $rows AS row

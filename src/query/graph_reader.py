@@ -353,6 +353,31 @@ def load_symbols(service_qualified_name_pairs: list[tuple[str, str]]) -> list[di
         return [dict(r) for r in result]
 
 
+def load_file_imports(service_file_pairs: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """{(service, file_path): that file's import lines}, empty entries dropped.
+
+    The planner otherwise has no idea how this project imports anything:
+    the parser extracts classes and functions, so the lines above them were
+    never stored. Code written without them invents module paths — a
+    component importing "@client/hooks", which does not exist, and a new
+    test file importing a props type that is not exported.
+    """
+    if not service_file_pairs:
+        return {}
+    rows = [{"service": s, "file_path": f} for s, f in service_file_pairs]
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (f:File {service: row.service, file_path: row.file_path})
+            WHERE f.imports IS NOT NULL AND f.imports <> ''
+            RETURN row.service AS service, row.file_path AS file_path, f.imports AS imports
+            """,
+            rows=rows,
+        )
+        return {(r["service"], r["file_path"]): r["imports"] for r in result}
+
+
 def load_file_context(
     service_file_pairs: list[tuple[str, str]],
 ) -> dict[tuple[str, str], list[str]]:

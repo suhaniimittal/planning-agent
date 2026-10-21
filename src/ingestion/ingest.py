@@ -24,6 +24,7 @@ from pathlib import Path, PurePosixPath
 
 from . import code_graph_writer, github_api, graph_writer
 from .code_parser import (
+    extract_imports,
     LANGUAGE_BY_EXTENSION,
     TRACKED_ONLY_EXTENSIONS,
     CodeChunk,
@@ -304,6 +305,9 @@ async def _ingest_full(
             "language": lang,
             "blob_sha": blob_shas.get(fp),
             "references": sorted(references_by_file.get(fp, set())),
+            # "" for a file that imports nothing, so the property always
+            # exists and a reader can tell "no imports" from "never parsed".
+            "imports": graph.file_imports.get(fp, ""),
         }
         for fp, lang in language_by_file.items()
     ]
@@ -486,6 +490,7 @@ async def _ingest_incremental(
                     "language": language,
                     "blob_sha": sha,
                     "references": sorted(references),
+                    "imports": extract_imports(text),
                 }
             ],
         )

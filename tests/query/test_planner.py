@@ -991,3 +991,21 @@ def test_nothing_is_claimed_when_no_test_names_the_symbol():
         tests_by_symbol={},
     )
     assert "mention this symbol by name" not in prompt
+
+
+def test_a_symbol_shows_its_file_imports_verbatim():
+    """Paraphrasing them would be no better than guessing — the point is the
+    exact module paths, which is what generated code gets wrong."""
+    path = "src/forms/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        file_imports={("ui", path): 'import React from "react";\nimport stubs from "../../stubs";'},
+    )
+    assert "This file imports:" in prompt
+    assert 'import stubs from "../../stubs";' in prompt
+
+
+def test_prompt_forbids_inventing_module_paths():
+    prompt = build_system_prompt("bug")
+    assert "DO NOT INVENT MODULE PATHS" in prompt
+    assert "fails as a build error before any test runs" in prompt

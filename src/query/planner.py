@@ -628,6 +628,20 @@ def build_system_prompt(mode: str = "bug") -> str:
         "the test must assert instead. You were given that file's PATH and "
         "never its contents, so do not name a test function or state what "
         "it currently asserts.\n\n"
+        "USE THE IMPORTS YOU WERE SHOWN; DO NOT INVENT MODULE PATHS. A "
+        "symbol's file may list 'This file imports:'. Those lines are "
+        "verbatim from the file, so any sketch for that file must take its "
+        "module paths, aliases and named exports from them rather than "
+        "from what a project of this kind usually looks like.\n\n"
+        "This matters most for a file you are CREATING, where there is no "
+        "existing import block to inherit: take the paths from a file "
+        "you WERE shown in the same area, and say in "
+        "`implementation_notes` which file you took them from so a reader "
+        "can check. An invented import does not fail as a wrong answer — "
+        "it fails as a build error before any test runs.\n\n"
+        "Never name an exported type, helper or component you were not "
+        "shown. A props type that is not exported cannot be imported, and "
+        "neither can a module path nothing in the evidence references.\n\n"
         "AN EXISTING TEST IS ALWAYS PREFERRED OVER A NEW ONE. A symbol may "
         "list 'Existing test files that mention this symbol by name'. Those "
         "already exercise it, wherever in the project they live, and one of "
@@ -777,6 +791,7 @@ def _format_code_symbol(
     tests_beside: list[str] | None = None,
     new_test_path: str | None = None,
     tests_naming_it: list[str] | None = None,
+    imports: str | None = None,
 ) -> str:
     location = f"{symbol['file_path']}:{symbol['line_start']}-{symbol['line_end']}"
     line = f"- `{location}` `{symbol['qualified_name']}` — `{symbol['signature']}`"
@@ -813,6 +828,12 @@ def _format_code_symbol(
         # folder, and on this project the tests are usually somewhere else.
         named = ", ".join(f"`{t}`" for t in tests_naming_it)
         line += f"\n  Existing test files that mention this symbol by name: {named}"
+    if imports:
+        # Verbatim, because the point is the exact module paths — a
+        # paraphrase would be no better than guessing.
+        line += "\n  This file imports:\n" + "\n".join(
+            f"    {importline}" for importline in imports.splitlines()
+        )
     if snippet:
         line += f"\n  ```{symbol.get('language') or ''}\n{snippet}\n  ```"
     return line
@@ -829,6 +850,7 @@ def build_user_prompt(
     sibling_tests: dict[tuple[str, str], list[str]] | None = None,
     new_test_paths: dict[tuple[str, str], str] | None = None,
     tests_by_symbol: dict[tuple[str, str], list[str]] | None = None,
+    file_imports: dict[tuple[str, str], str] | None = None,
 ) -> str:
     """`known_dependencies`: real CALLS edges among the candidate services,
     read from the graph BEFORE the LLM call — shown here as confirmed
@@ -862,6 +884,7 @@ def build_user_prompt(
     sibling_tests = sibling_tests or {}
     new_test_paths = new_test_paths or {}
     tests_by_symbol = tests_by_symbol or {}
+    file_imports = file_imports or {}
 
     sections = [f"## Issue\n{issue_text}\n"]
 
@@ -914,6 +937,7 @@ def build_user_prompt(
                     sibling_tests.get((doc["name"], symbol["file_path"])),
                     new_test_paths.get((doc["name"], symbol["file_path"])),
                     tests_by_symbol.get((doc["name"], symbol["name"])),
+                    file_imports.get((doc["name"], symbol["file_path"])),
                 )
                 for symbol in code_symbols
             ]
