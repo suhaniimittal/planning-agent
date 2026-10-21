@@ -26,23 +26,24 @@ _FULL_SOURCE_MAX_CHARS = 1500
 # is ~7,400 chars), small enough that it cannot crowd out other services.
 _FULL_CLASS_MAX_CHARS = 8000
 
-# The best-matching symbols in a service are shown WHOLE even when they are
-# far too long for the rule above, up to this much.
+# How much of a service's matched code may be shown WHOLE rather than as a
+# chunk, best match first. A budget, not a count of symbols: the thing that
+# costs is characters in the prompt, and a count cannot express that when
+# one match is 300 characters and the next is 12,000.
 #
 # A large component is exactly the case the 1,500 rule handles worst. On a
 # real ticket the component holding the bug was 12,135 characters, so the
-# planner saw one ~700-character chunk of it and nothing else. A review done
-# with the file open then found four things the design had missed — that the
-# blur handler fires even when nothing was edited, that the callback it uses
-# is internal and cannot be asserted on, that the view dereferences a field
-# with no null check, and that an input is gated behind a prop — every one
-# of them inside those 12,135 characters, and none of them in the chunk.
+# planner saw one ~700-character chunk of it. A review done with the file
+# open then found four things the design had missed — the blur handler
+# fires even when nothing was edited, the callback it uses is internal and
+# cannot be asserted on, the view dereferences a field with no null check,
+# and an input is gated behind a prop — every one of them inside those
+# 12,135 characters, already in the graph, and none of them in the chunk.
 #
-# Only the top few per service, because this is the expensive setting: the
-# rest of a service's matches keep the 1,500 rule, and anything over the
-# limit still falls back to its chunk.
-_TOP_SYMBOLS_SHOWN_WHOLE = 2
-_TOP_SYMBOL_MAX_CHARS = 16000
+# That component ranked THIRD for its own ticket, behind two matches of 316
+# and ~2,000 characters. So "the top two symbols" would not have reached it,
+# while a budget does: the small ones barely spend any of it.
+_WHOLE_SOURCE_BUDGET_CHARS = 20000
 
 
 def _print_selection_debug(
@@ -268,7 +269,8 @@ async def build_tdd(
     selection_log: list[dict] = []
     parent_of: dict[tuple[str, str], tuple[str, str]] = {}
     for service in selected:
-        for rank, hit in enumerate(ranked_by_service[service]):
+        whole_source_left = _WHOLE_SOURCE_BUDGET_CHARS
+        for hit in ranked_by_service[service]:
             key = (service, hit["function_qualified_name"])
             symbol = by_key.get(key)
             if symbol is None:
@@ -277,17 +279,22 @@ async def build_tdd(
             code_symbols_by_service.setdefault(service, []).append(symbol)
             if symbol.get("parent_class"):
                 parent_of[key] = (service, symbol["parent_class"])
-            # A short function is shown whole; a long one only by its
-            # best-matching chunk — the relevant slice, exactly the point of
-            # chunking. The exception is a service's best few matches, where
-            # the whole symbol is worth far more than a slice of it: the
-            # surrounding code is where a reader learns what actually calls
-            # this, and what it assumes.
-            limit = (
-                _TOP_SYMBOL_MAX_CHARS if rank < _TOP_SYMBOLS_SHOWN_WHOLE else _FULL_SOURCE_MAX_CHARS
-            )
+            # Whole source while this service's budget lasts, best match
+            # first; a chunk once it is spent. A chunk is the right unit for
+            # the supporting cast — showing the relevant slice of something
+            # peripheral is the point of chunking — and the wrong unit for
+            # the thing about to be edited, where the surrounding code is how
+            # a reader learns what calls it and what it assumes. Always whole
+            # below _FULL_SOURCE_MAX_CHARS, so a long tail of small matches
+            # still arrives intact after the budget runs out.
             source = symbol.get("source_snippet") or ""
-            snippet_map[key] = source if 0 < len(source) <= limit else hit["text"]
+            if 0 < len(source) <= _FULL_SOURCE_MAX_CHARS:
+                snippet_map[key] = source
+            elif 0 < len(source) <= whole_source_left:
+                snippet_map[key] = source
+                whole_source_left -= len(source)
+            else:
+                snippet_map[key] = hit["text"]
             reason = f"score {hit['score']:.3f}"
             if hit["identifiers"]:
                 reason += f", contains {', '.join(hit['identifiers'])}"

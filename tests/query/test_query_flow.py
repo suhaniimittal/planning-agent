@@ -277,52 +277,61 @@ async def test_a_large_class_is_not_pulled_in(graph):
 
 
 @pytest.mark.asyncio
-async def test_the_best_matches_are_shown_whole_even_when_long(graph):
+async def test_a_long_best_match_is_shown_whole_while_the_budget_lasts(graph):
     """A large component is the case the short-function rule handles worst.
     On a real ticket the component holding the bug was 12,135 characters, so
     the design saw one ~700-character chunk of it — and a review done with
-    the file open found four things inside the rest that it had missed."""
+    the file open found four things inside the rest that it had missed. It
+    ranked THIRD, behind two much smaller matches, which is why this is a
+    character budget and not a count of symbols."""
     graph.summary = {"ui": 0.9}
     graph.hits = {
         "ui": [
-            _hit("a.ts::first", 0.9),
-            _hit("b.ts::second", 0.89),
-            _hit("c.ts::third", 0.88),
+            _hit("a.ts::small", 0.9),
+            _hit("b.ts::tiny", 0.89),
+            _hit("c.ts::component", 0.88),
             _hit("gone.ts::stale", 0.87),
         ]
     }
-    big = "x" * 5000
-    graph.symbols[("ui", "a.ts::first")] = _fn("ui", "a.ts::first", source="short body")
-    graph.symbols[("ui", "b.ts::second")] = _fn("ui", "b.ts::second", source=big)
-    graph.symbols[("ui", "c.ts::third")] = _fn("ui", "c.ts::third", source=big)
+    component = "x" * 12135
+    graph.symbols[("ui", "a.ts::small")] = _fn("ui", "a.ts::small", source="short body")
+    graph.symbols[("ui", "b.ts::tiny")] = _fn("ui", "b.ts::tiny", source="tiny body")
+    graph.symbols[("ui", "c.ts::component")] = _fn("ui", "c.ts::component", source=component)
 
     await query_flow.build_tdd("issue", top_k=1, hops=0)
 
     snippets = graph.prompt["snippets"]
-    assert snippets[("ui", "a.ts::first")] == "short body"
-    # second-best: long, but within the top few, so shown whole
-    assert snippets[("ui", "b.ts::second")] == big
-    # beyond the top few: back to its best chunk
-    assert snippets[("ui", "c.ts::third")] == "chunk of c.ts::third"
+    assert snippets[("ui", "a.ts::small")] == "short body"
+    assert snippets[("ui", "b.ts::tiny")] == "tiny body"
+    # third by score, and long — a count of two would have missed it
+    assert snippets[("ui", "c.ts::component")] == component
     # a chunk whose function no longer exists is skipped, never fabricated
     assert [s["qualified_name"] for s in graph.prompt["code"]["ui"]] == [
-        "a.ts::first",
-        "b.ts::second",
-        "c.ts::third",
+        "a.ts::small",
+        "b.ts::tiny",
+        "c.ts::component",
     ]
 
 
 @pytest.mark.asyncio
-async def test_even_a_best_match_falls_back_to_its_chunk_when_enormous(graph):
+async def test_once_the_budget_is_spent_later_long_matches_fall_back_to_chunks(graph):
+    """Small matches still arrive whole afterwards — only the expensive ones
+    are affected, which is the point of budgeting characters."""
     graph.summary = {"ui": 0.9}
-    graph.hits = {"ui": [_hit("a.ts::huge", 0.9)]}
-    graph.symbols[("ui", "a.ts::huge")] = _fn(
-        "ui", "a.ts::huge", source="x" * (query_flow._TOP_SYMBOL_MAX_CHARS + 1)
-    )
+    graph.hits = {
+        "ui": [_hit("a.ts::big", 0.9), _hit("b.ts::also_big", 0.89), _hit("c.ts::small", 0.88)]
+    }
+    big = "x" * (query_flow._WHOLE_SOURCE_BUDGET_CHARS - 100)
+    graph.symbols[("ui", "a.ts::big")] = _fn("ui", "a.ts::big", source=big)
+    graph.symbols[("ui", "b.ts::also_big")] = _fn("ui", "b.ts::also_big", source=big)
+    graph.symbols[("ui", "c.ts::small")] = _fn("ui", "c.ts::small", source="small body")
 
     await query_flow.build_tdd("issue", top_k=1, hops=0)
 
-    assert graph.prompt["snippets"][("ui", "a.ts::huge")] == "chunk of a.ts::huge"
+    snippets = graph.prompt["snippets"]
+    assert snippets[("ui", "a.ts::big")] == big
+    assert snippets[("ui", "b.ts::also_big")] == "chunk of b.ts::also_big"
+    assert snippets[("ui", "c.ts::small")] == "small body"
 
 
 @pytest.mark.asyncio
