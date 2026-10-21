@@ -1072,7 +1072,6 @@ def _patch_run_dependencies(monkeypatch):
     monkeypatch.setattr(ingest, "sync_service", fake_sync_service)
     monkeypatch.setattr(ingest.code_graph_writer, "create_code_indexes", lambda: None)
     monkeypatch.setattr(ingest.code_graph_writer, "create_chunk_vector_index", lambda: None)
-    monkeypatch.setattr(ingest.code_graph_writer, "load_current_symbols", lambda name: ([], []))
 
     return calls
 

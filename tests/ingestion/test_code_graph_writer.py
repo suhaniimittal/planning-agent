@@ -263,41 +263,6 @@ def test_get_aggregated_file_references_returns_distinct_targets(monkeypatch):
     targets = code_graph_writer.get_aggregated_file_references("orders")
 
     assert targets == ["payment", "shipping"]
-
-
-def test_load_current_symbols_splits_by_kind(monkeypatch):
-    rows = [
-        {
-            "qualified_name": "a.py::A",
-            "name": "A",
-            "file_path": "a.py",
-            "language": "python",
-            "docstring": None,
-            "is_method": None,
-            "parent_class": None,
-            "kind": "Class",
-        },
-        {
-            "qualified_name": "a.py::fn",
-            "name": "fn",
-            "file_path": "a.py",
-            "language": "python",
-            "docstring": None,
-            "is_method": False,
-            "parent_class": None,
-            "kind": "Function",
-        },
-    ]
-    _patch_driver(monkeypatch, rows)
-
-    classes, functions = code_graph_writer.load_current_symbols("orders")
-
-    assert [c["name"] for c in classes] == ["A"]
-    assert [f["name"] for f in functions] == ["fn"]
-    assert "kind" not in classes[0]
-    assert "kind" not in functions[0]
-
-
 def test_upsert_chunks_writes_in_slices(monkeypatch):
     driver = _patch_driver(monkeypatch)
     monkeypatch.setattr(code_graph_writer, "_CHUNK_WRITE_BATCH", 2)

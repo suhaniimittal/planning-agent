@@ -316,31 +316,3 @@ def get_aggregated_file_references(service: str) -> list[str]:
             service=service,
         )
         return [r["target"] for r in result]
-
-
-def load_current_symbols(service: str) -> tuple[list[dict], list[dict]]:
-    """(classes, functions) currently in the graph for `service`, each a
-    plain dict of class/function rows — formerly used to rebuild a
-    service's summary digest WITHOUT a fresh RepoGraph (an incremental run
-    only reparses the files that changed, so it never has the service's
-    full symbol set in memory; this reads it back from Neo4j instead,
-    never from a repo clone)."""
-    with get_driver().session() as session:
-        result = session.run(
-            """
-            MATCH (n)
-            WHERE (n:Class OR n:Function) AND n.service = $service
-            RETURN n.qualified_name AS qualified_name, n.name AS name,
-                   n.file_path AS file_path, n.language AS language,
-                   n.docstring AS docstring, n.is_method AS is_method,
-                   n.parent_class AS parent_class, labels(n)[0] AS kind
-            """,
-            service=service,
-        )
-        classes: list[dict] = []
-        functions: list[dict] = []
-        for record in result:
-            row = dict(record)
-            kind = row.pop("kind")
-            (classes if kind == "Class" else functions).append(row)
-        return classes, functions
