@@ -26,6 +26,24 @@ _FULL_SOURCE_MAX_CHARS = 1500
 # is ~7,400 chars), small enough that it cannot crowd out other services.
 _FULL_CLASS_MAX_CHARS = 8000
 
+# The best-matching symbols in a service are shown WHOLE even when they are
+# far too long for the rule above, up to this much.
+#
+# A large component is exactly the case the 1,500 rule handles worst. On a
+# real ticket the component holding the bug was 12,135 characters, so the
+# planner saw one ~700-character chunk of it and nothing else. A review done
+# with the file open then found four things the design had missed — that the
+# blur handler fires even when nothing was edited, that the callback it uses
+# is internal and cannot be asserted on, that the view dereferences a field
+# with no null check, and that an input is gated behind a prop — every one
+# of them inside those 12,135 characters, and none of them in the chunk.
+#
+# Only the top few per service, because this is the expensive setting: the
+# rest of a service's matches keep the 1,500 rule, and anything over the
+# limit still falls back to its chunk.
+_TOP_SYMBOLS_SHOWN_WHOLE = 2
+_TOP_SYMBOL_MAX_CHARS = 16000
+
 
 def _print_selection_debug(
     candidate_names: list[str],
@@ -250,7 +268,7 @@ async def build_tdd(
     selection_log: list[dict] = []
     parent_of: dict[tuple[str, str], tuple[str, str]] = {}
     for service in selected:
-        for hit in ranked_by_service[service]:
+        for rank, hit in enumerate(ranked_by_service[service]):
             key = (service, hit["function_qualified_name"])
             symbol = by_key.get(key)
             if symbol is None:
@@ -261,9 +279,15 @@ async def build_tdd(
                 parent_of[key] = (service, symbol["parent_class"])
             # A short function is shown whole; a long one only by its
             # best-matching chunk — the relevant slice, exactly the point of
-            # chunking.
+            # chunking. The exception is a service's best few matches, where
+            # the whole symbol is worth far more than a slice of it: the
+            # surrounding code is where a reader learns what actually calls
+            # this, and what it assumes.
+            limit = (
+                _TOP_SYMBOL_MAX_CHARS if rank < _TOP_SYMBOLS_SHOWN_WHOLE else _FULL_SOURCE_MAX_CHARS
+            )
             source = symbol.get("source_snippet") or ""
-            snippet_map[key] = source if 0 < len(source) <= _FULL_SOURCE_MAX_CHARS else hit["text"]
+            snippet_map[key] = source if 0 < len(source) <= limit else hit["text"]
             reason = f"score {hit['score']:.3f}"
             if hit["identifiers"]:
                 reason += f", contains {', '.join(hit['identifiers'])}"

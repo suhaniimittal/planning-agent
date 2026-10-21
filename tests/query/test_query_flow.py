@@ -277,19 +277,52 @@ async def test_a_large_class_is_not_pulled_in(graph):
 
 
 @pytest.mark.asyncio
-async def test_short_functions_are_shown_whole_and_long_ones_by_their_chunk(graph):
+async def test_the_best_matches_are_shown_whole_even_when_long(graph):
+    """A large component is the case the short-function rule handles worst.
+    On a real ticket the component holding the bug was 12,135 characters, so
+    the design saw one ~700-character chunk of it — and a review done with
+    the file open found four things inside the rest that it had missed."""
     graph.summary = {"ui": 0.9}
-    graph.hits = {"ui": [_hit("a.ts::short", 0.9), _hit("b.ts::long", 0.89), _hit("gone.ts::stale", 0.88)]}
-    graph.symbols[("ui", "a.ts::short")] = _fn("ui", "a.ts::short", source="short body")
-    graph.symbols[("ui", "b.ts::long")] = _fn("ui", "b.ts::long", source="x" * 5000)
+    graph.hits = {
+        "ui": [
+            _hit("a.ts::first", 0.9),
+            _hit("b.ts::second", 0.89),
+            _hit("c.ts::third", 0.88),
+            _hit("gone.ts::stale", 0.87),
+        ]
+    }
+    big = "x" * 5000
+    graph.symbols[("ui", "a.ts::first")] = _fn("ui", "a.ts::first", source="short body")
+    graph.symbols[("ui", "b.ts::second")] = _fn("ui", "b.ts::second", source=big)
+    graph.symbols[("ui", "c.ts::third")] = _fn("ui", "c.ts::third", source=big)
 
     await query_flow.build_tdd("issue", top_k=1, hops=0)
 
     snippets = graph.prompt["snippets"]
-    assert snippets[("ui", "a.ts::short")] == "short body"
-    assert snippets[("ui", "b.ts::long")] == "chunk of b.ts::long"
+    assert snippets[("ui", "a.ts::first")] == "short body"
+    # second-best: long, but within the top few, so shown whole
+    assert snippets[("ui", "b.ts::second")] == big
+    # beyond the top few: back to its best chunk
+    assert snippets[("ui", "c.ts::third")] == "chunk of c.ts::third"
     # a chunk whose function no longer exists is skipped, never fabricated
-    assert [s["qualified_name"] for s in graph.prompt["code"]["ui"]] == ["a.ts::short", "b.ts::long"]
+    assert [s["qualified_name"] for s in graph.prompt["code"]["ui"]] == [
+        "a.ts::first",
+        "b.ts::second",
+        "c.ts::third",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_even_a_best_match_falls_back_to_its_chunk_when_enormous(graph):
+    graph.summary = {"ui": 0.9}
+    graph.hits = {"ui": [_hit("a.ts::huge", 0.9)]}
+    graph.symbols[("ui", "a.ts::huge")] = _fn(
+        "ui", "a.ts::huge", source="x" * (query_flow._TOP_SYMBOL_MAX_CHARS + 1)
+    )
+
+    await query_flow.build_tdd("issue", top_k=1, hops=0)
+
+    assert graph.prompt["snippets"][("ui", "a.ts::huge")] == "chunk of a.ts::huge"
 
 
 @pytest.mark.asyncio
