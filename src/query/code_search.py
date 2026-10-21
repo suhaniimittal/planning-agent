@@ -101,6 +101,22 @@ def issue_identifiers(issue_text: str) -> list[str]:
     return sorted(found)
 
 
+def symbol_identifiers(source: str) -> list[str]:
+    """The camelCase/PascalCase names a symbol's own source mentions.
+
+    Used to find the tests that exercise that symbol. issue_identifiers()
+    cannot do this job: it reads the TICKET, and a real ticket is written in
+    English. "ATS Link CC email addresses changes semi-colon to comma"
+    yields no identifiers at all, so a lookup keyed on the ticket's
+    identifiers had nothing to search with. The symbol's source always names
+    the fields it touches, and a test that exercises the symbol names them
+    too — handleCcEmailAddressesBlur reads
+    `sendReportRequestedLinkCcEmailAddresses`, and so do the three specs
+    that cover it.
+    """
+    return sorted(set(_IDENTIFIER.findall(source or "")))
+
+
 def rank_functions(
     hits: list[dict],
     max_functions: int = 20,

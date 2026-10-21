@@ -80,6 +80,24 @@ def _print_selection_debug(
             print(f"      - [{e['kind']}] {e['name']} — {e['reason']} ({snippet_tag})")
 
 
+# How many terms one symbol is looked up by. A long function mentions
+# dozens of names, and each one costs a scan of its service's spec files,
+# so the longest are kept: a long identifier is a specific one
+# (sendReportRequestedLinkCcEmailAddresses, 39 chars, matches 3 spec files),
+# while the short ones are the generic names every file shares.
+_MAX_TEST_LOOKUP_TERMS = 12
+
+
+def _test_lookup_terms(source: str, issue_identifiers: list[str]) -> list[str]:
+    """What to search the test files for, to find the tests covering a symbol
+    whose own name no test ever mentions."""
+    terms = set(code_search.symbol_identifiers(source))
+    # A ticket that DOES quote a name or a UI label is a strong signal, but
+    # only where the symbol genuinely touches it.
+    terms.update(word for word in issue_identifiers if word in source)
+    return sorted(sorted(terms, key=len, reverse=True)[:_MAX_TEST_LOOKUP_TERMS])
+
+
 def _referenced_service_names(tdd: TechnicalDesignDoc) -> list[str]:
     """Every service name the LLM actually touched: services it proposed
     changes for, plus anything it named as a dependency source/target in
@@ -330,28 +348,23 @@ async def build_tdd(
     # no test exists has a new one written from scratch instead of the real one
     # edited.
     #
-    # Each symbol is looked up by its own name AND by the issue identifiers
-    # that appear in its own source. The name alone finds nothing on a UI
-    # project — no test in the ui repo contains "AtsIntegrationSectionView"
-    # or "handleCcEmailAddressesBlur", because a component is rendered
-    # through a wrapper and a handler is never named, while four tests
-    # contain the field the ticket is about. Requiring the identifier to be
-    # in the symbol's own source keeps the attribution honest: a test is
-    # attached only when it names something this symbol genuinely touches.
+    # Each symbol is looked up by the identifiers its OWN SOURCE mentions,
+    # plus any issue identifier that appears there. The name alone finds
+    # nothing on a UI project — no test contains "AtsIntegrationSectionView"
+    # or "handleCcEmailAddressesBlur", because a component renders through a
+    # wrapper and a handler is never named — and the ticket alone finds
+    # nothing either, because a real ticket is English prose: "ATS Link CC
+    # email addresses changes semi-colon to comma" yields no identifiers at
+    # all. What does work is the field the handler reads,
+    # sendReportRequestedLinkCcEmailAddresses, which is in its source and in
+    # the three specs that cover it.
     tests_by_symbol = graph_reader.tests_naming(
         [
-            (
-                service,
-                symbol["name"],
-                [
-                    word
-                    for word in identifiers
-                    if word in (snippet_map.get((service, symbol["qualified_name"])) or "")
-                ],
-            )
+            (service, symbol["name"], _test_lookup_terms(source, identifiers))
             for service, symbols_ in code_symbols_by_service.items()
             for symbol in symbols_
             if symbol.get("name")
+            for source in [snippet_map.get((service, symbol["qualified_name"])) or ""]
         ]
     )
     # Their actual text, so the planner copies a fixture that works instead

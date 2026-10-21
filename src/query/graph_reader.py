@@ -478,8 +478,14 @@ def new_test_path(file_path: str, infix: str) -> str | None:
     return f"{folder}/{stem}{infix}{ext}" if folder else f"{stem}{infix}{ext}"
 
 
+# A term in more spec files than this is describing an area, not a symbol.
+_MAX_SPEC_FILES_PER_TERM = 10
+
+
 def tests_naming(
-    service_symbol_terms: list[tuple[str, str, list[str]]], limit: int = 4
+    service_symbol_terms: list[tuple[str, str, list[str]]],
+    limit: int = 4,
+    max_files: int = _MAX_SPEC_FILES_PER_TERM,
 ) -> dict[tuple[str, str], list[str]]:
     """{(service, symbol): [test file paths naming that symbol or one of its
     terms]}.
@@ -491,17 +497,28 @@ def tests_naming(
     existed and had a brand-new one written — which then has to invent every
     import, since imports are not ingested.
 
-    `terms` are the issue's identifiers that appear in THIS symbol's own
-    source, and they exist because the symbol name alone finds nothing on a
-    UI project. Measured on the ATS CC-email ticket: no test file in the
-    repository contains "AtsIntegrationSectionView" or
-    "handleCcEmailAddressesBlur", because a component is rendered through a
-    wrapper and a handler is never named; four test files contain
-    "sendReportRequestedLinkCcEmailAddresses", the field the ticket is
-    actually about, and those four hold the working fixture. Requiring the
-    term to appear in the symbol's own source is what keeps this attribution
-    honest — a test is attached to a symbol only when it names something
-    that symbol genuinely touches, not merely something the ticket mentions.
+    `terms` are the identifiers THIS symbol's own source mentions, and they
+    exist because the symbol name alone finds nothing on a UI project. No
+    test file in the repository contains "AtsIntegrationSectionView" or
+    "handleCcEmailAddressesBlur" — a component renders through a wrapper and
+    a handler is never named — while three contain
+    `sendReportRequestedLinkCcEmailAddresses`, the field the handler reads,
+    and those three hold the working fixture.
+
+    Taking the terms from the SYMBOL rather than from the ticket is the
+    whole point. A real ticket is written in English: "ATS Link CC email
+    addresses changes semi-colon to comma" yields no identifiers at all, so
+    a lookup keyed on the ticket had nothing to search with and fell back to
+    reporting that no test existed.
+
+    A term matching more than `max_files` specs in its service is dropped as
+    too common to identify anything — the same idea as
+    rank_functions' `max_identifier_hits`. Measured over ui's 1,105 spec
+    files: sendReportRequestedLinkCcEmailAddresses 3, atsIntegration 5,
+    candidateId 11, handleSubmit 60, reportNumber 117, SetupComponentBuilder
+    260, React 1,013. Real signal sits at or below a handful and noise
+    starts around sixty, so anything in that gap works; the default sits
+    near the signal end of it.
 
     A plain CONTAINS, not a vector search: this runs AFTER the files to
     change are chosen, so it cannot take a result slot from real code
@@ -542,14 +559,18 @@ def tests_naming(
         rows = session.run(
             """
             UNWIND $lookups AS lookup
+            UNWIND lookup.terms AS term
             MATCH (f:File {service: lookup.service})
             WHERE f.file_path =~ $spec_re
-              AND any(term IN lookup.terms WHERE coalesce(f.source, '') CONTAINS term)
-            RETURN lookup.service AS service, lookup.symbol AS symbol,
-                   f.file_path AS file_path
+              AND coalesce(f.source, '') CONTAINS term
+            WITH lookup, term, collect(f.file_path) AS paths
+            WHERE size(paths) <= $max_files
+            UNWIND paths AS file_path
+            RETURN lookup.service AS service, lookup.symbol AS symbol, file_path
             """,
             lookups=lookups,
             spec_re=CYPHER_SPEC_FILE_RE,
+            max_files=max_files,
         )
         found: dict[tuple[str, str], set[str]] = {}
         for row in rows:

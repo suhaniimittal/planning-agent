@@ -503,3 +503,35 @@ async def test_an_identifier_absent_from_a_symbol_is_not_attributed_to_it(graph)
 
     lookups = [c[1] for c in graph.calls if c[0] == "tests_naming"][0]
     assert lookups == [("ui", "unrelatedThing", [])]
+
+
+def test_lookup_terms_come_from_the_symbol_not_the_ticket():
+    """"ATS Link CC email addresses changes semi-colon to comma" yields no
+    identifiers, so a lookup keyed on the ticket had nothing to search."""
+    source = "atsIntegration.sendReportRequestedLinkCcEmailAddresses.split(/[;,]+/)"
+
+    terms = query_flow._test_lookup_terms(source, [])
+
+    assert "sendReportRequestedLinkCcEmailAddresses" in terms
+
+
+def test_lookup_terms_keep_a_ticket_identifier_the_symbol_touches():
+    terms = query_flow._test_lookup_terms("const x = reportNumber;", ["reportNumber"])
+    assert "reportNumber" in terms
+
+
+def test_lookup_terms_drop_a_ticket_identifier_the_symbol_never_touches():
+    terms = query_flow._test_lookup_terms("const x = 1;", ["reportNumber"])
+    assert terms == []
+
+
+def test_lookup_terms_keep_the_longest_when_a_symbol_names_many():
+    """Each term costs a scan of the service's spec files, and a long name
+    is the specific one."""
+    source = " ".join(f"name{'x' * n}Thing" for n in range(1, 30))
+
+    terms = query_flow._test_lookup_terms(source, [])
+
+    assert len(terms) == query_flow._MAX_TEST_LOOKUP_TERMS
+    assert f"name{'x' * 29}Thing" in terms
+    assert "namexThing" not in terms

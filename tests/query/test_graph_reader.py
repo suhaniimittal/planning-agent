@@ -416,3 +416,16 @@ def test_load_test_sources_returns_the_stored_text_per_file(monkeypatch):
 
 def test_load_test_sources_asks_nothing_for_an_empty_list(monkeypatch):
     assert graph_reader.load_test_sources([]) == {}
+
+
+def test_tests_naming_drops_a_term_that_matches_too_many_specs(monkeypatch):
+    """Measured over ui's 1,105 spec files: the field this ticket is about
+    matches 3, while React matches 1,013 and SetupComponentBuilder 260. A
+    term that common identifies an area, not a symbol."""
+    driver = _patch_driver(monkeypatch, [])
+
+    graph_reader.tests_naming([("ui", "X", ["React"])], max_files=10)
+
+    query = driver._session.last_query
+    assert "WHERE size(paths) <= $max_files" in query
+    assert driver._session.last_params["max_files"] == 10

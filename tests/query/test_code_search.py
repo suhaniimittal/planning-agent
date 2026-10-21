@@ -148,3 +148,25 @@ def test_issue_queries_always_leads_with_the_whole_ticket():
         "Second one, also long enough."
     )
     assert code_search.issue_queries(text)[0] == text.strip()
+
+
+def test_symbol_identifiers_reads_the_names_a_symbol_touches():
+    """A real ticket is English prose and yields no identifiers at all, so
+    the tests covering a symbol have to be found from the symbol itself."""
+    source = (
+        'const trimmed = atsIntegration.sendReportRequestedLinkCcEmailAddresses\n'
+        '  .split(/[;,]+/).map((email) => email.trim()).join(",");\n'
+        "atsIntegrationChange({ sendReportRequestedLinkCcEmailAddresses: trimmed });"
+    )
+
+    found = code_search.symbol_identifiers(source)
+
+    assert "sendReportRequestedLinkCcEmailAddresses" in found
+    assert "atsIntegrationChange" in found
+    # plain lowercase words are every file's vocabulary, not this symbol's
+    assert "trimmed" not in found
+    assert "email" not in found
+
+
+def test_symbol_identifiers_of_empty_source_is_empty():
+    assert code_search.symbol_identifiers("") == []
