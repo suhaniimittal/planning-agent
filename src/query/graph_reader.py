@@ -274,7 +274,7 @@ def summary_scores(embedding: list[float], names: list[str] | None = None) -> di
 
 
 def search_service_chunks(
-    service: str, vectors: list[list[float]], identifiers: list[str], k: int = 20
+    service: str, vectors: list[list[float]], identifiers: list[str], k: int = 50
 ) -> list[dict]:
     """One service's best-matching NON-TEST chunks, searched within that
     service only — so a large service can never crowd a small one out.
@@ -285,6 +285,15 @@ def search_service_chunks(
     Two reads, merged: the top `k` by that score, plus every chunk
     containing one of `identifiers` (exact code names from the issue text),
     whatever its score.
+
+    `k` is close to a count of candidate FUNCTIONS, not of chunks: 93% of
+    functions are short enough to be a single chunk, so measured on this
+    graph 20 chunks yielded 17-22 distinct functions and 50 yielded ~43.
+    It is also nearly free to raise — the scan already computes a score for
+    every chunk in the service, and LIMIT only truncates the sorted output
+    (measured: k=20 and k=300 both ~3.5s on 36k chunks). What costs is
+    code_search.rank_functions' cap, which decides how much source reaches
+    the prompt.
 
     Returns [{"function_qualified_name", "text", "score", "identifiers"}].
     """

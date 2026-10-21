@@ -103,7 +103,7 @@ def issue_identifiers(issue_text: str) -> list[str]:
 
 def rank_functions(
     hits: list[dict],
-    max_functions: int = 12,
+    max_functions: int = 20,
     keep_within: float = 0.12,
     identifier_bonus: float = 0.08,
     max_identifier_hits: int = 25,
