@@ -444,6 +444,49 @@ def new_test_path(file_path: str, infix: str) -> str | None:
     return f"{folder}/{stem}{infix}{ext}" if folder else f"{stem}{infix}{ext}"
 
 
+def tests_naming(
+    service_symbol_pairs: list[tuple[str, str]], limit: int = 4
+) -> dict[tuple[str, str], list[str]]:
+    """{(service, symbol): [test file paths whose text names that symbol]}.
+
+    load_sibling_tests only looks in the SAME FOLDER, which misses the test
+    on any project that separates them. Observed on a real ticket: the file
+    to change was under src/common/, five test files covering it were under
+    src/apps/, the sibling lookup found none, and the design said no test
+    existed and had a brand-new one written — which then has to invent every
+    import, since imports are not ingested.
+
+    A plain CONTAINS on the symbol name, not a vector search: this runs AFTER
+    the files to change are chosen, so it cannot take a result slot from real
+    code (search_service_chunks excludes test chunks for exactly that reason
+    — test prose echoes a ticket's wording and outscores the code it tests).
+    Paths only, never the test source, same as load_sibling_tests.
+    """
+    if not service_symbol_pairs:
+        return {}
+    lookups = [{"service": s, "symbol": sym} for s, sym in service_symbol_pairs if sym]
+    if not lookups:
+        return {}
+    with get_driver().session() as session:
+        rows = session.run(
+            """
+            UNWIND $lookups AS lookup
+            MATCH (c:Chunk {service: lookup.service})
+            WHERE coalesce(c.is_test, c.file_path =~ $test_re)
+              AND c.text CONTAINS lookup.symbol
+            MATCH (f:Function)-[:HAS_CHUNK]->(c)
+            RETURN lookup.service AS service, lookup.symbol AS symbol,
+                   split(f.qualified_name, '::')[0] AS file_path
+            """,
+            lookups=lookups,
+            test_re=CYPHER_TEST_PATH_RE,
+        )
+        found: dict[tuple[str, str], set[str]] = {}
+        for row in rows:
+            found.setdefault((row["service"], row["symbol"]), set()).add(row["file_path"])
+    return {key: sorted(paths)[:limit] for key, paths in found.items()}
+
+
 def load_sibling_tests(
     service_file_pairs: list[tuple[str, str]],
 ) -> dict[tuple[str, str], list[str]]:

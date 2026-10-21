@@ -323,3 +323,37 @@ def test_a_service_with_no_doc_scores_zero_rather_than_vanishing(monkeypatch):
     query = driver._session.last_query
     assert "s.doc_embedding IS NULL THEN 0.0" in query
     assert "WHERE s.doc_embedding IS NOT NULL" not in query
+
+
+def test_tests_naming_finds_tests_by_content_not_by_folder(monkeypatch):
+    """The sibling lookup only sees the same folder. On a project that keeps
+    src/common/ apart from src/apps/ that finds nothing, and a design that
+    believes no test exists has a new one written from scratch."""
+    driver = _patch_driver(
+        monkeypatch,
+        [
+            {"service": "ui", "symbol": "handleCcEmailAddressesBlur",
+             "file_path": "src/apps/internal/.../ApplicationSettingsTab/view.data.test.tsx"},
+            {"service": "ui", "symbol": "handleCcEmailAddressesBlur",
+             "file_path": "src/apps/client/.../AtsIntegrationSettings/view.test.tsx"},
+        ],
+    )
+
+    found = graph_reader.tests_naming([("ui", "handleCcEmailAddressesBlur")])
+
+    assert found == {
+        ("ui", "handleCcEmailAddressesBlur"): [
+            "src/apps/client/.../AtsIntegrationSettings/view.test.tsx",
+            "src/apps/internal/.../ApplicationSettingsTab/view.data.test.tsx",
+        ]
+    }
+    query = driver._session.last_query
+    # only test chunks, and a plain name match — this runs after the files to
+    # change are chosen, so it can never take a slot from real code
+    assert "coalesce(c.is_test" in query
+    assert "c.text CONTAINS lookup.symbol" in query
+
+
+def test_tests_naming_asks_nothing_when_there_are_no_symbols(monkeypatch):
+    assert graph_reader.tests_naming([]) == {}
+    assert graph_reader.tests_naming([("ui", "")]) == {}

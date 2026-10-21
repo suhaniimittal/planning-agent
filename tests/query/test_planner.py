@@ -868,10 +868,22 @@ def test_prompt_treats_a_sibling_test_file_as_a_contradiction_risk():
     assert "never quote a test, name a test function" in prompt
 
 
-def test_prompt_does_not_read_absence_of_a_sibling_test_as_untested():
+def test_prompt_does_not_read_absence_of_a_test_as_untested():
+    """Two lookups can miss a test — the same-folder one and the by-name one
+    — so silence from both still is not proof that nothing covers it."""
     prompt = build_system_prompt("bug")
+    assert "no test file sits beside it AND names no test" in prompt
     assert "do not conclude it is untested" in prompt
-    assert "tests may live elsewhere in the project" in prompt
+    assert "a test may still exist that never names it directly" in prompt
+
+
+def test_prompt_prefers_an_existing_test_over_a_new_one():
+    """A new test file is written from nothing, imports included — and the
+    existing one very likely asserts the behaviour being changed."""
+    prompt = build_system_prompt("bug")
+    assert "AN EXISTING TEST IS ALWAYS PREFERRED OVER A NEW ONE" in prompt
+    assert "Existing test files that mention this symbol by name" in prompt
+    assert "code that did not exist cannot already be tested" in prompt
 
 
 def test_self_check_covers_test_work():
@@ -955,3 +967,27 @@ def test_a_service_with_no_measured_convention_still_just_says_there_is_no_test(
     )
     assert "No test file sits beside this one in its folder." in prompt
     assert "belongs at" not in prompt
+
+
+def test_a_symbol_lists_the_tests_that_name_it_wherever_they_live():
+    """Five test files covered a real component from another tree; the
+    same-folder lookup found none, so the design had a new test written
+    from scratch instead of the real one edited."""
+    path = "src/common/.../AtsIntegrationSection/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        sibling_tests={("ui", path): []},
+        tests_by_symbol={("ui", "X"): ["src/apps/internal/.../view.data.test.tsx"]},
+    )
+    assert "Existing test files that mention this symbol by name:" in prompt
+    assert "src/apps/internal/.../view.data.test.tsx" in prompt
+
+
+def test_nothing_is_claimed_when_no_test_names_the_symbol():
+    path = "a/b/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        sibling_tests={("ui", path): []},
+        tests_by_symbol={},
+    )
+    assert "mention this symbol by name" not in prompt

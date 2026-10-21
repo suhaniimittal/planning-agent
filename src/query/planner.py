@@ -628,6 +628,21 @@ def build_system_prompt(mode: str = "bug") -> str:
         "the test must assert instead. You were given that file's PATH and "
         "never its contents, so do not name a test function or state what "
         "it currently asserts.\n\n"
+        "AN EXISTING TEST IS ALWAYS PREFERRED OVER A NEW ONE. A symbol may "
+        "list 'Existing test files that mention this symbol by name'. Those "
+        "already exercise it, wherever in the project they live, and one of "
+        "them is where its behaviour is asserted today. When your change "
+        "alters what that symbol does observably, MODIFY one of those files "
+        '— a change with that `file_path` and `change_type` "modify" — '
+        "rather than creating a new test file beside the code.\n\n"
+        "Creating one instead is not a neutral choice. A new test file has "
+        "to be written from nothing, including every import, while an "
+        "existing one is edited in place with its imports already correct. "
+        "And the existing file very likely asserts the behaviour you are "
+        "changing, so leaving it untouched breaks it.\n\n"
+        "Create a new test file only when no existing test names the symbol "
+        "at all, which is the normal case for a symbol you are creating: "
+        "code that did not exist cannot already be tested.\n\n"
         "WHEN A SYMBOL NAMES WHERE A NEW TEST BELONGS, WRITE THE TEST "
         "THERE. A symbol with no test beside it may still say where one "
         'would go ("a new test for it belongs at ...") — that path was '
@@ -642,8 +657,9 @@ def build_system_prompt(mode: str = "bug") -> str:
         "so the test silently never gets written. Put the question of "
         "where this project keeps tests for that code into "
         "`open_questions` instead.\n\n"
-        "When a symbol says no test file sits beside it, do not conclude it "
-        "is untested: tests may live elsewhere in the project. Treat it as "
+        "When a symbol says no test file sits beside it AND names no test "
+        "that mentions it, do not conclude it is untested: a test may still "
+        "exist that never names it directly. Treat it as "
         "unknown, and put the question of where this project keeps tests for "
         "that code into `open_questions`.\n\n"
         "For every change, `implementation_notes` states which of these is "
@@ -760,6 +776,7 @@ def _format_code_symbol(
     file_neighbors: list[str] | None = None,
     tests_beside: list[str] | None = None,
     new_test_path: str | None = None,
+    tests_naming_it: list[str] | None = None,
 ) -> str:
     location = f"{symbol['file_path']}:{symbol['line_start']}-{symbol['line_end']}"
     line = f"- `{location}` `{symbol['qualified_name']}` — `{symbol['signature']}`"
@@ -791,6 +808,11 @@ def _format_code_symbol(
             )
         else:
             line += "\n  No test file sits beside this one in its folder."
+    if tests_naming_it:
+        # Wherever they live — the sibling lookup above only sees the same
+        # folder, and on this project the tests are usually somewhere else.
+        named = ", ".join(f"`{t}`" for t in tests_naming_it)
+        line += f"\n  Existing test files that mention this symbol by name: {named}"
     if snippet:
         line += f"\n  ```{symbol.get('language') or ''}\n{snippet}\n  ```"
     return line
@@ -806,6 +828,7 @@ def build_user_prompt(
     file_context: dict[tuple[str, str], list[str]] | None = None,
     sibling_tests: dict[tuple[str, str], list[str]] | None = None,
     new_test_paths: dict[tuple[str, str], str] | None = None,
+    tests_by_symbol: dict[tuple[str, str], list[str]] | None = None,
 ) -> str:
     """`known_dependencies`: real CALLS edges among the candidate services,
     read from the graph BEFORE the LLM call — shown here as confirmed
@@ -838,6 +861,7 @@ def build_user_prompt(
     file_context = file_context or {}
     sibling_tests = sibling_tests or {}
     new_test_paths = new_test_paths or {}
+    tests_by_symbol = tests_by_symbol or {}
 
     sections = [f"## Issue\n{issue_text}\n"]
 
@@ -889,6 +913,7 @@ def build_user_prompt(
                     file_context.get((doc["name"], symbol["file_path"])),
                     sibling_tests.get((doc["name"], symbol["file_path"])),
                     new_test_paths.get((doc["name"], symbol["file_path"])),
+                    tests_by_symbol.get((doc["name"], symbol["name"])),
                 )
                 for symbol in code_symbols
             ]

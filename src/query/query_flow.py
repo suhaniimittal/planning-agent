@@ -290,6 +290,19 @@ async def build_tdd(
     # Paths only, looked up AFTER the files are chosen — test code still never
     # competes in the search (see graph_reader.load_sibling_tests).
     sibling_tests = graph_reader.load_sibling_tests(shown_files)
+    # Tests that NAME a symbol being changed, wherever they live. The sibling
+    # lookup above only sees the same folder, which finds nothing on a project
+    # that keeps src/common/ apart from src/apps/ — and a design that believes
+    # no test exists has a new one written from scratch instead of the real one
+    # edited.
+    tests_by_symbol = graph_reader.tests_naming(
+        [
+            (service, symbol["name"])
+            for service, symbols_ in code_symbols_by_service.items()
+            for symbol in symbols_
+            if symbol.get("name")
+        ]
+    )
     # Where a NEW test would go, for the shown files that have none beside
     # them. Only for services whose tests demonstrably sit beside their
     # code — a service with a mirrored test tree gets nothing here rather
@@ -314,6 +327,7 @@ async def build_tdd(
         known_dependencies=known_dependencies,
         file_context=file_context,
         sibling_tests=sibling_tests,
+        tests_by_symbol=tests_by_symbol,
         new_test_paths=new_test_paths,
     )
 
