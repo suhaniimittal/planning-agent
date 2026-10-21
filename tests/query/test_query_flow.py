@@ -50,6 +50,7 @@ class FakeGraph:
         self.test_conventions = {}
         self.tests_by_symbol = {}
         self.file_imports = {}
+        self.test_sources = {}
         self.calls = []
         self.prompt = {}
         self.tdd = FakeTdd()
@@ -107,6 +108,10 @@ def graph(monkeypatch):
         g.calls.append(("load_file_imports", list(pairs)))
         return g.file_imports
 
+    def load_test_sources(pairs):
+        g.calls.append(("load_test_sources", list(pairs)))
+        return g.test_sources
+
     def build_user_prompt(issue_text, docs, code_symbols_by_service=None, snippets_by_key=None, **kwargs):
         g.prompt = {
             "docs": [d["name"] for d in docs],
@@ -132,6 +137,7 @@ def graph(monkeypatch):
         "test_naming_conventions": test_naming_conventions,
         "tests_naming": tests_naming,
         "load_file_imports": load_file_imports,
+        "load_test_sources": load_test_sources,
     }.items():
         monkeypatch.setattr(query_flow.graph_reader, name, fn)
     monkeypatch.setattr(query_flow.planner, "build_system_prompt", lambda mode=None: "system")
@@ -453,3 +459,47 @@ async def test_hops_above_two_are_capped(graph):
     graph.summary = {"orders": 0.9}
     await query_flow.build_tdd("issue", top_k=1, hops=5)
     assert ("expand_neighbors", ["orders"], 2) in graph.calls
+
+
+@pytest.mark.asyncio
+async def test_tests_are_looked_up_by_the_identifiers_a_symbol_touches(graph):
+    """The symbol name alone finds nothing on a UI project: no test in the
+    repo names the component or its handler, because a component is rendered
+    through a wrapper. Four tests name the field the ticket is about."""
+    graph.summary = {"ui": 0.9}
+    qname = "src/m/view.tsx::AtsIntegrationSectionView"
+    graph.hits = {"ui": [_hit(qname, 0.9)]}
+    graph.symbols[("ui", qname)] = _fn(
+        "ui", qname, source="const x = settings.sendReportRequestedLinkCcEmailAddresses;"
+    )
+
+    await query_flow.build_tdd(
+        "CC email addresses in sendReportRequestedLinkCcEmailAddresses use a comma",
+        top_k=1,
+        hops=0,
+    )
+
+    lookups = [c[1] for c in graph.calls if c[0] == "tests_naming"][0]
+    assert lookups == [
+        ("ui", "AtsIntegrationSectionView", ["sendReportRequestedLinkCcEmailAddresses"])
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_identifier_absent_from_a_symbol_is_not_attributed_to_it(graph):
+    """A ticket's identifier only earns a test lookup when the symbol being
+    changed genuinely touches it — otherwise every symbol in the service
+    would be handed the same tests."""
+    graph.summary = {"ui": 0.9}
+    qname = "src/m/other.tsx::unrelatedThing"
+    graph.hits = {"ui": [_hit(qname, 0.9)]}
+    graph.symbols[("ui", qname)] = _fn("ui", qname, source="const y = 1;")
+
+    await query_flow.build_tdd(
+        "CC email addresses in sendReportRequestedLinkCcEmailAddresses use a comma",
+        top_k=1,
+        hops=0,
+    )
+
+    lookups = [c[1] for c in graph.calls if c[0] == "tests_naming"][0]
+    assert lookups == [("ui", "unrelatedThing", [])]

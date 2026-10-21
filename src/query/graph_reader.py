@@ -479,9 +479,10 @@ def new_test_path(file_path: str, infix: str) -> str | None:
 
 
 def tests_naming(
-    service_symbol_pairs: list[tuple[str, str]], limit: int = 4
+    service_symbol_terms: list[tuple[str, str, list[str]]], limit: int = 4
 ) -> dict[tuple[str, str], list[str]]:
-    """{(service, symbol): [test file paths whose text names that symbol]}.
+    """{(service, symbol): [test file paths naming that symbol or one of its
+    terms]}.
 
     load_sibling_tests only looks in the SAME FOLDER, which misses the test
     on any project that separates them. Observed on a real ticket: the file
@@ -490,15 +491,34 @@ def tests_naming(
     existed and had a brand-new one written — which then has to invent every
     import, since imports are not ingested.
 
-    A plain CONTAINS on the symbol name, not a vector search: this runs AFTER
-    the files to change are chosen, so it cannot take a result slot from real
-    code (search_service_chunks excludes test chunks for exactly that reason
-    — test prose echoes a ticket's wording and outscores the code it tests).
-    Paths only, never the test source, same as load_sibling_tests.
+    `terms` are the issue's identifiers that appear in THIS symbol's own
+    source, and they exist because the symbol name alone finds nothing on a
+    UI project. Measured on the ATS CC-email ticket: no test file in the
+    repository contains "AtsIntegrationSectionView" or
+    "handleCcEmailAddressesBlur", because a component is rendered through a
+    wrapper and a handler is never named; four test files contain
+    "sendReportRequestedLinkCcEmailAddresses", the field the ticket is
+    actually about, and those four hold the working fixture. Requiring the
+    term to appear in the symbol's own source is what keeps this attribution
+    honest — a test is attached to a symbol only when it names something
+    that symbol genuinely touches, not merely something the ticket mentions.
+
+    A plain CONTAINS, not a vector search: this runs AFTER the files to
+    change are chosen, so it cannot take a result slot from real code
+    (search_service_chunks excludes test chunks for exactly that reason —
+    test prose echoes a ticket's wording and outscores the code it tests).
+
+    Matched against a test's chunks, but the chunks are only the finding
+    aid; load_test_sources then reads the whole file, because a test file
+    reaches the graph as a small fraction of itself and never the fixture.
     """
-    if not service_symbol_pairs:
+    if not service_symbol_terms:
         return {}
-    lookups = [{"service": s, "symbol": sym} for s, sym in service_symbol_pairs if sym]
+    lookups = [
+        {"service": svc, "symbol": sym, "terms": sorted({sym, *terms})}
+        for svc, sym, terms in service_symbol_terms
+        if sym
+    ]
     if not lookups:
         return {}
     with get_driver().session() as session:
@@ -507,7 +527,7 @@ def tests_naming(
             UNWIND $lookups AS lookup
             MATCH (c:Chunk {service: lookup.service})
             WHERE coalesce(c.is_test, c.file_path =~ $test_re)
-              AND c.text CONTAINS lookup.symbol
+              AND any(term IN lookup.terms WHERE c.text CONTAINS term)
             MATCH (f:Function)-[:HAS_CHUNK]->(c)
             RETURN lookup.service AS service, lookup.symbol AS symbol,
                    split(f.qualified_name, '::')[0] AS file_path
@@ -519,6 +539,35 @@ def tests_naming(
         for row in rows:
             found.setdefault((row["service"], row["symbol"]), set()).add(row["file_path"])
     return {key: sorted(paths)[:limit] for key, paths in found.items()}
+
+
+def load_test_sources(
+    service_file_pairs: list[tuple[str, str]],
+) -> dict[tuple[str, str], str]:
+    """{(service, file_path): that test file's stored text}, empty dropped.
+
+    Only test files carry `source` (see RepoGraph.file_source). Everything a
+    planner gets wrong when writing a test lives here and nowhere else: the
+    complete fixture object, which props must be set for the component to
+    render at all, the shape of the payload a callback receives, and whether
+    the component is driven by its own state or by its parent's. A path
+    alone taught it none of that, and a test written without it asserted
+    against a value the component never reads.
+    """
+    if not service_file_pairs:
+        return {}
+    rows = [{"service": s, "file_path": f} for s, f in service_file_pairs]
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (f:File {service: row.service, file_path: row.file_path})
+            WHERE f.source IS NOT NULL AND f.source <> ''
+            RETURN row.service AS service, row.file_path AS file_path, f.source AS source
+            """,
+            rows=rows,
+        )
+        return {(r["service"], r["file_path"]): r["source"] for r in result}
 
 
 def load_sibling_tests(

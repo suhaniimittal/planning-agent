@@ -645,3 +645,41 @@ def test_embedding_text_leaves_the_code_last_and_unchanged():
     what is sent to the embedding model gains the header."""
     code = "return 1"
     assert code_parser.embedding_text("a.py", "f", None, code).endswith(code)
+
+
+def test_parse_repo_stores_a_test_file_whole(tmp_path):
+    """A test file reaches the graph as a fraction of itself: parse_file()
+    extracts functions and classes, and a Jest file is top-level describe()
+    calls and object literals, so a 3,920-char test was stored as 192
+    characters — never the fixture, which is the one thing a planner writing
+    a test cannot guess."""
+    (tmp_path / "view.test.tsx").write_text(
+        'const settings = { canEdit: true };\nit("works", () => {});\n'
+    )
+
+    graph = parse_repo(tmp_path, "ui")
+
+    assert graph.file_source["view.test.tsx"] == (
+        'const settings = { canEdit: true };\nit("works", () => {});\n'
+    )
+
+
+def test_parse_repo_stores_no_source_for_production_files(tmp_path):
+    """Their symbols are already extracted; storing both would double the
+    graph for nothing."""
+    (tmp_path / "view.tsx").write_text("export const view = () => null;\n")
+
+    graph = parse_repo(tmp_path, "ui")
+
+    assert "view.tsx" not in graph.file_source
+
+
+def test_parse_repo_caps_a_long_test_file(tmp_path):
+    """One real suite covering a whole settings tab is 29,652 characters;
+    its first 6,000 are its imports and first fixture, the part worth
+    copying."""
+    (tmp_path / "big.test.tsx").write_text("x" * (code_parser.MAX_TEST_SOURCE_CHARS + 500))
+
+    graph = parse_repo(tmp_path, "ui")
+
+    assert len(graph.file_source["big.test.tsx"]) == code_parser.MAX_TEST_SOURCE_CHARS

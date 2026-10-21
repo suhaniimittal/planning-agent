@@ -28,6 +28,8 @@ from pathlib import Path
 from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
+from .test_paths import is_test_path
+
 __all__ = [
     "CodeChunk",
     "LanguageAdapter",
@@ -91,6 +93,16 @@ class RepoGraph:
     # module paths — a new test file importing a props type that is not
     # exported, a component importing "@client/hooks" which does not exist.
     file_imports: dict[str, str] = field(default_factory=dict)
+    # file_path -> its whole text, TEST FILES ONLY, capped. A test file is
+    # mostly top-level describe()/it() calls and object literals, none of
+    # which parse_file() extracts, so a 3,920-char test file reached the
+    # graph as 192 characters — under 10% of itself, and never the part
+    # that matters. What the planner needs from a test is precisely what is
+    # missing: the fixture, which props must be set for the component to
+    # render at all, and the shape of the payload its callbacks receive.
+    # Production files are not stored this way; their symbols are already
+    # extracted, and storing both would double the graph for nothing.
+    file_source: dict[str, str] = field(default_factory=dict)
     files_parsed: int = 0
     files_skipped_unsupported: int = 0
     files_skipped_oversized: int = 0
@@ -764,6 +776,14 @@ _IMPORT_SCAN_LINES = 120
 # still leaves room for the code itself in a prompt.
 MAX_IMPORT_CHARS = 1200
 
+# How much of a test file is kept. Measured against the tests that cover the
+# ATS settings form: 1,605 / 2,235 / 3,920 characters, so a focused unit test
+# fits whole. The one file this truncates is a 29,652-char suite covering a
+# whole settings tab, and its first 6,000 characters are its imports and
+# first fixture — the part worth copying. Raising it further buys more of
+# the files that teach least.
+MAX_TEST_SOURCE_CHARS = 6000
+
 
 def extract_imports(source: str) -> str:
     """The import lines at the top of `source`, in order, as one block.
@@ -995,11 +1015,15 @@ def parse_repo(
             graph.files_parsed += 1
             rel_path = str(path.relative_to(repo_root).as_posix())
             try:
-                imports = extract_imports(path.read_text(encoding="utf-8", errors="replace"))
+                text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
-                imports = ""
+                text = ""
+            imports = extract_imports(text) if text else ""
             if imports:
                 graph.file_imports[rel_path] = imports
+            # Read once, used twice — the import scan already has the text.
+            if text and is_test_path(rel_path):
+                graph.file_source[rel_path] = text[:MAX_TEST_SOURCE_CHARS]
             for symbol in symbols:
                 if symbol.kind == "class":
                     graph.classes.append(symbol)

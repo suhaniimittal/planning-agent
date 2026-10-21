@@ -364,6 +364,7 @@ async def test_ingest_full_writes_files_and_returns_commit_sha(monkeypatch):
             # "" rather than absent, so a reader can tell "imports nothing"
             # from "written before imports were recorded"
             "imports": "",
+            "source": "",
         }
     ]
     assert calls["create_has_file_edges"] == ["controller.py"]
@@ -573,6 +574,7 @@ async def test_ingest_full_does_not_skip_when_only_tracked_files_exist(monkeypat
             "blob_sha": None,
             "references": [],
             "imports": "",
+            "source": "",
         }
     ]
 

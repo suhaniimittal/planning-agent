@@ -64,7 +64,9 @@ from .test_paths import is_test_path
 #
 # 1 — the first version to record this at all. Its predecessors embedded a
 #     chunk as its code alone and stored no imports.
-PIPELINE_VERSION = 1
+# 2 — every test file now stores its own text on its File node, so the
+#     planner can be shown a real test instead of only its name.
+PIPELINE_VERSION = 2
 
 _CODE_GRAPH_CONCURRENCY = 4
 
@@ -330,6 +332,11 @@ async def _ingest_full(
             # "" for a file that imports nothing, so the property always
             # exists and a reader can tell "no imports" from "never parsed".
             "imports": graph.file_imports.get(fp, ""),
+            # Only ever non-empty for a test file (see RepoGraph.file_source):
+            # the planner is shown an existing test whole, because a test
+            # file's fixture and render setup are what it cannot guess and
+            # what parse_file() never extracted.
+            "source": graph.file_source.get(fp, ""),
         }
         for fp, lang in language_by_file.items()
     ]

@@ -882,8 +882,17 @@ def test_prompt_prefers_an_existing_test_over_a_new_one():
     existing one very likely asserts the behaviour being changed."""
     prompt = build_system_prompt("bug")
     assert "AN EXISTING TEST IS ALWAYS PREFERRED OVER A NEW ONE" in prompt
-    assert "Existing test files that mention this symbol by name" in prompt
+    assert "Existing test files that cover this symbol" in prompt
     assert "code that did not exist cannot already be tested" in prompt
+
+
+def test_prompt_tells_the_model_to_copy_the_setup_it_was_shown():
+    """Shown only a test's name, the model invented a fixture that was too
+    short to render and drove the component the wrong way."""
+    prompt = build_system_prompt("bug")
+    assert "TAKE A TEST'S SETUP FROM THE TEST YOU WERE SHOWN" in prompt
+    assert "HOW THE VALUE REACHES THE CODE" in prompt
+    assert "passes before your fix and fails after it" in prompt
 
 
 def test_self_check_covers_test_work():
@@ -979,8 +988,67 @@ def test_a_symbol_lists_the_tests_that_name_it_wherever_they_live():
         sibling_tests={("ui", path): []},
         tests_by_symbol={("ui", "X"): ["src/apps/internal/.../view.data.test.tsx"]},
     )
-    assert "Existing test files that mention this symbol by name:" in prompt
+    assert "Existing test files that cover this symbol:" in prompt
     assert "src/apps/internal/.../view.data.test.tsx" in prompt
+
+
+def test_an_existing_test_is_shown_whole_not_only_named():
+    """A path taught the planner nothing about the fixture. Shown only the
+    name, it wrote a test that typed into an input and asserted on a
+    callback — for a component whose handler reads its value from its
+    parent's settings, so the test passed before the fix and failed after."""
+    path = "src/common/.../AtsIntegrationSection/view.tsx"
+    test_path = "src/apps/client/.../AtsIntegrationSettings/view.test.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        sibling_tests={("ui", path): []},
+        tests_by_symbol={("ui", "X"): [test_path]},
+        test_sources={("ui", test_path): "const settings = { canEdit: true };"},
+    )
+    assert "const settings = { canEdit: true };" in prompt
+    assert "copy this fixture and render, do not invent one" in prompt
+
+
+def test_the_smallest_tests_are_the_ones_shown():
+    """A focused unit test is both shorter and a better model of the setup
+    than a 29,652-char suite covering a whole settings tab."""
+    path = "a/b/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        tests_by_symbol={("ui", "X"): ["huge.test.tsx", "small.test.tsx", "mid.test.tsx"]},
+        test_sources={
+            ("ui", "huge.test.tsx"): "H" * 3000,
+            ("ui", "mid.test.tsx"): "M" * 200,
+            ("ui", "small.test.tsx"): "S" * 50,
+        },
+    )
+    assert "S" * 50 in prompt
+    assert "M" * 200 in prompt
+    assert "H" * 3000 not in prompt
+
+
+def test_a_test_too_large_for_the_budget_is_named_but_not_quoted():
+    path = "a/b/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        tests_by_symbol={("ui", "X"): ["huge.test.tsx"]},
+        test_sources={("ui", "huge.test.tsx"): "H" * 9000},
+    )
+    assert "huge.test.tsx" in prompt
+    assert "H" * 9000 not in prompt
+
+
+def test_nothing_is_quoted_when_a_test_has_no_stored_source():
+    """Only test files carry source; a path with none must not produce an
+    empty code fence that reads as "this test is empty"."""
+    path = "a/b/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        tests_by_symbol={("ui", "X"): ["a/b/view.test.tsx"]},
+        test_sources={},
+    )
+    assert "a/b/view.test.tsx" in prompt
+    assert "copy this fixture" not in prompt
 
 
 def test_nothing_is_claimed_when_no_test_names_the_symbol():
@@ -990,7 +1058,7 @@ def test_nothing_is_claimed_when_no_test_names_the_symbol():
         sibling_tests={("ui", path): []},
         tests_by_symbol={},
     )
-    assert "mention this symbol by name" not in prompt
+    assert "Existing test files that cover this symbol" not in prompt
 
 
 def test_a_symbol_shows_its_file_imports_verbatim():

@@ -643,7 +643,7 @@ def build_system_prompt(mode: str = "bug") -> str:
         "shown. A props type that is not exported cannot be imported, and "
         "neither can a module path nothing in the evidence references.\n\n"
         "AN EXISTING TEST IS ALWAYS PREFERRED OVER A NEW ONE. A symbol may "
-        "list 'Existing test files that mention this symbol by name'. Those "
+        "list 'Existing test files that cover this symbol'. Those "
         "already exercise it, wherever in the project they live, and one of "
         "them is where its behaviour is asserted today. When your change "
         "alters what that symbol does observably, MODIFY one of those files "
@@ -657,6 +657,22 @@ def build_system_prompt(mode: str = "bug") -> str:
         "Create a new test file only when no existing test names the symbol "
         "at all, which is the normal case for a symbol you are creating: "
         "code that did not exist cannot already be tested.\n\n"
+        "TAKE A TEST'S SETUP FROM THE TEST YOU WERE SHOWN. One of those "
+        "files may be quoted in full under 'How ... sets this up today'. "
+        "That is the real file, so its fixture, its render call and the "
+        "props it sets are facts about what this code needs in order to run "
+        "at all — copy them. Do not write a shorter fixture that looks "
+        "sufficient: a missing field makes the component throw on render, "
+        "and a missing flag leaves the thing you are testing disabled or "
+        "absent from the page.\n\n"
+        "Read the quoted test for HOW THE VALUE REACHES THE CODE before "
+        "you write a step that changes it. If the setup passes state in as "
+        "props and the code reads it from there, then simulating a user "
+        "typing does not change what the code sees, and a test built that "
+        "way asserts against the fixture's old value instead of the new "
+        "one. Such a test passes before your fix and fails after it, which "
+        "is the exact opposite of what it is for. Drive the behaviour the "
+        "way the quoted test drives it.\n\n"
         "WHEN A SYMBOL NAMES WHERE A NEW TEST BELONGS, WRITE THE TEST "
         "THERE. A symbol with no test beside it may still say where one "
         'would go ("a new test for it belongs at ...") — that path was '
@@ -783,6 +799,48 @@ def build_system_prompt(mode: str = "bug") -> str:
 
 _MAX_FILE_CONTEXT_NAMES = 20
 
+# How many existing tests are shown whole for one symbol, and how much text
+# that may take. Smallest first, deliberately: of the four tests covering
+# the ATS settings form, the three focused ones are 1,605-3,920 characters
+# and each shows a complete working fixture, while the fourth is a
+# 29,652-char suite for a whole settings tab. The small ones teach the setup
+# in a fraction of the tokens.
+_TESTS_SHOWN_WHOLE = 2
+_TEST_SOURCE_BUDGET_CHARS = 6000
+
+
+def _format_test_sources(paths: list[str], sources: dict[str, str]) -> str:
+    """The smallest of the given tests, shown whole, within a budget.
+
+    Paths alone were never enough. A test file reaches the graph as a
+    fraction of itself — parse_file() extracts functions and classes, and a
+    Jest file is top-level describe()/it() calls and object literals, so a
+    3,920-char test was stored as 192 characters. The planner was therefore
+    told a test existed and shown nothing about how it works, and wrote one
+    that typed into an input and asserted on a callback — for a component
+    whose handler reads its value from its parent's settings, not from the
+    input. The test passed before the fix and failed after it.
+
+    Smallest first: a focused unit test is both shorter and a better model
+    of the setup than a suite covering a whole screen.
+    """
+    available = [(len(sources[p]), p) for p in paths if sources.get(p)]
+    if not available:
+        return ""
+    available.sort()
+    out = ""
+    left = _TEST_SOURCE_BUDGET_CHARS
+    for _, path_ in available[:_TESTS_SHOWN_WHOLE]:
+        source = sources[path_]
+        if len(source) > left:
+            continue
+        left -= len(source)
+        out += (
+            f"\n  How `{path_}` sets this up today — copy this fixture and "
+            f"render, do not invent one:\n  ```\n{source}\n  ```"
+        )
+    return out
+
 
 def _format_code_symbol(
     symbol: dict,
@@ -792,6 +850,7 @@ def _format_code_symbol(
     new_test_path: str | None = None,
     tests_naming_it: list[str] | None = None,
     imports: str | None = None,
+    test_sources: dict[str, str] | None = None,
 ) -> str:
     location = f"{symbol['file_path']}:{symbol['line_start']}-{symbol['line_end']}"
     line = f"- `{location}` `{symbol['qualified_name']}` — `{symbol['signature']}`"
@@ -827,7 +886,8 @@ def _format_code_symbol(
         # Wherever they live — the sibling lookup above only sees the same
         # folder, and on this project the tests are usually somewhere else.
         named = ", ".join(f"`{t}`" for t in tests_naming_it)
-        line += f"\n  Existing test files that mention this symbol by name: {named}"
+        line += f"\n  Existing test files that cover this symbol: {named}"
+        line += _format_test_sources(tests_naming_it, test_sources or {})
     if imports:
         # Verbatim, because the point is the exact module paths — a
         # paraphrase would be no better than guessing.
@@ -851,6 +911,7 @@ def build_user_prompt(
     new_test_paths: dict[tuple[str, str], str] | None = None,
     tests_by_symbol: dict[tuple[str, str], list[str]] | None = None,
     file_imports: dict[tuple[str, str], str] | None = None,
+    test_sources: dict[tuple[str, str], str] | None = None,
 ) -> str:
     """`known_dependencies`: real CALLS edges among the candidate services,
     read from the graph BEFORE the LLM call — shown here as confirmed
@@ -885,6 +946,11 @@ def build_user_prompt(
     new_test_paths = new_test_paths or {}
     tests_by_symbol = tests_by_symbol or {}
     file_imports = file_imports or {}
+    # Regrouped per service, because a symbol is formatted knowing only its
+    # own service and the test paths attached to it.
+    test_sources_by_service: dict[str, dict[str, str]] = {}
+    for (svc, path_), source in (test_sources or {}).items():
+        test_sources_by_service.setdefault(svc, {})[path_] = source
 
     sections = [f"## Issue\n{issue_text}\n"]
 
@@ -938,6 +1004,7 @@ def build_user_prompt(
                     new_test_paths.get((doc["name"], symbol["file_path"])),
                     tests_by_symbol.get((doc["name"], symbol["name"])),
                     file_imports.get((doc["name"], symbol["file_path"])),
+                    test_sources_by_service.get(doc["name"], {}),
                 )
                 for symbol in code_symbols
             ]

@@ -329,13 +329,36 @@ async def build_tdd(
     # that keeps src/common/ apart from src/apps/ — and a design that believes
     # no test exists has a new one written from scratch instead of the real one
     # edited.
+    #
+    # Each symbol is looked up by its own name AND by the issue identifiers
+    # that appear in its own source. The name alone finds nothing on a UI
+    # project — no test in the ui repo contains "AtsIntegrationSectionView"
+    # or "handleCcEmailAddressesBlur", because a component is rendered
+    # through a wrapper and a handler is never named, while four tests
+    # contain the field the ticket is about. Requiring the identifier to be
+    # in the symbol's own source keeps the attribution honest: a test is
+    # attached only when it names something this symbol genuinely touches.
     tests_by_symbol = graph_reader.tests_naming(
         [
-            (service, symbol["name"])
+            (
+                service,
+                symbol["name"],
+                [
+                    word
+                    for word in identifiers
+                    if word in (snippet_map.get((service, symbol["qualified_name"])) or "")
+                ],
+            )
             for service, symbols_ in code_symbols_by_service.items()
             for symbol in symbols_
             if symbol.get("name")
         ]
+    )
+    # Their actual text, so the planner copies a fixture that works instead
+    # of inventing one. Only test files carry source, so this reads nothing
+    # for anything else.
+    test_sources = graph_reader.load_test_sources(
+        sorted({(service, path_) for (service, _), paths in tests_by_symbol.items() for path_ in paths})
     )
     # Where a NEW test would go, for the shown files that have none beside
     # them. Only for services whose tests demonstrably sit beside their
@@ -363,6 +386,7 @@ async def build_tdd(
         file_imports=file_imports,
         sibling_tests=sibling_tests,
         tests_by_symbol=tests_by_symbol,
+        test_sources=test_sources,
         new_test_paths=new_test_paths,
     )
 

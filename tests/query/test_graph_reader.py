@@ -339,7 +339,7 @@ def test_tests_naming_finds_tests_by_content_not_by_folder(monkeypatch):
         ],
     )
 
-    found = graph_reader.tests_naming([("ui", "handleCcEmailAddressesBlur")])
+    found = graph_reader.tests_naming([("ui", "handleCcEmailAddressesBlur", [])])
 
     assert found == {
         ("ui", "handleCcEmailAddressesBlur"): [
@@ -351,9 +351,49 @@ def test_tests_naming_finds_tests_by_content_not_by_folder(monkeypatch):
     # only test chunks, and a plain name match — this runs after the files to
     # change are chosen, so it can never take a slot from real code
     assert "coalesce(c.is_test" in query
-    assert "c.text CONTAINS lookup.symbol" in query
+    assert "any(term IN lookup.terms WHERE c.text CONTAINS term)" in query
+
+
+def test_tests_naming_also_matches_the_issue_identifiers_a_symbol_touches(monkeypatch):
+    """No test in the ui repo names AtsIntegrationSectionView — a component
+    is rendered through a wrapper — while four name the field the ticket is
+    about, and those four hold the working fixture."""
+    driver = _patch_driver(monkeypatch, [])
+
+    graph_reader.tests_naming(
+        [("ui", "AtsIntegrationSectionView", ["sendReportRequestedLinkCcEmailAddresses"])]
+    )
+
+    assert driver._session.last_params["lookups"] == [
+        {
+            "service": "ui",
+            "symbol": "AtsIntegrationSectionView",
+            # the symbol's own name is always one of the terms
+            "terms": ["AtsIntegrationSectionView", "sendReportRequestedLinkCcEmailAddresses"],
+        }
+    ]
 
 
 def test_tests_naming_asks_nothing_when_there_are_no_symbols(monkeypatch):
     assert graph_reader.tests_naming([]) == {}
-    assert graph_reader.tests_naming([("ui", "")]) == {}
+    assert graph_reader.tests_naming([("ui", "", ["x"])]) == {}
+
+
+def test_load_test_sources_returns_the_stored_text_per_file(monkeypatch):
+    """A path alone taught the planner nothing about the fixture, which is
+    the one thing it cannot guess and the one thing it got wrong."""
+    driver = _patch_driver(
+        monkeypatch,
+        [{"service": "ui", "file_path": "a/view.test.tsx", "source": "const settings = {...}"}],
+    )
+
+    found = graph_reader.load_test_sources([("ui", "a/view.test.tsx")])
+
+    assert found == {("ui", "a/view.test.tsx"): "const settings = {...}"}
+    query = driver._session.last_query
+    # only files that actually carry text — production files never do
+    assert "f.source IS NOT NULL AND f.source <> ''" in query
+
+
+def test_load_test_sources_asks_nothing_for_an_empty_list(monkeypatch):
+    assert graph_reader.load_test_sources([]) == {}
