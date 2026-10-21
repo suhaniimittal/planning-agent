@@ -409,6 +409,32 @@ ADAPTERS: dict[str, LanguageAdapter] = {
 _CHUNK_TARGET_CHARS = 700
 
 
+def embedding_text(file_path: str, name: str, parent_class: str | None, chunk_text: str) -> str:
+    """What a chunk is embedded AS — its path and symbol name, then its code.
+
+    Not what is stored or shown: `Chunk.text` stays the code alone, so the
+    planner still reads exactly what is in the file.
+
+    Measured on this graph, 22% of single-chunk functions do not contain
+    their own name anywhere in their text — an arrow function's chunk
+    begins at its parameter list, so the name it was assigned to is lost.
+    Only multi-chunk functions were anchored, and 93% of functions are a
+    single chunk. So for roughly a fifth of the graph the most descriptive
+    thing about a symbol was never embedded.
+
+    That matters because a ticket is written in words and code is written
+    in symbols. `multipleEmailFieldValidation` contains the semicolon-to-
+    comma conversion a real ticket was about, as `.replace(/;/g, ",")` —
+    characters, not the words "semicolon" and "comma" — and scored 0.292
+    against that ticket while unrelated code scored 0.78. Its NAME holds
+    "email" and "validation", both of which the ticket says, and its path
+    holds more. Embedding those costs nothing and is often the only English
+    a chunk has.
+    """
+    head = file_path if not parent_class else f"{file_path}\n{parent_class}"
+    return f"{head}\n{name}\n{chunk_text}"
+
+
 def chunk_function(node: Node, body: Node | None, signature: str, source: bytes) -> list[CodeChunk]:
     """Split a function's body into embeddable pieces.
 

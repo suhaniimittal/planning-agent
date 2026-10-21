@@ -616,3 +616,32 @@ def test_extract_imports_is_empty_when_a_file_imports_nothing():
 def test_extract_imports_is_capped():
     source = "\n".join(f'import a{i} from "m{i}";' for i in range(200))
     assert len(code_parser.extract_imports(source)) <= code_parser.MAX_IMPORT_CHARS
+
+
+def test_embedding_text_carries_the_path_and_name_the_code_often_lacks():
+    """An arrow function's chunk begins at its parameter list, so the name it
+    was assigned to is lost. Measured on a real graph: 22% of single-chunk
+    functions do not contain their own name anywhere in their text, and 93%
+    of functions are a single chunk."""
+    text = code_parser.embedding_text(
+        "src/common/utils/utils/multipleEmailFieldValidation.tsx",
+        "multipleEmailFieldValidation",
+        None,
+        "(value: string) => {",
+    )
+    assert text.startswith("src/common/utils/utils/multipleEmailFieldValidation.tsx\n")
+    assert "multipleEmailFieldValidation" in text
+    assert text.endswith("(value: string) => {")
+
+
+def test_embedding_text_includes_the_parent_class_for_a_method():
+    text = code_parser.embedding_text("A.kt", "toAvro", "EmploymentVerificationInput", "builder()")
+    assert "EmploymentVerificationInput" in text
+    assert "toAvro" in text
+
+
+def test_embedding_text_leaves_the_code_last_and_unchanged():
+    """Chunk.text is what the planner reads, and is stored unprefixed; only
+    what is sent to the embedding model gains the header."""
+    code = "return 1"
+    assert code_parser.embedding_text("a.py", "f", None, code).endswith(code)

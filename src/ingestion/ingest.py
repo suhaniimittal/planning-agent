@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath
 from . import code_graph_writer, github_api, graph_writer
 from .code_parser import (
     extract_imports,
+    embedding_text,
     LANGUAGE_BY_EXTENSION,
     TRACKED_ONLY_EXTENSIONS,
     CodeChunk,
@@ -190,7 +191,12 @@ async def _embed_chunks(
         nonlocal batches_done
         async with semaphore:
             embedded: list[tuple[ParsedSymbol, CodeChunk, list[float]]] = []
-            vectors = await _embed_many_with_retry([chunk.text for _, chunk in batch])
+            vectors = await _embed_many_with_retry(
+                [
+                    embedding_text(fn.file_path, fn.name, fn.parent_class, chunk.text)
+                    for fn, chunk in batch
+                ]
+            )
             if vectors is not None:
                 embedded = [
                     (fn, chunk, vector) for (fn, chunk), vector in zip(batch, vectors, strict=True)
@@ -198,7 +204,9 @@ async def _embed_chunks(
             else:
                 for fn, chunk in batch:
                     try:
-                        vector = await embed(chunk.text)
+                        vector = await embed(
+                            embedding_text(fn.file_path, fn.name, fn.parent_class, chunk.text)
+                        )
                     except (
                         Exception
                     ) as e:  # noqa: BLE001 - one bad embed call must never abort the run

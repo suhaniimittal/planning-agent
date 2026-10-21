@@ -118,7 +118,8 @@ async def test_embed_chunks_skips_failed_embedding_without_aborting_others(monke
     bad_fn = _fn_symbol(name="bad_fn", chunks=[bad_chunk])
 
     async def flaky_embed(text):
-        if text == "bad":
+        # text is now embedding_text(...): path, name, then the code
+        if text.endswith("bad"):
             raise RuntimeError("rate limited")
         return [0.1]
 
@@ -167,9 +168,13 @@ async def test_embed_chunks_sends_chunks_in_batches(monkeypatch):
     ]
     batch_sizes = []
 
+    embedded = []
+
     async def fake_embed_many(texts):
         batch_sizes.append(len(texts))
-        return [[float(t[1:])] for t in texts]
+        embedded.extend(texts)
+        # a chunk is embedded as "path\nname\ncode", so the code is the last line
+        return [[float(t.splitlines()[-1][1:])] for t in texts]
 
     async def must_not_be_called(text):
         raise AssertionError("per-chunk embed used although the batch succeeded")
@@ -183,6 +188,11 @@ async def test_embed_chunks_sends_chunks_in_batches(monkeypatch):
     assert {r["function_qualified_name"]: r["embedding"] for r in rows} == {
         f"controller.py::f{i}": [float(i)] for i in range(5)
     }
+    # What is EMBEDDED carries the path and the symbol name; what is STORED
+    # stays the code alone. Measured on the real graph, 22% of single-chunk
+    # functions do not contain their own name anywhere in their text.
+    assert sorted(embedded) == [f"controller.py\nf{i}\nt{i}" for i in range(5)]
+    assert {r["text"] for r in rows} == {f"t{i}" for i in range(5)}
     assert len(edges) == 5
 
 
