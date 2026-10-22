@@ -1,4 +1,4 @@
-from src.ingestion import graph_writer
+from src.ingestion import code_crypto, graph_writer
 
 
 class FakeResult(list):
@@ -74,11 +74,16 @@ def test_update_service_summary_sets_summary_and_embedding(monkeypatch):
     assert "MATCH (s:Service {name: $name})" in query
     assert "s.summary = $summary" in query
     assert "s.summary_embedding = $embedding" in query
-    assert params == {
-        "name": "orders",
-        "summary": "Handles order placement.",
-        "embedding": [0.1, 0.2],
-    }
+    assert params["name"] == "orders" and params["embedding"] == [0.1, 0.2]
+    assert code_crypto.is_encrypted(params["summary"])
+    opened = code_crypto.decrypt(
+        params["summary"],
+        label="Service",
+        service="orders",
+        qualified_name="orders",
+        field="summary",
+    )
+    assert opened == "Handles order placement."
 
 
 def test_set_service_dependencies_passes_source_and_targets(monkeypatch):

@@ -8,7 +8,7 @@ from src.query.models import (
     ServicePlan,
     TechnicalDesignDoc,
 )
-from src.query.render import render_confluence, render_markdown, render_text
+from src.query.render import render_confluence, render_text
 
 
 def _tdd(**overrides) -> TechnicalDesignDoc:
@@ -36,238 +36,6 @@ def _tdd(**overrides) -> TechnicalDesignDoc:
     )
     defaults.update(overrides)
     return TechnicalDesignDoc(**defaults)
-
-
-def _md(**overrides) -> str:
-    return render_markdown(_tdd(**overrides))
-
-
-def test_render_markdown_title_becomes_h1_heading():
-    assert _md().startswith("# Fix order totals")
-
-
-def test_render_markdown_service_becomes_h3_heading():
-    assert "### orders" in _md()
-
-
-def test_render_markdown_change_includes_file_path_symbol_and_description():
-    md = _md()
-    assert "`src/.../OrdersController.java`" in md
-    assert "`calculateTotal`" in md
-    assert "Fix summation of item prices" in md
-
-
-def test_render_markdown_change_without_file_path_omits_backtick_path():
-    tdd = _tdd()
-    tdd.services[0].changes[0].file_path = None
-    md = render_markdown(tdd)
-    assert "`calculateTotal`" in md
-
-
-def test_render_markdown_omits_empty_optional_sections():
-    md = _md()
-    assert "## 21. Risks" not in md
-    assert "## 19. Testing Strategy" not in md
-    assert "## 22. Open Questions" not in md
-    assert "## 6. Root Cause" not in md
-    assert "## 18. Backward Compatibility" not in md
-
-
-def test_render_markdown_includes_populated_optional_sections():
-    md = _md(
-        risks=["Discount logic isn't described in the docs"],
-        testing_notes="Add a multi-item cart test case",
-        open_questions=["What happens with zero-quantity items?"],
-    )
-    assert "## 21. Risks" in md
-    assert "Discount logic isn't described in the docs" in md
-    assert "## 19. Testing Strategy" in md
-    assert "Add a multi-item cart test case" in md
-    assert "## 22. Open Questions" in md
-    assert "What happens with zero-quantity items?" in md
-
-
-def test_render_markdown_includes_overall_reasoning():
-    md = _md()
-    assert "## 25. Overall Reasoning" in md
-    assert "The bug is in total calculation logic" in md
-
-
-def test_render_markdown_omits_dependency_diagram_when_no_edges():
-    md = _md()
-    assert "## 15. Inter-Service Communication" not in md
-    assert "```mermaid" not in md
-
-
-def test_render_markdown_includes_mermaid_diagram_for_service_dependencies():
-    md = _md(service_dependencies=[ServiceDependency(source="orders", target="shipping")])
-    assert "## 15. Inter-Service Communication" in md
-    assert "```mermaid" in md
-    assert "flowchart LR" in md
-    assert 'orders["orders"]' in md
-    assert 'shipping["shipping"]' in md
-    assert "orders --> shipping" in md
-
-
-def test_render_markdown_renders_multiple_dependency_edges():
-    md = _md(
-        service_dependencies=[
-            ServiceDependency(source="orders", target="shipping"),
-            ServiceDependency(source="orders", target="payment"),
-        ]
-    )
-    assert "orders --> shipping" in md
-    assert "orders --> payment" in md
-
-
-def test_render_markdown_labels_kafka_based_dependency_edge():
-    md = _md(
-        service_dependencies=[
-            ServiceDependency(source="orders", target="shipping", via="kafka:orders.created")
-        ]
-    )
-    assert "orders -- kafka:orders.created --> shipping" in md
-
-
-def test_render_markdown_architecture_diagram_uses_mermaid_flowchart():
-    md = _md(
-        current_architecture="Orders calls payment directly.",
-        current_architecture_components=[
-            ArchComponent(name="Orders", depends_on=["Payment"]),
-            ArchComponent(name="Payment"),
-        ],
-    )
-    assert "## 4. Current System / Architecture" in md
-    assert "```mermaid" in md
-    assert "flowchart LR" in md
-    assert 'Orders["Orders"]' in md
-    assert 'Payment["Payment"]' in md
-    assert "Orders --> Payment" in md
-
-
-def test_render_markdown_architecture_diagram_sanitizes_ids_with_spaces_and_punctuation():
-    md = _md(
-        current_architecture_components=[
-            ArchComponent(name="Order Service", depends_on=["Payment-Gateway (v2)"]),
-        ],
-    )
-    assert 'Order_Service["Order Service"]' in md
-    assert "Order_Service -->" in md
-
-
-def test_render_markdown_flow_diagram_uses_mermaid_flowchart_td():
-    md = _md(
-        current_flow_steps=[
-            FlowStep(step="Validate input", detail="Checks required fields are present"),
-            FlowStep(step="Process request"),
-        ]
-    )
-    assert "## 5. Current Flow" in md
-    assert "flowchart TD" in md
-    assert "Validate input" in md
-    assert "Checks required fields are present" in md
-    assert "s0 --> s1" in md
-
-
-def test_render_markdown_sequence_diagram_uses_mermaid_sequence_diagram():
-    md = _md(
-        sequence_steps=[
-            SequenceStep(from_participant="Client", to_participant="Orders", action="Create order"),
-            SequenceStep(
-                from_participant="Orders", to_participant="Client", action="Order confirmation", direction="response"
-            ),
-        ]
-    )
-    assert "## 10. Sequence / Interaction Flow" in md
-    assert "sequenceDiagram" in md
-    assert "Client->>Orders: Create order" in md
-    assert "Orders-->>Client: Order confirmation" in md
-
-
-def test_render_markdown_omits_diagram_sections_when_no_data():
-    md = _md()
-    assert "## 5. Current Flow" not in md
-    assert "## 9. Proposed Flow" not in md
-    assert "## 10. Sequence" not in md
-
-
-def test_render_markdown_includes_implementation_notes():
-    assert "Loop over items and sum unit price * quantity" in _md()
-
-
-def test_render_markdown_includes_acceptance_criteria_when_present():
-    tdd = _tdd()
-    tdd.services[0].changes[0].acceptance_criteria = ["Total matches sum of item prices for a 3-item cart"]
-    md = render_markdown(tdd)
-    assert "Acceptance criteria" in md
-    assert "Total matches sum of item prices for a 3-item cart" in md
-
-
-def test_render_markdown_omits_acceptance_criteria_when_empty():
-    assert "Acceptance criteria" not in _md()
-
-
-def test_render_markdown_includes_complexity_and_data_model():
-    tdd = _tdd()
-    tdd.services[0].affected_data_model = "MongoDB: CustomerOrder"
-    md = render_markdown(tdd)
-    assert "Complexity: medium" in md
-    assert "Data model: MongoDB: CustomerOrder" in md
-
-
-def test_render_markdown_omits_data_model_line_when_none():
-    assert "| Data model:" not in _md()
-
-
-def test_render_markdown_omits_backward_compatibility_section_when_none():
-    assert "## 18. Backward Compatibility" not in _md()
-
-
-def test_render_markdown_includes_backward_compatibility_when_present():
-    md = _md(backward_compatibility_notes="Order total field type is unchanged")
-    assert "## 18. Backward Compatibility" in md
-    assert "Order total field type is unchanged" in md
-
-
-def test_render_markdown_includes_pseudocode_in_fenced_code_block():
-    md = _md()
-    assert "```" in md
-    assert "total = 0" in md
-    assert "total += item.price" in md
-
-
-def test_render_markdown_labels_pseudocode_as_illustrative_not_real_code():
-    assert "illustrative pseudocode, not real code" in _md()
-
-
-def test_render_markdown_renders_all_pseudocode_lines():
-    tdd = _tdd()
-    tdd.services[0].changes[0].pseudocode_sketch = "line1\nline2\nline3"
-    md = render_markdown(tdd)
-    assert "line1" in md
-    assert "line2" in md
-    assert "line3" in md
-
-
-def test_render_markdown_tags_changes_with_real_source():
-    tdd = _tdd()
-    tdd.services[0].changes[0].has_real_source = True
-    md = render_markdown(tdd)
-    assert "(grounded in real source)" in md
-    assert "may reflect real source shown to the model" in md
-
-
-def test_render_markdown_omits_real_source_tag_when_false():
-    md = _md()
-    assert "(grounded in real source)" not in md
-    assert "illustrative pseudocode, not real code" in md
-
-
-def test_render_markdown_omits_affected_services_section_when_no_services():
-    tdd = _tdd(services=[])
-    md = render_markdown(tdd)
-    assert "## 11. Affected Services" not in md
-    assert "## 12. Affected Files" not in md
 
 
 # --- render_text (the plain-text TDD behind the PDF) ------------------------
@@ -419,7 +187,7 @@ def test_render_confluence_drops_architecture_component_diagram():
         current_architecture_components=[ArchComponent(name="orders", depends_on=["shipping"])],
     )
     # the prose survives, but the component-diagram's own node/edge markup
-    # (the bracketed mermaid node syntax render_markdown would produce) never
+    # (bracketed mermaid node syntax) never
     # appears — render_confluence only ever uses `current_architecture` text
     assert "Orders talks to shipping directly." in cf
     assert '["orders"]' not in cf
@@ -521,7 +289,6 @@ def test_what_must_keep_working_and_the_versions_are_part_of_the_requirements():
     assert "<strong>Technology constraints:</strong>" in page
     text = render_text(tdd)  # what the coding agent reads
     assert "Existing behaviour to preserve:\n" in text and "Technology constraints:\n" in text
-    assert "**Existing behaviour to preserve:**" in render_markdown(tdd)
 
 
 def test_without_them_the_requirements_read_as_before():

@@ -1,4 +1,11 @@
+from src.ingestion import code_crypto
 from src.query import graph_reader
+
+
+def _sealed(text, label, service, qualified_name, field):
+    return code_crypto.encrypt(
+        text, label=label, service=service, qualified_name=qualified_name, field=field
+    )
 
 
 class FakeSession:
@@ -103,69 +110,6 @@ def test_load_candidate_docs_returns_name_and_summary_for_given_names(monkeypatc
     assert driver._session.last_params == {"names": ["orders"]}
 
 
-def test_load_code_symbols_for_services_queries_class_or_function_by_service(monkeypatch):
-    driver = _patch_driver(
-        monkeypatch,
-        [
-            {
-                "service": "orders",
-                "qualified_name": "controller.py::OrderController.create_order",
-                "name": "create_order",
-                "file_path": "controller.py",
-                "line_start": 4,
-                "line_end": 7,
-                "signature": "def create_order(self, user_id, items):",
-                "docstring": "Creates a new order.",
-                "language": "python",
-                "is_method": True,
-                "parent_class": "controller.py::OrderController",
-                "kind": "Function",
-            }
-        ],
-    )
-    result = graph_reader.load_code_symbols_for_services(["orders"])
-    assert result[0]["qualified_name"] == "controller.py::OrderController.create_order"
-    assert "source_snippet" not in driver._session.last_query
-    assert driver._session.last_params == {"names": ["orders"]}
-
-
-def test_load_code_symbols_for_services_empty_names_returns_empty_without_query(monkeypatch):
-    driver = _patch_driver(monkeypatch, [{"service": "shouldnt-be-seen"}])
-    result = graph_reader.load_code_symbols_for_services([])
-    assert result == []
-    assert driver._session.last_query is None
-
-
-def test_load_source_snippets_keys_result_by_service_and_qualified_name(monkeypatch):
-    driver = _patch_driver(
-        monkeypatch,
-        [
-            {
-                "service": "orders",
-                "qualified_name": "controller.py::OrderController.create_order",
-                "source_snippet": "def create_order(self, user_id, items):\n    ...",
-            }
-        ],
-    )
-    result = graph_reader.load_source_snippets(
-        [("orders", "controller.py::OrderController.create_order")]
-    )
-    assert result == {
-        ("orders", "controller.py::OrderController.create_order"):
-            "def create_order(self, user_id, items):\n    ..."
-    }
-    assert driver._session.last_params == {
-        "rows": [{"service": "orders", "qualified_name": "controller.py::OrderController.create_order"}]
-    }
-
-
-def test_load_source_snippets_empty_pairs_returns_empty_without_query(monkeypatch):
-    driver = _patch_driver(monkeypatch, [{"service": "shouldnt-be-seen"}])
-    result = graph_reader.load_source_snippets([])
-    assert result == {}
-    assert driver._session.last_query is None
-
-
 def test_vector_search_chunks_queries_chunk_index_and_rolls_up_to_function(monkeypatch):
     driver = _patch_driver(
         monkeypatch,
@@ -173,7 +117,14 @@ def test_vector_search_chunks_queries_chunk_index_and_rolls_up_to_function(monke
             {
                 "service": "orders",
                 "function_qualified_name": "controller.py::OrderController.create_order",
-                "text": "def create_order(self, user_id, items):\n    ...",
+                "chunk_qualified_name": "controller.py::OrderController.create_order::chunk0",
+                "text": _sealed(
+                    "def create_order(self, user_id, items):\n    ...",
+                    "Chunk",
+                    "orders",
+                    "controller.py::OrderController.create_order::chunk0",
+                    "text",
+                ),
                 "score": 0.87,
             }
         ],
@@ -246,9 +197,13 @@ def test_search_service_chunks_merges_semantic_and_identifier_hits(monkeypatch):
         def run(self, query, **params):
             self.queries.append((query, params))
             if "identifiers" in params:
-                return [{"function_qualified_name": "a::g", "text": "t", "score": 0.5,
-                         "identifiers": ["approveDeferredReport"]}]
-            return [{"function_qualified_name": "a::f", "text": "t", "score": 0.9, "identifiers": []}]
+                code = "x = approveDeferredReport(r)"
+                text = _sealed(code, "Chunk", "ui", "a::g::chunk0", "text")
+                return [{"function_qualified_name": "a::g", "chunk_qualified_name": "a::g::chunk0",
+                         "text": text, "score": 0.5}]
+            text = _sealed("t", "Chunk", "ui", "a::f::chunk0", "text")
+            return [{"function_qualified_name": "a::f", "chunk_qualified_name": "a::f::chunk0",
+                     "text": text, "score": 0.9, "identifiers": []}]
 
         def __enter__(self):
             return self
@@ -262,6 +217,8 @@ def test_search_service_chunks_merges_semantic_and_identifier_hits(monkeypatch):
     rows = graph_reader.search_service_chunks("ui", [0.1], ["approveDeferredReport"])
 
     assert [r["function_qualified_name"] for r in rows] == ["a::f", "a::g"]
+    assert rows[1]["text"] == "x = approveDeferredReport(r)"  # decrypted on the way out
+    assert rows[1]["identifiers"] == ["approveDeferredReport"]
     assert all(p["service"] == "ui" for _, p in session.queries)
     assert all("is_test" in q for q, _ in session.queries)  # test code always excluded
 
@@ -282,3 +239,24 @@ def test_load_symbols_and_file_context_skip_the_query_for_nothing(monkeypatch):
 def test_load_file_context_returns_sorted_unique_names(monkeypatch):
     _patch_driver(monkeypatch, [{"service": "ui", "file_path": "a.ts", "names": ["g", "f", "Form.f", "f"]}])
     assert graph_reader.load_file_context([("ui", "a.ts")]) == {("ui", "a.ts"): ["Form.f", "f", "g"]}
+
+
+def test_load_symbols_decrypts_the_source_on_the_way_out(monkeypatch):
+    qname = "controller.py::OrderController.create_order"
+    where = ("Function", "orders", qname)
+    _patch_driver(
+        monkeypatch,
+        [
+            {
+                "service": "orders",
+                "qualified_name": qname,
+                "kind": "Function",
+                "signature": _sealed("create_order(self)", *where, "signature"),
+                "docstring": None,
+                "source_snippet": _sealed("def create_order(self): ...", *where, "source_snippet"),
+            }
+        ],
+    )
+    (symbol,) = graph_reader.load_symbols([("orders", qname)])
+    assert symbol["source_snippet"] == "def create_order(self): ..."
+    assert symbol["signature"] == "create_order(self)" and symbol["docstring"] is None

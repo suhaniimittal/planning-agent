@@ -141,10 +141,10 @@ def test_parse_repo_skips_oversized_files(tmp_path):
     assert graph.functions == []
 
 
-def test_parse_repo_counts_unsupported_extensions(tmp_path):
+def test_parse_repo_skips_unsupported_extensions(tmp_path):
     (tmp_path / "readme.md").write_text("# hello\n")
     graph = parse_repo(tmp_path, "orders")
-    assert graph.files_skipped_unsupported == 1
+    assert graph.files_parsed == 0 and graph.tracked_files == {}
 
 
 def test_parse_repo_continues_after_one_file_fails(tmp_path, monkeypatch):
@@ -555,14 +555,13 @@ def test_parse_repo_tracks_html_css_csv_without_fake_symbols(tmp_path):
     }
 
 
-def test_parse_repo_still_counts_truly_unsupported_extensions(tmp_path):
+def test_parse_repo_still_skips_truly_unsupported_extensions(tmp_path):
     (tmp_path / "index.html").write_text("<html></html>")
     (tmp_path / "photo.png").write_bytes(b"binary")
 
     graph = parse_repo(tmp_path, "orders")
 
     assert graph.tracked_files == {"index.html": "html"}
-    assert graph.files_skipped_unsupported == 1
 
 
 def test_parse_repo_mixes_real_symbols_and_tracked_only_files(tmp_path):

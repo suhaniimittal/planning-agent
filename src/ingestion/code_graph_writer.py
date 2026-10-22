@@ -14,6 +14,7 @@ reconciliation.
 
 from __future__ import annotations
 
+from . import code_crypto
 from .graph_writer import get_driver
 
 # Rows per write transaction. One UNWIND over a whole large repo (tens of
@@ -80,6 +81,8 @@ def upsert_files(service: str, records: list[dict]) -> None:
 
 
 def upsert_classes(service: str, records: list[dict]) -> None:
+    """Source, signature and docstring are stored encrypted (code_crypto)."""
+    records = [code_crypto.encrypt_row(r, label="Class", service=service) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -93,6 +96,8 @@ def upsert_classes(service: str, records: list[dict]) -> None:
 
 
 def upsert_functions(service: str, records: list[dict]) -> None:
+    """Source, signature and docstring are stored encrypted (code_crypto)."""
+    records = [code_crypto.encrypt_row(r, label="Function", service=service) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -106,6 +111,9 @@ def upsert_functions(service: str, records: list[dict]) -> None:
 
 
 def upsert_chunks(service: str, records: list[dict]) -> None:
+    """The text is stored encrypted, with the hashes of its words beside it
+    (``text_terms``) so the exact-name search still works (code_crypto)."""
+    records = [_sealed_chunk(service, r) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -117,6 +125,13 @@ def upsert_chunks(service: str, records: list[dict]) -> None:
         batch_size=_CHUNK_WRITE_BATCH,
         service=service,
     )
+
+
+def _sealed_chunk(service: str, row: dict) -> dict:
+    if "text" not in row or code_crypto.is_encrypted(row["text"]):
+        return code_crypto.encrypt_row(row, label="Chunk", service=service)
+    terms = code_crypto.text_terms(service, row["text"] or "")
+    return {**code_crypto.encrypt_row(row, label="Chunk", service=service), "text_terms": terms}
 
 
 def create_has_chunk_edges(service: str, function_to_chunk_qnames: list[tuple[str, str]]) -> None:
@@ -342,5 +357,9 @@ def load_current_symbols(service: str) -> tuple[list[dict], list[dict]]:
         for record in result:
             row = dict(record)
             kind = row.pop("kind")
+            # Decrypted here, for the summary digest built from it.
+            row = code_crypto.decrypt_row(
+                row, label=kind, service=service, qualified_name=row["qualified_name"]
+            )
             (classes if kind == "Class" else functions).append(row)
         return classes, functions

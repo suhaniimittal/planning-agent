@@ -111,27 +111,6 @@ def fetch_file_content(repo: str, path: str, ref: str, token: str | None = None)
     return base64.b64decode(content_b64).decode("utf-8")
 
 
-def create_pull_request(
-    repo: str,
-    head: str,
-    base: str,
-    title: str,
-    body: str,
-    token: str | None = None,
-) -> str:
-    """Opens a PR from `head` (the branch the coding agent just pushed) into
-    `base` (the service's default/manifest branch) — never a merge, always a
-    PR for human review. Returns the PR's html_url."""
-    url = f"{_API_BASE}/repos/{repo}/pulls"
-    payload = {"title": title, "body": body, "head": head, "base": base}
-    try:
-        resp = httpx.post(url, headers=_headers(token), json=payload, timeout=_TIMEOUT)
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        raise GitHubApiError(f"could not open PR for {repo} {head}->{base}: {e}") from e
-    return resp.json()["html_url"]
-
-
 def download_zipball(repo: str, ref: str, token: str | None = None, timeout: int = 120) -> bytes:
     """The repo's tracked files at `ref` (a commit sha or branch) as zip
     bytes — replaces `git clone`, since the platform container has no `git`

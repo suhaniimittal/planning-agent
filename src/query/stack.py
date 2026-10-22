@@ -36,7 +36,6 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from pathlib import Path
 
 import httpx
 
@@ -229,7 +228,6 @@ PARSERS = (
     ("pyproject.toml", parse_pyproject),
     ("go.mod", parse_go_mod),
 )
-BUILD_FILES = tuple(name for name, _ in PARSERS)
 
 
 # --- the whole picture: modules, Spring Boot's managed versions, Gradle catalogs ------
@@ -407,28 +405,3 @@ def read_stack(paths: list[str], read: Callable[[str], str]) -> ProjectStack:
 
 
 _SKIP_DIRS = {".git", "node_modules", "target", "build", "dist", ".gradle", ".venv", "venv"}
-
-
-def repository_paths(repo_root: Path, depth: int = 4) -> list[str]:
-    """A checkout's file paths, relative, without build output and dependencies."""
-    out: list[str] = []
-    for current, dirs, files in os.walk(repo_root):
-        rel = Path(current).relative_to(repo_root)
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and len(rel.parts) < depth]
-        out += [str(rel / f) if rel.parts else f for f in files]
-    return out
-
-
-def from_files(files: dict[str, str]) -> ProjectStack:
-    """The stack from build files already read (name -> text); the first found wins."""
-    for name, parse in PARSERS:
-        if files.get(name):
-            return parse(files[name])
-    return ProjectStack()
-
-
-def detect(repo_root: Path) -> ProjectStack:
-    """The stack of a checked-out repository: its build files, modules and catalog."""
-    return read_stack(
-        repository_paths(repo_root), lambda p: (repo_root / p).read_text(errors="replace")
-    )

@@ -86,7 +86,6 @@ class RepoGraph:
     # still covered by the cross-service dependency scan).
     tracked_files: dict[str, str] = field(default_factory=dict)
     files_parsed: int = 0
-    files_skipped_unsupported: int = 0
     files_skipped_oversized: int = 0
     files_failed: int = 0
 
@@ -912,8 +911,6 @@ def parse_repo(
                 if tracked_language is not None:
                     rel_path = str(path.relative_to(repo_root).as_posix())
                     graph.tracked_files[rel_path] = tracked_language
-                else:
-                    graph.files_skipped_unsupported += 1
                 continue
             try:
                 if path.stat().st_size > max_file_size_bytes:

@@ -2,10 +2,15 @@
 traversal, candidate-doc loading. Counterpart to graph_writer.py's writes —
 kept separate since the two paths have different callers and failure modes
 (a write failure breaks ingestion; a read failure breaks a live request).
+
+Code, signatures, docstrings, chunk text and summaries are stored encrypted
+(see src/ingestion/code_crypto.py); each read below decrypts only the rows it
+returns, as it returns them.
 """
 
 from __future__ import annotations
 
+from src.ingestion import code_crypto
 from src.ingestion.graph_writer import get_driver
 from src.ingestion.test_paths import CYPHER_TEST_PATH_RE
 
@@ -82,8 +87,8 @@ def load_candidate_docs(names: list[str]) -> list[dict]:
     """name + summary for exactly these service names — the short,
     code-derived overview generated at ingestion time (see
     src/ingestion/summarizer.py). There's no separate "full doc" tier
-    anymore: real per-symbol detail comes from load_code_symbols_for_services/
-    load_source_snippets instead, not a markdown document."""
+    anymore: real per-symbol detail comes from search_service_chunks/
+    load_symbols instead, not a markdown document."""
     if not names:
         return []
     with get_driver().session() as session:
@@ -95,33 +100,30 @@ def load_candidate_docs(names: list[str]) -> list[dict]:
             """,
             names=names,
         )
-        return [dict(r) for r in result]
+        return [_open_summary(dict(r)) for r in result]
 
 
-def load_code_symbols_for_services(names: list[str]) -> list[dict]:
-    """Class/Function metadata for these services — everything EXCEPT
-    source_snippet, which is kept in a separate, narrower read
-    (load_source_snippets) since a service can have hundreds of symbols and
-    most won't survive candidates.select_relevant_symbols' ranking/cap.
-    """
-    if not names:
-        return []
-    with get_driver().session() as session:
-        result = session.run(
-            """
-            MATCH (n)
-            WHERE (n:Class OR n:Function) AND n.service IN $names
-            RETURN n.service AS service, n.qualified_name AS qualified_name,
-                   n.name AS name, n.file_path AS file_path,
-                   n.line_start AS line_start, n.line_end AS line_end,
-                   n.signature AS signature, n.docstring AS docstring,
-                   n.language AS language,
-                   n.is_method AS is_method, n.parent_class AS parent_class,
-                   labels(n)[0] AS kind
-            """,
-            names=names,
-        )
-        return [dict(r) for r in result]
+def _open_summary(row: dict) -> dict:
+    return code_crypto.decrypt_row(
+        row, label="Service", service=row["name"], qualified_name=row["name"]
+    )
+
+
+def _open_symbol(row: dict) -> dict:
+    """A Class/Function row with its code fields decrypted; the row must
+    carry service, qualified_name and kind (the node's label)."""
+    return code_crypto.decrypt_row(
+        row, label=row["kind"], service=row["service"], qualified_name=row["qualified_name"]
+    )
+
+
+def _open_chunk(row: dict, service: str) -> dict:
+    """A chunk row with its text decrypted; the chunk's own qualified_name,
+    needed to decrypt, is dropped from what callers see."""
+    qualified_name = row.pop("chunk_qualified_name")
+    return code_crypto.decrypt_row(
+        row, label="Chunk", service=service, qualified_name=qualified_name
+    )
 
 
 def vector_search_chunks(embedding: list[float], service_names: list[str], k: int = 50) -> list[dict]:
@@ -148,44 +150,14 @@ def vector_search_chunks(embedding: list[float], service_names: list[str], k: in
             MATCH (f:Function)-[:HAS_CHUNK]->(node)
             WHERE node.service IN $service_names
             RETURN node.service AS service, f.qualified_name AS function_qualified_name,
-                   node.text AS text, score
+                   node.qualified_name AS chunk_qualified_name, node.text AS text, score
             ORDER BY score DESC
             """,
             k=k,
             embedding=embedding,
             service_names=service_names,
         )
-        return [dict(r) for r in result]
-
-
-def load_source_snippets(
-    service_qualified_name_pairs: list[tuple[str, str]],
-) -> dict[tuple[str, str], str]:
-    """source_snippet for exactly these (service, qualified_name) symbols,
-    keyed by that same (service, qualified_name) pair — called only for the
-    final, ranked+capped shortlist, never for every symbol a service has.
-
-    Keyed by the pair, not qualified_name alone: qualified_name is only
-    unique WITHIN a service (it's derived from file_path, which two
-    different repos can coincidentally share), so a bare-string key could
-    collide across services in the result.
-    """
-    if not service_qualified_name_pairs:
-        return {}
-    rows = [{"service": s, "qualified_name": q} for s, q in service_qualified_name_pairs]
-    with get_driver().session() as session:
-        result = session.run(
-            """
-            UNWIND $rows AS row
-            MATCH (n)
-            WHERE (n:Class OR n:Function)
-              AND n.service = row.service AND n.qualified_name = row.qualified_name
-            RETURN n.service AS service, n.qualified_name AS qualified_name,
-                   n.source_snippet AS source_snippet
-            """,
-            rows=rows,
-        )
-        return {(r["service"], r["qualified_name"]): r["source_snippet"] for r in result}
+        return [_open_chunk(dict(r), r["service"]) for r in result]
 
 
 def file_exists(service: str, file_path: str) -> bool:
@@ -274,7 +246,9 @@ def search_service_chunks(
     ticket strongly is enough, so a specific detail is not averaged away.
     Two reads, merged: the top `k` by that score, plus every chunk
     containing one of `identifiers` (exact code names from the issue text),
-    whatever its score.
+    whatever its score. The text is encrypted, so the second read matches
+    the hashes of each identifier's words (`text_terms`), then keeps only
+    the chunks whose decrypted text really contains it.
 
     Returns [{"function_qualified_name", "text", "score", "identifiers"}].
     """
@@ -292,28 +266,38 @@ def search_service_chunks(
             WITH c, {score} AS score
             ORDER BY score DESC LIMIT $k
             MATCH (f:Function)-[:HAS_CHUNK]->(c)
-            RETURN f.qualified_name AS function_qualified_name, c.text AS text, score,
+            RETURN f.qualified_name AS function_qualified_name,
+                   c.qualified_name AS chunk_qualified_name, c.text AS text, score,
                    [] AS identifiers
             """,
             k=k,
             **params,
         )
-        rows = [dict(r) for r in semantic]
+        rows = [_open_chunk(dict(r), service) for r in semantic]
         if identifiers:
+            groups = [code_crypto.query_terms(service, w) for w in identifiers]
             exact = session.run(
                 f"""
                 MATCH (c:Chunk {{service: $service}})
-                WHERE any(w IN $identifiers WHERE c.text CONTAINS w) AND {_NOT_TEST}
+                WHERE {_NOT_TEST} AND (
+                  any(g IN $groups WHERE size(g) > 0
+                      AND all(t IN g WHERE t IN coalesce(c.text_terms, [])))
+                  OR (c.text_terms IS NULL AND any(w IN $identifiers WHERE c.text CONTAINS w)))
                 WITH c, {score} AS score
                 MATCH (f:Function)-[:HAS_CHUNK]->(c)
-                RETURN f.qualified_name AS function_qualified_name, c.text AS text, score,
-                       [w IN $identifiers WHERE c.text CONTAINS w] AS identifiers
+                RETURN f.qualified_name AS function_qualified_name,
+                       c.qualified_name AS chunk_qualified_name, c.text AS text, score
                 LIMIT 200
                 """,
+                groups=groups,
                 identifiers=identifiers,
                 **params,
             )
-            rows += [dict(r) for r in exact]
+            for record in exact:
+                row = _open_chunk(dict(record), service)
+                row["identifiers"] = [w for w in identifiers if w in (row["text"] or "")]
+                if row["identifiers"]:  # a hash match is checked against the real text
+                    rows.append(row)
         return rows
 
 
@@ -340,7 +324,7 @@ def load_symbols(service_qualified_name_pairs: list[tuple[str, str]]) -> list[di
             """,
             rows=rows,
         )
-        return [dict(r) for r in result]
+        return [_open_symbol(dict(r)) for r in result]
 
 
 def load_file_context(

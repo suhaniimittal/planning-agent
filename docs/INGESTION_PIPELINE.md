@@ -169,7 +169,7 @@ showing the model that decides the plan.
 | B — `embed(issue text)` | `src/ingestion/embedder.py::embed()` (reused as-is) |
 | C/D — vector search | `src/query/graph_reader.py::vector_search_services()` |
 | E — graph traversal | `src/query/graph_reader.py::expand_neighbors()` |
-| F — candidate merge | `src/query/candidates.py::merge_candidates()` |
+| F — candidate merge | `src/query/query_flow.py::build_tdd()` |
 | G — doc loading | `src/query/graph_reader.py::load_candidate_docs()` |
 | H — LLM call | `src/query/planner.py::call_llm()` |
 | I — structured TDD | `src/query/planner.py::parse_tdd()` → `src/query/models.py::TechnicalDesignDoc` |
@@ -183,10 +183,10 @@ design document, not just a diagnosis: `title`, `issue_summary`, per-service
 Reference table in its `full_doc`, never fabricated — plus a
 `change_description` distinct from its `reasoning`), `risks`,
 `testing_notes`, and `open_questions` for anything not determinable from the
-docs alone. `src/query/render.py::render_markdown()` renders it as a
-readable Markdown document; `generate_technical_design()` returns both the
-structured data and the rendered Markdown so a coding agent can consume
-either form.
+docs alone. `src/query/render.py` renders it as a Confluence page
+(`render_confluence()`) and as plain text (`render_text()`, the PDF and what
+the coding agent reads); `generate_technical_design()` returns the structured
+data alongside them.
 
 **Traversal direction (step E):** both directions, 1-2 hops, not just
 outgoing. `CALLS` means "A depends on B," but a bug's real fix can live in

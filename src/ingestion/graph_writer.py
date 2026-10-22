@@ -8,6 +8,7 @@ import os
 
 from neo4j import GraphDatabase
 
+from src.ingestion import code_crypto
 from src.ingestion.secret_store import secret
 
 _driver = None
@@ -160,7 +161,10 @@ def update_service_summary(name: str, summary: str, embedding: list[float]) -> N
                 s.summary_embedding = $embedding
             """,
             name=name,
-            summary=summary,
+            # The summary describes the code, so it is stored encrypted too.
+            summary=code_crypto.encrypt(
+                summary, label="Service", service=name, qualified_name=name, field="summary"
+            ),
             embedding=embedding,
         )
 

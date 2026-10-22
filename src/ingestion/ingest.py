@@ -575,7 +575,7 @@ async def run(
 ) -> None:
     """`specs`, when given, IS this run's complete service list — the
     published agent's own path, built from the `repos` text a user typed
-    into the UI form (see manifest.parse_service_specs), never from
+    into the UI form (see tools/ingestion_tools.py), never from
     services.yaml. `specs=None` falls back to services.yaml via
     load_services() — local CLI/dev convenience only.
 

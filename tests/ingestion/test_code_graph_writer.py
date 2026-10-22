@@ -1,4 +1,4 @@
-from src.ingestion import code_graph_writer
+from src.ingestion import code_crypto, code_graph_writer
 
 
 class FakeSession:
@@ -153,12 +153,17 @@ def test_create_code_indexes_creates_all_indexes(monkeypatch):
 
 def test_upsert_chunks_batches_via_unwind(monkeypatch):
     driver = _patch_driver(monkeypatch)
-    rows = [{"qualified_name": "a.py::fn::chunk0", "text": "..."}]
+    rows = [{"qualified_name": "a.py::fn::chunk0", "text": "total = applyDiscount(x)"}]
     code_graph_writer.upsert_chunks("orders", rows)
 
     query, params = driver._session.queries[0]
     assert "MERGE (c:Chunk {service: $service, qualified_name: row.qualified_name})" in query
-    assert params == {"service": "orders", "rows": rows}
+    assert params["service"] == "orders"
+    (stored,) = params["rows"]
+    # stored encrypted, with the hashes of its words for the exact-name search
+    assert code_crypto.is_encrypted(stored["text"]) and "applyDiscount" not in stored["text"]
+    assert stored["text_terms"] == code_crypto.text_terms("orders", "total = applyDiscount(x)")
+    assert rows[0]["text"] == "total = applyDiscount(x)"  # the caller's row is untouched
 
 
 def test_upsert_chunks_skips_query_for_empty_list(monkeypatch):
