@@ -1077,3 +1077,19 @@ def test_prompt_forbids_inventing_module_paths():
     prompt = build_system_prompt("bug")
     assert "DO NOT INVENT MODULE PATHS" in prompt
     assert "fails as a build error before any test runs" in prompt
+
+
+def test_prompt_forbids_an_undeclared_second_edit():
+    """A one-line fix's sketch also narrowed the regex feeding it, from both
+    separators to one. The join was the fix; the narrowing was collateral and
+    broke validation for input the old code had cleaned — and the design read
+    as correct because it was never mentioned."""
+    prompt = build_system_prompt("bug")
+    assert "A SKETCH CHANGES WHAT ITS `change_description` SAYS, AND NOTHING ELSE" in prompt
+    assert "undeclared second change" in prompt
+    assert "A condition you did not have to touch is a condition you do not get to simplify" in prompt
+
+
+def test_self_check_covers_undeclared_edits():
+    prompt = build_system_prompt("bug")
+    assert "nothing narrowed, dropped or tidied along the way" in prompt
