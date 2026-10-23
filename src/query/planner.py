@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 from typing import get_origin
 
@@ -29,7 +30,17 @@ from src.ingestion import gateway_env
 
 from .models import FileChange, ServicePlan, TechnicalDesignDoc
 
-_GATEWAY_PROVIDER, _GATEWAY_MODEL = "anthropic", "claude-sonnet-4-6"
+_GATEWAY_PROVIDER = "anthropic"
+# The strongest Claude first (2026-10-23), then the next, so a design is never
+# lost to a model the gateway does not offer. PLANNING_LLM_MODEL puts one first.
+_GATEWAY_MODELS = ("claude-opus-5-5", "claude-opus-4-8", "claude-sonnet-4-6")
+# Room for the TDD itself plus the thinking an Opus model does before writing it.
+_GATEWAY_MAX_TOKENS = 32000
+# Words in a gateway error that mean "this model is not available here".
+_MODEL_REJECTED = re.compile(
+    r"model|not found|404|does not exist|unknown|invalid|unsupported|no such", re.IGNORECASE
+)
+_working_model: str | None = None
 # gpt-5.4, not 5.5: the newer model refuses `temperature` outright ("does not
 # support 0 with this model"), leaving the API default of 1.0, and the same
 # ticket then produced visibly different TDDs run to run. 5.4 is one
@@ -431,6 +442,28 @@ def build_system_prompt(mode: str = "bug") -> str:
         "(`reasoning`) — do not conflate them.\n\n"
         "List anything that couldn't be determined from the documentation "
         "alone in `risks` or `open_questions` rather than stating it as fact.\n\n"
+        "DECIDE WHAT THE CODE LETS YOU DECIDE (2026-10-23). An open question is "
+        "for what neither the ticket nor the code can settle. Where a standard, "
+        "safe engineering answer exists, choose it in the design, say why in "
+        "`reasoning`, and give it a test — do not leave it as a risk:\n"
+        "- Money: the NEW calculation sums and compares in integer minor units "
+        "(paise as a `long`; 2,00,000 INR = 20_000_000 paise). This does NOT "
+        "change how the code stores money: if amounts are stored as `double`, "
+        "keep them so and convert each one where it is read (e.g. "
+        "`Math.round(amount * 100)`), so it is no broader than the ticket. If the "
+        "code already uses a decimal money type (e.g. BigDecimal), use that "
+        "instead. Never sum or compare money as floating point.\n"
+        "- Time rules (day boundaries, time zones): read the time from an "
+        "injectable `Clock` (or the code's existing time source) so a test can "
+        "fix it; production keeps the system clock.\n"
+        "- A check followed by the update it guards (a limit or balance check, "
+        "then the debit): make check and update one atomic step (a lock or "
+        "synchronized block around both) when the code can run concurrently.\n"
+        "- Validation order: keep every existing check, its exception type and "
+        "its position; put a new check where the ticket's rules place it, and "
+        "write the full resulting order in `implementation_notes`.\n"
+        "- A rejected operation must leave state unchanged (balances, history); "
+        "say so and test it.\n\n"
         "Every service that has a 'Real code symbols' section and is NOT "
         "marked as graph-connected background context was chosen as likely "
         "involved in this issue. For EACH of those services, either propose "
@@ -1071,28 +1104,42 @@ def _use_gateway() -> bool:
     return gateway_env.use_gateway()
 
 
+def gateway_models() -> list[str]:
+    """The models to try, in order: the one that last worked, PLANNING_LLM_MODEL,
+    then the strongest available Claude down to the one used before."""
+    chosen = [_working_model, os.environ.get("PLANNING_LLM_MODEL", "").strip()]
+    return list(dict.fromkeys(m for m in [*chosen, *_GATEWAY_MODELS] if m))
+
+
 async def _plan_via_gateway(system_prompt: str, user_prompt: str) -> str:
+    global _working_model
     from agent_lib.gateway.ai import AiGatewayClient
 
+    models = gateway_models()
     async with AiGatewayClient(
         gateway_key=gateway_env.gateway_key(),
         gateway_url=gateway_env.gateway_url(),
     ) as client:
-        reply = await client.chat(
-            provider=_GATEWAY_PROVIDER,
-            model_name=_GATEWAY_MODEL,
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            # The schema grew substantially (architecture/flow/sequence
-            # diagrams, requirements, testing plan, etc.), and diagrams are
-            # now explicitly required rather than optional — 8000 was
-            # already a big jump from the original 4000, but multiple
-            # multi-line ASCII diagrams plus everything else can still eat
-            # into it fast.
-            max_tokens=12000,
-            temperature=_TEMPERATURE,
-        )
-        return reply["content"]
+        for model in models:
+            try:
+                reply = await client.chat(
+                    provider=_GATEWAY_PROVIDER,
+                    model_name=model,
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=_GATEWAY_MAX_TOKENS,
+                    temperature=_TEMPERATURE,  # dropped by the SDK for a thinking model
+                )
+            except Exception as error:
+                if model == models[-1] or not _MODEL_REJECTED.search(str(error)):
+                    raise
+                print(f"  [PLANNER] {model} not available ({error}); trying the next model")
+                continue
+            if model != _working_model:
+                print(f"  [PLANNER] answered by {model}")
+            _working_model = model
+            return reply["content"]
+    raise RuntimeError("no model answered")  # unreachable: the last model raises
 
 
 def _openai_params(model: str) -> dict:
