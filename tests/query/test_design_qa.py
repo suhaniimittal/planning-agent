@@ -38,3 +38,30 @@ async def test_no_code_graph_still_answers_from_the_tdd(monkeypatch):
     monkeypatch.setattr(design_qa.planner, "call_llm", call)
     answer = await design_qa.answer_question("Why X?", "TDD body")
     assert answer.answer == "From the TDD" and "RELATED CODE" not in seen["user"]
+
+
+@pytest.mark.asyncio
+async def test_a_service_without_a_service_md_is_still_searched_for_code(monkeypatch):
+    # 2026-10-23: the doc index never returned a service with no SERVICE.md, so a
+    # question about bank-transfer-service was answered without seeing its code.
+    from src.query import design_qa, graph_reader
+
+    async def fake_embed(text):
+        return [0.1]
+
+    searched = {}
+
+    def chunks(embedding, services, k=50):
+        searched["services"] = services
+        return [{"service": "bank", "function_qualified_name": "T::transfer", "text": "code"}]
+
+    monkeypatch.setattr(design_qa, "embed", fake_embed)
+    monkeypatch.setattr(
+        graph_reader, "summary_scores", lambda e, names=None: {"bank": 0.0, "ui": 0.4}
+    )
+    monkeypatch.setattr(graph_reader, "vector_search_chunks", chunks)
+
+    code = await design_qa._related_code("why not paise?", "TDD")
+
+    assert searched["services"] == ["ui", "bank"]  # every service, best doc first
+    assert code == ["[bank] T::transfer\ncode"]

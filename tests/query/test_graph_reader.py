@@ -40,19 +40,6 @@ def _patch_driver(monkeypatch, records):
     return fake_driver
 
 
-def test_vector_search_services_passes_k_and_embedding_params(monkeypatch):
-    driver = _patch_driver(monkeypatch, [{"name": "orders", "score": 0.9}])
-    result = graph_reader.vector_search_services([0.1, 0.2], k=3)
-    assert driver._session.last_params == {"k": 3, "embedding": [0.1, 0.2]}
-    assert result == [{"name": "orders", "score": 0.9}]
-
-
-def test_vector_search_services_query_uses_correct_index_name(monkeypatch):
-    driver = _patch_driver(monkeypatch, [])
-    graph_reader.vector_search_services([0.1], k=5)
-    assert "service_doc_index" in driver._session.last_query
-
-
 def test_expand_neighbors_query_uses_undirected_calls_pattern(monkeypatch):
     driver = _patch_driver(monkeypatch, [])
     graph_reader.expand_neighbors(["orders"], hops=2)

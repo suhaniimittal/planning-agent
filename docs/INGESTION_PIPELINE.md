@@ -167,7 +167,7 @@ showing the model that decides the plan.
 | Flowchart step | Function |
 |---|---|
 | B — `embed(issue text)` | `src/ingestion/embedder.py::embed()` (reused as-is) |
-| C/D — vector search | `src/query/graph_reader.py::vector_search_services()` |
+| C/D — vector search | `src/query/graph_reader.py::summary_scores()` (exact; every service) |
 | E — graph traversal | `src/query/graph_reader.py::expand_neighbors()` |
 | F — candidate merge | `src/query/query_flow.py::build_tdd()` |
 | G — doc loading | `src/query/graph_reader.py::load_candidate_docs()` |
@@ -240,5 +240,5 @@ See `.env.example` for the full template.
 - **`db.index.vector.queryNodes` deprecation**: Neo4j logs a deprecation
   warning for this procedure at query time (replaced by `SEARCH`). Still
   functionally correct as of this writing (verified against a live
-  instance), but `graph_reader.vector_search_services()` should be migrated
+  instance), but `graph_reader.vector_search_chunks()` should be migrated
   before the procedure is actually removed in a future Neo4j version.

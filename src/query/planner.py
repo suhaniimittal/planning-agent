@@ -968,7 +968,7 @@ def build_user_prompt(
     Giving it the real edges as input directly fixes that.
 
     `seed_names`: services that were DIRECT semantic matches to the issue
-    (vector_search_services hits), as opposed to ones only pulled in via a
+    (the best-scoring services), as opposed to ones only pulled in via a
     1-2 hop CALLS traversal from a seed. `None` (the default) treats every
     candidate as a seed, preserving old behavior for any caller that doesn't
     distinguish them.

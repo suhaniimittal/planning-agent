@@ -15,25 +15,6 @@ from src.ingestion.graph_writer import get_driver
 from src.ingestion.test_paths import CYPHER_SPEC_FILE_RE, CYPHER_TEST_PATH_RE, is_test_path
 
 
-def vector_search_services(embedding: list[float], k: int = 5) -> list[dict]:
-    """Top-k services by cosine similarity on doc_embedding.
-
-    Returns [{"name": str, "score": float}, ...], descending score.
-    """
-    with get_driver().session() as session:
-        result = session.run(
-            """
-            CALL db.index.vector.queryNodes('service_doc_index', $k, $embedding)
-            YIELD node, score
-            RETURN node.name AS name, score
-            ORDER BY score DESC
-            """,
-            k=k,
-            embedding=embedding,
-        )
-        return [{"name": r["name"], "score": r["score"]} for r in result]
-
-
 def expand_neighbors(seed_names: list[str], hops: int = 2) -> list[dict]:
     """Services within `hops` of any seed, via CALLS in either direction.
 
@@ -145,7 +126,7 @@ def vector_search_chunks(
     graph today this is a non-issue, but at real scale a global top-k could
     theoretically miss a relevant chunk that belongs to a candidate service
     if enough higher-scoring chunks from OTHER services crowd it out; same
-    class of caveat already noted for `vector_search_services` and the
+    class of caveat as the
     `db.index.vector.queryNodes` deprecation in docs/INGESTION_PIPELINE.md.
     """
     if not service_names:

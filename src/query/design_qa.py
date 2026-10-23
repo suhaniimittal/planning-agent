@@ -54,10 +54,17 @@ class DesignAnswer:
 
 
 async def _related_code(question: str, tdd_text: str) -> list[str]:
-    """The code the question is most likely about: chunks near the question."""
+    """The code the question is most likely about: chunks near the question.
+
+    Every service is searched, best SERVICE.md match first (2026-10-23): a
+    service without a SERVICE.md has no doc embedding, so the doc index alone
+    never returned it and its questions were answered without seeing any code.
+    The chunks' own similarity decides what is shown.
+    """
     try:
         embedding = await embed(f"{question}\n\n{tdd_text[:2000]}")
-        services = [h["name"] for h in graph_reader.vector_search_services(embedding, k=3)]
+        scores = graph_reader.summary_scores(embedding)
+        services = sorted(scores, key=lambda name: -scores[name])
         hits = graph_reader.vector_search_chunks(embedding, services, k=_MAX_SNIPPETS * 3)
     except Exception as error:  # noqa: BLE001 - an answer from the TDD alone is still useful
         print(f"  [DESIGN Q&A] no code context: {type(error).__name__}: {error}")
