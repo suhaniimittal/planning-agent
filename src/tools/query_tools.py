@@ -46,9 +46,34 @@ def _team_id() -> str:
     return os.environ.get("TENANT_ID") or os.environ["STORAGE_AGENTS_BUCKET"]
 
 
-def _slug(text: str, max_len: int = 40) -> str:
+def _slug(text: str, max_len: int = 45) -> str:
+    """A filename-safe slug, cut at a word boundary.
+
+    Cutting at a fixed character count left names ending mid-word
+    ("...silently-fails-wit"), so the truncation backs up to the last
+    hyphen instead when one is close enough to the limit."""
     slug = _NON_SLUG_CHARS.sub("-", text.lower()).strip("-")
-    return slug[:max_len].rstrip("-") or "issue"
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    if len(slug) <= max_len:
+        return slug or "technical-design"
+    cut = slug.rfind("-", max_len // 2, max_len)
+    return slug[: cut if cut > 0 else max_len].rstrip("-") or "technical-design"
+
+
+def _stamp(generated_at: str | None) -> str:
+    """The run's own generation time as a compact, sortable filename part.
+
+    Taken from the TDD's `generated_at` rather than the clock, so the
+    filename and the "Generated:" line inside the PDF always name the same
+    run — the whole point of the stamp is telling two runs of one ticket
+    apart, which a filename that disagreed with the document would defeat.
+    Falls back to now() only for a TDD that was never stamped."""
+    try:
+        when = datetime.fromisoformat(generated_at) if generated_at else datetime.now(UTC)
+    except ValueError:
+        when = datetime.now(UTC)
+    return when.astimezone(UTC).strftime("%Y%m%d-%H%M%S")
 
 
 @tool()
@@ -99,11 +124,12 @@ def technology_constraints(service_repos: dict[str, str]) -> list[str]:
 @tool()
 async def generate_technical_design(
     issue_text: str,
-    top_k: int = 5,
-    hops: int = 2,
+    top_k: int | None = None,
+    hops: int | None = None,
     service_names: list[str] | None = None,
     return_document: bool = False,
     service_repos: dict[str, str] | None = None,
+    mode: str | None = None,
 ) -> dict:
     """Search the service graph for services relevant to a requirement/bug
     report and produce a technical design doc: structured data plus a real
@@ -120,21 +146,39 @@ async def generate_technical_design(
     service in the graph. `service_repos` ("name" -> "org/repo[@branch]"): the
     repositories whose build files give the design its technology
     constraints. `return_document`: also return the title, the
-    Confluence HTML and the plain text, for the orchestrator."""
+    Confluence HTML and the plain text, for the orchestrator. `mode`:
+    "bug" or "feature" to override how the ticket is classified."""
     constraints, api_contracts = repository_facts(service_repos or {})
+    # Only what the caller actually chose is forwarded, so build_tdd's own
+    # signature stays the single definition of what top_k and hops default
+    # to — nothing here restates the numbers.
+    chosen = {
+        name: value for name, value in (("top_k", top_k), ("hops", hops)) if value is not None
+    }
     tdd = await build_tdd(
         issue_text,
-        top_k=top_k,
-        hops=hops,
         service_names=service_names,
         technology_constraints=constraints,
         api_contracts=api_contracts,
+        mode=mode,
+        **chosen,
     )
     pdf_bytes = render_pdf(tdd)
 
     storage.init_client()
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    file_name = f"technical_designs/{timestamp}_{_slug(issue_text)}.pdf"
+    # Named from the TDD's own title, not the raw issue text: the title is
+    # written to describe the change, while the ticket text opens with
+    # whatever the reporter typed first and truncated to something like
+    # "deferred-order-submit-silently-fails-wit".
+    #
+    # The timestamp suffix gives every run its own name and its own storage
+    # key. Without it, re-running a ticket overwrote its previous PDF at the
+    # same key, and a browser downloading the result still appended "(2)",
+    # "(3)" to avoid a local filename collision — so a stale download and a
+    # fresh one looked identical and only the "Generated:" line inside the
+    # PDF could tell them apart. The cost is accepted: one ticket run twice
+    # now leaves two files.
+    file_name = f"technical_designs/{_slug(tdd.title)}-{_stamp(tdd.generated_at)}.pdf"
     _, s3_key = storage.store_object(_team_id(), file_name, pdf_bytes, "application/pdf")
 
     _publish_to_confluence(tdd)

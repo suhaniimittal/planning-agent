@@ -16,6 +16,8 @@ import posixpath
 import re
 from typing import NamedTuple
 
+from src.ingestion.test_paths import is_test_path
+
 from . import graph_reader
 from .models import FileChange, TechnicalDesignDoc
 
@@ -42,25 +44,25 @@ def _list(paths: list[str], limit: int = 3) -> str:
     return shown + (f" (+{len(paths) - limit} more)" if len(paths) > limit else "")
 
 
-# The note for new code added to a file that already exists — a change TO
-# that file, so it is marked "modify" (see verify_change).
-_IN_EXISTING_FILE = "New code in the existing file"
+def _verify_create(service: str, path: str | None) -> tuple[str, str, bool]:
+    """(status, note, the file already exists).
 
-
-def _verify_create(service: str, path: str | None) -> tuple[str, str]:
+    The third value is what turns a mislabelled "create" back into a
+    "modify" — see verify_change."""
     if path is None:
-        return "unverified", "No file was given for the new code."
+        return "unverified", "No file was given for the new code.", False
     if graph_reader.file_exists(service, path):
-        return "new", f"{_IN_EXISTING_FILE} `{path}`."
+        return "new", f"New code in the existing file `{path}`.", True
     if graph_reader.folder_exists(service, path):
         return (
             "unverified",
             f"`{path}` is a folder, not a file — the new file's name was not given.",
+            False,
         )
     parent = posixpath.dirname(path)
     if parent and graph_reader.folder_exists(service, parent):
-        return "new", f"New file in the existing folder `{parent}`."
-    return "unverified", f"Neither `{path}` nor its folder exists in `{service}`."
+        return "new", f"New file in the existing folder `{parent}`.", False
+    return "unverified", f"Neither `{path}` nor its folder exists in `{service}`.", False
 
 
 class _Result(NamedTuple):
@@ -84,10 +86,29 @@ def _dotted_part_in_file(service: str, path: str, symbol: str) -> str | None:
 
 
 def _verify_existing(
-    service: str, path: str | None, symbol: str, shown_files: set[str]
+    service: str,
+    path: str | None,
+    symbol: str,
+    shown_files: set[str],
+    change_type: str = "modify",
 ) -> _Result:
-    """For "modify"/"delete": the symbol must already exist."""
+    """For "modify"/"delete": the symbol must already exist — except that a
+    "modify" naming a symbol its real file does not have yet is how new code
+    in an existing file is now expressed, so that case is "new", not a
+    failure. A "delete" of a symbol that isn't there stays unverified: there
+    is nothing to remove."""
     found_in = graph_reader.find_symbol_files(service, symbol) if symbol else []
+
+    # A production change never means the test copy of a same-named symbol
+    # (a Cypress page object, a fixture builder). A genuine test change was
+    # already routed to _verify_test_file by its own path, so everything
+    # reaching here wants the real file — and dropping the test copies is
+    # what turns "exists in 2 files, which one is unclear" into the one
+    # answer, instead of an UNVERIFIED change nobody may act on.
+    if len(found_in) > 1:
+        non_test = [f for f in found_in if not is_test_path(f)]
+        if non_test:
+            found_in = non_test
 
     if path is not None and path in found_in:
         return _Result("verified", f"`{symbol}` found in `{path}`.", path)
@@ -125,6 +146,12 @@ def _verify_existing(
                 path,
                 real_symbol,
             )
+        if change_type == "modify":
+            return _Result(
+                "new",
+                f"New code in the existing file `{path}` — `{symbol}` is not in it today.",
+                path,
+            )
         return _Result(
             "unverified",
             f"`{path}` exists, but `{symbol}` was not found in it — "
@@ -147,20 +174,42 @@ def _verify_existing(
     )
 
 
+def _verify_test_file(service: str, path: str | None) -> _Result:
+    """A change to a TEST file is verified by its path alone.
+
+    Its `function_or_symbol` names the PRODUCTION symbol whose behaviour
+    changed, which by definition lives in the production file — so the
+    normal symbol lookup would find exactly one home for it and "correct"
+    the test path into the production path, silently turning "update this
+    test" into "edit this source file again". Test bodies are never shown to
+    the planner either (test chunks are excluded from search), so there is no
+    symbol inside the test to check against."""
+    if path is None:
+        return _Result("unverified", "No file was given for the test change.", None)
+    if graph_reader.file_exists(service, path):
+        return _Result("verified", f"Existing test file `{path}`.", path)
+    parent = posixpath.dirname(path)
+    if parent and graph_reader.folder_exists(service, parent):
+        return _Result("new", f"New test file in the existing folder `{parent}`.", path)
+    return _Result("unverified", f"Test file `{path}` was not found in `{service}`.", path)
+
+
 def verify_change(service: str, change: FileChange, shown_files: set[str]) -> None:
     path = _normalize_path(change.file_path)
     symbol = _normalize_symbol(change.function_or_symbol)
-    if change.change_type == "create":
-        status, note = _verify_create(service, path)
-        result = _Result(status, note, path)
-        if note.startswith(_IN_EXISTING_FILE):
-            # A new method in a file that already exists changes that file
-            # (2026-10-14). Left as "create", the file was listed under
-            # "Files to Create" and Coding wrote it from scratch, dropping
-            # everything already in it.
+    if is_test_path(path):
+        result = _verify_test_file(service, path)
+    elif change.change_type == "create":
+        status, note, file_already_exists = _verify_create(service, path)
+        # `change_type` describes what happens to the FILE. New code going
+        # into a file that already exists is a modify, whatever the model
+        # called it — a consumer acting on "create" does not read the file
+        # first, so it would replace its contents with only the new code.
+        if file_already_exists:
             change.change_type = "modify"
+        result = _Result(status, note, path)
     else:
-        result = _verify_existing(service, path, symbol, shown_files)
+        result = _verify_existing(service, path, symbol, shown_files, change.change_type)
     change.verification = result.status
     change.verification_note = result.note
     change.file_path = result.path

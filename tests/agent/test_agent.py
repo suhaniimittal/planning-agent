@@ -66,7 +66,9 @@ async def test_the_orchestrator_can_ask_for_the_document_itself(tools):
     )
     assert recorder.calls[1] == (
         "generate_technical_design",
-        ("Add a daily limit", 5, 2, ["bank"], True, {"bank": "o/bank"}),
+        # top_k/hops left as None: generate_technical_design owns their defaults;
+        # the last value is the optional bug/feature mode.
+        ("Add a daily limit", None, None, ["bank"], True, {"bank": "o/bank"}, None),
     )
     assert out["document"] == {
         "title": "Daily limit",

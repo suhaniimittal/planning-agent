@@ -112,8 +112,18 @@ def test_render_text_architecture_uses_proposed_components_and_real_dependencies
             ServiceDependency(source="orders", target="shipping", via="kafka:orders.created")
         ],
     )
-    assert "[Orders]" in text and "--> [Payment]" in text
-    assert "orders -> shipping (via kafka:orders.created)" in text
+    # One merged list, each edge carrying its provenance. The previous version
+    # printed the model's components and the graph's verified edges as two
+    # separate blocks of arrows, with nothing telling the reader which to
+    # believe, and rendered a component that calls nothing as
+    # "(no further dependencies)" — which reads like a failure, not a fact.
+    assert "Components:" in text
+    assert "Orders, Payment, orders, shipping" in text
+    assert "Orders --> Payment" in text
+    assert "(proposed by this design)" in text
+    assert "orders --> shipping" in text
+    assert "(verified in the code graph, via kafka:orders.created)" in text
+    assert "no further dependencies" not in text
 
 
 def test_render_text_testing_is_a_list_not_a_table():
@@ -294,3 +304,93 @@ def test_what_must_keep_working_and_the_versions_are_part_of_the_requirements():
 def test_without_them_the_requirements_read_as_before():
     page = render_confluence(_tdd())
     assert "Existing behaviour to preserve" not in page and "Technology constraints" not in page
+
+
+def _reference_change() -> FileChange:
+    return FileChange(
+        file_path="src/.../ReportStatus.kt",
+        function_or_symbol="ReportStatus",
+        change_description="New code reads this enum to decide printability",
+        implementation_notes="This file is NOT edited.",
+        pseudocode_sketch="",
+        reasoning="The caller needs the existing statuses",
+        change_type="reference",
+    )
+
+
+def test_render_text_keeps_reference_files_out_of_files_to_change():
+    """A "reference" change is a symbol the design reads without editing it.
+    Listing it under FILES TO CHANGE sent coding_agent to open files the TDD
+    itself said not to touch."""
+    tdd = _tdd()
+    tdd.services[0].changes.append(_reference_change())
+    text = render_text(tdd)
+    files = text.split("FILES TO CHANGE")[1].split("FILES READ BUT NOT CHANGED")[0]
+    assert "ReportStatus.kt" not in files
+    assert "OrdersController.java" in files
+
+
+def test_render_text_lists_reference_files_in_their_own_section():
+    tdd = _tdd()
+    tdd.services[0].changes.append(_reference_change())
+    text = render_text(tdd)
+    read_only = text.split("FILES READ BUT NOT CHANGED")[1]
+    assert "orders\n  - src/.../ReportStatus.kt" in read_only
+
+
+def test_render_text_omits_the_read_only_section_when_nothing_is_referenced():
+    assert "FILES READ BUT NOT CHANGED" not in render_text(_tdd())
+
+
+def test_render_text_spells_out_that_a_reference_is_not_a_change():
+    tdd = _tdd()
+    tdd.services[0].changes.append(_reference_change())
+    assert "ReportStatus  (reference (read, not changed))" in render_text(tdd)
+
+
+def test_render_confluence_separates_reference_files():
+    tdd = _tdd()
+    tdd.services[0].changes.append(_reference_change())
+    for body in (render_confluence(tdd),):
+        files = body.split("Files to Create / Modify / Delete")[1]
+        create_to_delete = files.split("Read but NOT changed")[0]
+        assert "ReportStatus.kt" not in create_to_delete
+        assert "Read but NOT changed" in files
+        assert "ReportStatus.kt" in files.split("Read but NOT changed")[1]
+
+
+def test_root_cause_splits_every_label_the_prompts_emit():
+    """These labels arrive inside one string field, often as a run-on
+    paragraph; a label the regex doesn't know renders as a wall of text."""
+    trace = (
+        "Accepted at: ui/view.tsx:onSubmit - read raw. "
+        "Validated at: ui/schema.ts:phone - anchored regex. "
+        "Transformed at: not shown in the evidence. "
+        "Stored at: cs/X.kt:setPhone - written as-is. "
+        "Consumed at: cs/Y.kt:read - expects trimmed. "
+        "Confirmed: leading space - ui/schema.ts. "
+        "Hypothesis: paste adds it - unproven. "
+        "Exists: a validator - ui/schema.ts. "
+        "Missing: trimming - no shown code does it. "
+        "Extend: ui/schema.ts - the existing validator. "
+        "Out of scope: server-side rules - the ticket excludes them. "
+        "Unknown: where tests live. "
+        "Not the cause: the server - it never receives the value."
+    )
+    text = render_text(_tdd(root_cause_analysis=trace))
+    for label in (
+        "Accepted at:",
+        "Validated at:",
+        "Transformed at:",
+        "Stored at:",
+        "Consumed at:",
+        "Confirmed:",
+        "Hypothesis:",
+        "Exists:",
+        "Missing:",
+        "Extend:",
+        "Out of scope:",
+        "Unknown:",
+        "Not the cause:",
+    ):
+        assert f"\n{label}" in text, label

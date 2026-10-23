@@ -225,32 +225,50 @@ def test_local_folder_fingerprint_changes_when_a_file_changes(tmp_path):
     import os
 
     (tmp_path / "app.py").write_text("one")
-    first = repo_fetcher.local_folder_fingerprint(tmp_path, {"orders"})
-    assert repo_fetcher.local_folder_fingerprint(tmp_path, {"orders"}) == first
+    first = repo_fetcher.local_folder_fingerprint(tmp_path)
+    assert repo_fetcher.local_folder_fingerprint(tmp_path) == first
 
     (tmp_path / "app.py").write_text("two!")
-    edited = repo_fetcher.local_folder_fingerprint(tmp_path, {"orders"})
+    edited = repo_fetcher.local_folder_fingerprint(tmp_path)
     assert edited != first
 
     (tmp_path / "new.py").write_text("x")
-    assert repo_fetcher.local_folder_fingerprint(tmp_path, {"orders"}) != edited
+    assert repo_fetcher.local_folder_fingerprint(tmp_path) != edited
 
     os.remove(tmp_path / "new.py")
-    assert repo_fetcher.local_folder_fingerprint(tmp_path, {"orders"}) == edited
+    assert repo_fetcher.local_folder_fingerprint(tmp_path) == edited
 
 
 def test_local_folder_fingerprint_ignores_denylisted_folders(tmp_path):
     (tmp_path / "app.py").write_text("one")
-    before = repo_fetcher.local_folder_fingerprint(tmp_path, {"orders"})
+    before = repo_fetcher.local_folder_fingerprint(tmp_path)
     (tmp_path / "node_modules").mkdir()
     (tmp_path / "node_modules" / "lib.js").write_text("noise")
 
-    assert repo_fetcher.local_folder_fingerprint(tmp_path, {"orders"}) == before
+    assert repo_fetcher.local_folder_fingerprint(tmp_path) == before
 
 
-def test_local_folder_fingerprint_changes_when_service_list_changes(tmp_path):
+def test_local_folder_fingerprint_ignores_the_service_list(tmp_path):
+    """The folder fingerprint answers one question: did THIS service's own
+    code change? Folding the service list into it made adding one service
+    re-parse, re-chunk and re-embed every other service — about 61,000
+    chunks re-embedded to learn one new name. That question now lives in
+    service_list_fingerprint instead."""
     (tmp_path / "app.py").write_text("one")
+    assert repo_fetcher.local_folder_fingerprint(tmp_path) == (
+        repo_fetcher.local_folder_fingerprint(tmp_path)
+    )
 
-    assert repo_fetcher.local_folder_fingerprint(
-        tmp_path, {"orders"}
-    ) != repo_fetcher.local_folder_fingerprint(tmp_path, {"orders", "payments"})
+
+def test_service_list_fingerprint_changes_when_a_service_is_added():
+    one = repo_fetcher.service_list_fingerprint({"orders"})
+    assert repo_fetcher.service_list_fingerprint({"orders"}) == one
+    assert repo_fetcher.service_list_fingerprint({"orders", "payments"}) != one
+
+
+def test_service_list_fingerprint_ignores_ordering():
+    """It is a set of names, not a sequence — the same services given in a
+    different order must not look like a change."""
+    assert repo_fetcher.service_list_fingerprint({"a", "b"}) == (
+        repo_fetcher.service_list_fingerprint({"b", "a"})
+    )

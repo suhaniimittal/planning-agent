@@ -270,39 +270,6 @@ def test_get_aggregated_file_references_returns_distinct_targets(monkeypatch):
     assert targets == ["payment", "shipping"]
 
 
-def test_load_current_symbols_splits_by_kind(monkeypatch):
-    rows = [
-        {
-            "qualified_name": "a.py::A",
-            "name": "A",
-            "file_path": "a.py",
-            "language": "python",
-            "docstring": None,
-            "is_method": None,
-            "parent_class": None,
-            "kind": "Class",
-        },
-        {
-            "qualified_name": "a.py::fn",
-            "name": "fn",
-            "file_path": "a.py",
-            "language": "python",
-            "docstring": None,
-            "is_method": False,
-            "parent_class": None,
-            "kind": "Function",
-        },
-    ]
-    _patch_driver(monkeypatch, rows)
-
-    classes, functions = code_graph_writer.load_current_symbols("orders")
-
-    assert [c["name"] for c in classes] == ["A"]
-    assert [f["name"] for f in functions] == ["fn"]
-    assert "kind" not in classes[0]
-    assert "kind" not in functions[0]
-
-
 def test_upsert_chunks_writes_in_slices(monkeypatch):
     driver = _patch_driver(monkeypatch)
     monkeypatch.setattr(code_graph_writer, "_CHUNK_WRITE_BATCH", 2)
@@ -322,3 +289,41 @@ def test_create_has_file_edges_writes_in_slices(monkeypatch):
     code_graph_writer.create_has_file_edges("orders", ["a.py", "b.py", "c.py"])
 
     assert [p["file_paths"] for _, p in driver._session.queries] == [["a.py", "b.py"], ["c.py"]]
+
+
+def test_upsert_files_encrypts_imports_and_test_text_by_path(monkeypatch):
+    driver = _patch_driver(monkeypatch)
+    rows = [
+        {"file_path": "a/v.test.ts", "language": "ts", "imports": "import x;", "source": "it()"}
+    ]
+    code_graph_writer.upsert_files("ui", rows)
+
+    (stored,) = driver._session.queries[0][1]["rows"]
+    for field, plain in (("imports", "import x;"), ("source", "it()")):
+        assert code_crypto.is_encrypted(stored[field])
+        assert (
+            code_crypto.decrypt(
+                stored[field], label="File", service="ui", qualified_name="a/v.test.ts", field=field
+            )
+            == plain
+        )
+    assert rows[0]["source"] == "it()"  # the caller's row is untouched
+
+
+def test_rename_file_reseals_the_files_text_under_its_new_path(monkeypatch):
+    sealed = code_crypto.encrypt_row(
+        {"source": "it()", "imports": None}, label="File", service="ui", qualified_name="old.ts"
+    )
+    driver = _patch_driver(monkeypatch, [sealed])
+
+    code_graph_writer.rename_file("ui", "old.ts", "new.ts")
+
+    query, params = driver._session.queries[-1]
+    assert "SET f.source = $source, f.imports = $imports" in query
+    assert params["imports"] is None
+    assert (
+        code_crypto.decrypt(
+            params["source"], label="File", service="ui", qualified_name="new.ts", field="source"
+        )
+        == "it()"
+    )

@@ -35,7 +35,13 @@ class FileChange(BaseModel):
     pseudocode_sketch: str
     acceptance_criteria: list[str] = Field(default_factory=list)
     reasoning: str
-    change_type: Literal["create", "modify", "delete"] = "modify"
+    # "reference" is NOT an edit: it marks a symbol the proposed design
+    # reads, calls, or depends on without changing a line of it. It exists
+    # because the LLM kept needing to explain such a symbol and had only
+    # "modify" available, which put files the design explicitly said not to
+    # touch into the reader's list of files to edit. Renderers list these
+    # separately from create/modify/delete for exactly that reason.
+    change_type: Literal["create", "modify", "delete", "reference"] = "modify"
     # Set programmatically in query_flow.build_tdd() by checking the real
     # code graph — never trusted from the LLM's own claim — same "verify
     # against the graph, don't guess" principle as service_dependencies

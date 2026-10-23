@@ -19,9 +19,21 @@ from __future__ import annotations
 
 import re
 
-_SENTENCE_SPLIT = re.compile(
-    r"(?<=[.!?])\s+|\n\s*\n+"
-)
+# A sentence ends at .!? followed by whitespace, or at a blank line. NOT at
+# every newline: pasted PDF text is hard-wrapped, and splitting there shreds
+# one sentence into three fragments that each pass the length filter below
+# and each spend a query slot while meaning nothing on their own.
+#
+# The lookbehinds suppress the split after an abbreviation, which is a period
+# that does not end a sentence. Without them "...whitespace (e.g. a value
+# like ..." breaks into a fragment ending at "(e.g." — observed on the
+# deferred-submit ticket, where it mutilated the sentence carrying the root
+# cause. Each lookbehind must be fixed-width, hence one per abbreviation.
+# Deliberately NOT included: a generic `(?<![A-Z]\.)` for initials, which
+# would also suppress the split after a sentence ending in an acronym
+# ("...stays stuck in DEFERRED." ), merging it with the next one.
+_ABBREVIATIONS = r"(?<!\be\.g\.)(?<!\bi\.e\.)(?<!\betc\.)(?<!\bvs\.)(?<!\bcf\.)(?<!\bapprox\.)"
+_SENTENCE_SPLIT = re.compile(rf"(?<=[.!?]){_ABBREVIATIONS}\s+|\n\s*\n+")
 # Shorter than this is a fragment ("Description", a bullet marker) with no
 # meaning of its own.
 MIN_SENTENCE_CHARS = 40
@@ -44,6 +56,7 @@ _IDENTIFIER = re.compile(r"\b[a-z]+[A-Z][A-Za-z0-9]*\b|\b[A-Z][a-z0-9]+(?:[A-Z][
 # "Form errors" — a quoted multi-word phrase, usually a UI label or log text
 _QUOTED_PHRASE = re.compile(r'"([^"\n]{4,60})"')
 
+
 def _is_boilerplate(piece: str) -> bool:
     return bool(_BOILERPLATE.match(piece))
 
@@ -58,6 +71,7 @@ def _spread(parts: list[str], limit: int) -> list[str]:
         return parts
     step = len(parts) / limit
     return [parts[int(i * step)] for i in range(limit)]
+
 
 #
 def issue_queries(issue_text: str) -> list[str]:
@@ -87,10 +101,25 @@ def issue_identifiers(issue_text: str) -> list[str]:
     return sorted(found)
 
 
+def symbol_identifiers(source: str) -> list[str]:
+    """The camelCase/PascalCase names a symbol's own source mentions.
+
+    Used to find the tests that exercise that symbol. issue_identifiers()
+    cannot do this job: it reads the TICKET, and a real ticket is written in
+    English. "ATS Link CC email addresses changes semi-colon to comma"
+    yields no identifiers at all, so a lookup keyed on the ticket's
+    identifiers had nothing to search with. The symbol's source always names
+    the fields it touches, and a test that exercises the symbol names them
+    too — handleCcEmailAddressesBlur reads
+    `sendReportRequestedLinkCcEmailAddresses`, and so do the three specs
+    that cover it.
+    """
+    return sorted(set(_IDENTIFIER.findall(source or "")))
+
+
 def rank_functions(
     hits: list[dict],
-    max_functions: int = 8,
-    keep_within: float = 0.12,
+    max_functions: int = 20,
     identifier_bonus: float = 0.08,
     max_identifier_hits: int = 25,
 ) -> list[dict]:
@@ -101,9 +130,19 @@ def rank_functions(
     identifier found in more than `max_identifier_hits` chunks, which is too
     common in this service to mean anything. A function containing an
     issue identifier always gets a place — it's the strongest signal there
-    is; the remaining places go to functions within `keep_within` of the
-    service's best score (weak matches are noise, not context). At most
+    is; the remaining places go to the best remaining scores, at most
     `max_functions` in all.
+
+    There was a relevance floor here, dropping anything more than a fixed
+    distance below the service's own best score. It was removed because the
+    idea is backwards, not because the distance was wrong: the floor is
+    relative to each service's best, so a service whose matches drop off
+    sharply after a strong top hit is cut hard, while one whose matches are
+    uniformly mediocre keeps everything. Measured on a real ticket, it took
+    the service the bug was actually in from 20 functions to 6 while leaving
+    two irrelevant services at 20. Telling a weakly-matching service apart
+    needs an absolute measure, or a comparison across services — not a
+    window on its own distribution.
 
     Returns [{"function_qualified_name", "text", "score", "identifiers"}],
     best first; `text` is the best-scoring chunk.
@@ -141,11 +180,8 @@ def rank_functions(
         for e in by_function.values()
     ]
     ranked.sort(key=lambda r: -r["score"])
-    if not ranked:
-        return []
-    floor = ranked[0]["score"] - keep_within
     named = [r for r in ranked if r["identifiers"]][:max_functions]
-    rest = [r for r in ranked if not r["identifiers"] and r["score"] >= floor]
+    rest = [r for r in ranked if not r["identifiers"]]
     kept = (named + rest)[:max_functions]
     kept.sort(key=lambda r: -r["score"])
     return kept

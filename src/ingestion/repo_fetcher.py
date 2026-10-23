@@ -41,7 +41,8 @@ class RepoFetchError(Exception):
     """Raised when a repo can't be downloaded — caller must catch this and
     fall back to key_symbols, never let it abort the whole ingestion run."""
 
-#the repo downloaded with its exact commit downloaded
+
+# the repo downloaded with its exact commit downloaded
 @dataclass(frozen=True)
 class RepoCheckout:
     """`root` is the extracted working tree; `head_sha` the exact commit it
@@ -62,22 +63,22 @@ def _extract_zip(data: bytes, dest: Path) -> None:
             if info.is_dir():
                 continue
 
-            #It essentially removes the first directory component.
+            # It essentially removes the first directory component.
             relative = Path(*Path(info.filename).parts[1:])
 
             if not relative.parts:
                 continue
             mode = info.external_attr >> 16
 
-            #skip symlinks, which are stored as small text files in a zip
+            # skip symlinks, which are stored as small text files in a zip
             if stat.S_ISLNK(mode):
                 continue
 
-            #security check for path traversal / Zip Slip (it could write files outside the temporary repository directory)
+            # security check for path traversal / Zip Slip (it could write files outside the temporary repository directory)
             target = (root / relative).resolve()
             if root not in target.parents:
                 raise RepoFetchError(f"unsafe path in repo archive: {info.filename!r}")
-            
+
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(zf.read(info))
 
@@ -131,17 +132,32 @@ def local_repo_root(service_name: str) -> Path | None:
     return paths[service_name]
 
 
-def local_folder_fingerprint(root: Path, service_names: set[str]) -> str:
+def service_list_fingerprint(service_names: set[str]) -> str:
+    """A fingerprint of the service-name list alone.
+
+    Kept SEPARATE from the folder fingerprint on purpose. edge_detector
+    matches every file's text against this list, so adding a service does
+    invalidate the stored dependency links of every other service — but it
+    does not change a single line of their code. Folding the list into
+    local_folder_fingerprint (as this once did) conflated the two and made
+    adding one service re-parse, re-chunk and re-embed all the others: on
+    this project's ten services that was ~61,000 chunks re-embedded to
+    learn one new name.
+
+    Two fingerprints let ingest.py tell the two cases apart and re-run only
+    the cheap text scan when only the list moved."""
+    return hashlib.sha1(("\0".join(sorted(service_names)) + "\n").encode()).hexdigest()
+
+
+def local_folder_fingerprint(root: Path) -> str:
     """A cheap fingerprint of a local folder: every file's path, size and
     modification time (no file is read), skipping the same build/dependency
     folders the parser skips — so walking a UI folder never descends into
     node_modules/. Editing, adding, removing or renaming any file changes it.
 
-    `service_names` (every service in this run) is folded in too: each file's
-    dependency references are matched against that list, so a change to it
-    must re-ingest even an untouched folder."""
+    Deliberately says nothing about which OTHER services exist — that is
+    service_list_fingerprint's job."""
     digest = hashlib.sha1()
-    digest.update(("\0".join(sorted(service_names)) + "\n").encode())
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in DEFAULT_DENYLIST)
         for filename in sorted(filenames):
@@ -181,19 +197,18 @@ def cloned_repo(
     except github_api.GitHubApiError as e:
         raise RepoFetchError(f"could not download {slug}: {e}") from e
 
-
-    #a temporary directory is created and repo is extracted there
+    # a temporary directory is created and repo is extracted there
     with tempfile.TemporaryDirectory(prefix="repo_fetcher_") as tmpdir:
         try:
             _extract_zip(data, Path(tmpdir))
         except zipfile.BadZipFile as e:
             raise RepoFetchError(f"downloaded archive for {slug} is not a valid zip") from e
-        
-        #gives directory to the caller, which is deleted on exit
+
+        # gives directory to the caller, which is deleted on exit
         yield RepoCheckout(Path(tmpdir), head_sha)
 
 
-#calculates the blob sha of every file in the repo, which is used to check if a file has changed
+# calculates the blob sha of every file in the repo, which is used to check if a file has changed
 def blob_shas_of(repo_root: Path) -> dict[str, str]:
     """{file_path: blob_sha} for every file under `repo_root`, computed the
     way git does (sha1 of "blob <size>\\0" + content) — so it equals what

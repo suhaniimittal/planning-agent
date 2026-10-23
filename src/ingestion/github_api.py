@@ -5,17 +5,27 @@ already-ingested service is never cloned again.
 
 Same auth convention as repo_fetcher.py's clone URL: GITHUB_TOKEN, optional
 for public repos.
+
+GITHUB_API_BASE points this at a GitHub Enterprise Server instead of
+github.com. Enterprise serves the same REST API under a different root
+(`https://<host>/api/v3`), and a token issued by that server is rejected
+outright by api.github.com — so with the public default left in place,
+every call against an Enterprise-hosted repo fails with 401 and the
+service is skipped.
 """
 
 from __future__ import annotations
 
 import base64
+import os
 
 import httpx
 
 from src.ingestion.secret_store import secret
 
-_API_BASE = "https://api.github.com"
+# Overridable for GitHub Enterprise: set GITHUB_API_BASE to e.g.
+# https://github.example.com/api/v3 — every URL below is built from this.
+_API_BASE = os.environ.get("GITHUB_API_BASE", "https://api.github.com").rstrip("/")
 _TIMEOUT = 30
 
 

@@ -13,13 +13,10 @@ from datetime import UTC, datetime
 
 from src.ingestion.embedder import embed_many
 
-from . import code_search, graph_reader, planner
+from . import code_search, graph_reader, issue_split, planner
 from .models import ServiceDependency, TechnicalDesignDoc
 from .verify import verify_tdd
 
-# Services beyond top_k whose code is also searched before choosing — so a
-# service with a generic summary can still win on its code.
-_CODE_EVIDENCE_EXTRA = 3
 # A service's rank = this weight x summary match + the rest x best code match.
 _SUMMARY_WEIGHT = 0.5
 # Functions up to this long are shown whole; longer ones by their best chunk.
@@ -28,6 +25,25 @@ _FULL_SOURCE_MAX_CHARS = 1500
 # long — enough for a typical input/DTO class (the one in the worked example
 # is ~7,400 chars), small enough that it cannot crowd out other services.
 _FULL_CLASS_MAX_CHARS = 8000
+
+# How much of a service's matched code may be shown WHOLE rather than as a
+# chunk, best match first. A budget, not a count of symbols: the thing that
+# costs is characters in the prompt, and a count cannot express that when
+# one match is 300 characters and the next is 12,000.
+#
+# A large component is exactly the case the 1,500 rule handles worst. On a
+# real ticket the component holding the bug was 12,135 characters, so the
+# planner saw one ~700-character chunk of it. A review done with the file
+# open then found four things the design had missed — the blur handler
+# fires even when nothing was edited, the callback it uses is internal and
+# cannot be asserted on, the view dereferences a field with no null check,
+# and an input is gated behind a prop — every one of them inside those
+# 12,135 characters, already in the graph, and none of them in the chunk.
+#
+# That component ranked THIRD for its own ticket, behind two matches of 316
+# and ~2,000 characters. So "the top two symbols" would not have reached it,
+# while a budget does: the small ones barely spend any of it.
+_WHOLE_SOURCE_BUDGET_CHARS = 20000
 
 
 def _print_selection_debug(
@@ -64,6 +80,24 @@ def _print_selection_debug(
             print(f"      - [{e['kind']}] {e['name']} — {e['reason']} ({snippet_tag})")
 
 
+# How many terms one symbol is looked up by. A long function mentions
+# dozens of names, and each one costs a scan of its service's spec files,
+# so the longest are kept: a long identifier is a specific one
+# (sendReportRequestedLinkCcEmailAddresses, 39 chars, matches 3 spec files),
+# while the short ones are the generic names every file shares.
+_MAX_TEST_LOOKUP_TERMS = 12
+
+
+def _test_lookup_terms(source: str, issue_identifiers: list[str]) -> list[str]:
+    """What to search the test files for, to find the tests covering a symbol
+    whose own name no test ever mentions."""
+    terms = set(code_search.symbol_identifiers(source))
+    # A ticket that DOES quote a name or a UI label is a strong signal, but
+    # only where the symbol genuinely touches it.
+    terms.update(word for word in issue_identifiers if word in source)
+    return sorted(sorted(terms, key=len, reverse=True)[:_MAX_TEST_LOOKUP_TERMS])
+
+
 def _referenced_service_names(tdd: TechnicalDesignDoc) -> list[str]:
     """Every service name the LLM actually touched: services it proposed
     changes for, plus anything it named as a dependency source/target in
@@ -79,9 +113,8 @@ def _referenced_service_names(tdd: TechnicalDesignDoc) -> list[str]:
 
     for service_plan in tdd.services:
         add(service_plan.service)
-    for component in (
-        list(getattr(tdd, "current_architecture_components", None) or [])
-        + list(getattr(tdd, "proposed_architecture_components", None) or [])
+    for component in list(getattr(tdd, "current_architecture_components", None) or []) + list(
+        getattr(tdd, "proposed_architecture_components", None) or []
     ):
         add(component.name)
         for dep in component.depends_on:
@@ -138,20 +171,30 @@ def _widen_to_small_classes(
 
 async def build_tdd(
     issue_text: str,
-    top_k: int = 5,
-    hops: int = 2,
+    top_k: int = 8,
+    hops: int = 0,
     debug_dump_prompts: bool = False,
     service_names: list[str] | None = None,
     technology_constraints: list[str] | None = None,
     api_contracts: str = "",
+    mode: str | None = None,
 ) -> TechnicalDesignDoc:
     """`service_names`: the services this run covers (the Repositories the
     user listed) — only those are ever considered. None considers every
     service in the graph.
 
-    `top_k` is the most services the TDD may involve; `hops` widens only the
-    BACKGROUND context (graph-connected services shown by summary, never
-    given code to change).
+    `top_k` is the most services the TDD may involve. It is a cap on the
+    answer, not on the search: every service in the run has its code read
+    before any of them are ranked, so this never decides which services
+    were allowed to compete.
+
+    `hops` widens only the BACKGROUND context: services reached over CALLS
+    edges, shown by summary and never given code to change. It defaults to
+    0 — off. Every neighbour becomes its own "no change" block in the
+    document, and on a graph this densely connected one hop already reaches
+    most of it, so the tail cost it adds is real while the context it buys
+    is not. Pass 1 or 2 when a change's blast radius across services is
+    the actual question.
 
     `debug_dump_prompts=True` writes the exact system/user prompt sent to
     the LLM to llm_system_prompt.txt / llm_user_prompt.txt in the current
@@ -160,21 +203,37 @@ async def build_tdd(
     # The whole ticket, then its parts. `vectors[0]` (the whole ticket) is
     # what scores services; all of them together search each service's code,
     # so a detail that only one sentence describes still finds its function.
-    queries = code_search.issue_queries(issue_text)
+    # The parts come from an LLM where possible (self-contained, references
+    # resolved) and from sentence splitting otherwise — see issue_split.
+    detected_mode, queries = await issue_split.issue_queries(issue_text)
+    # An explicit mode from the caller wins; otherwise take what the split
+    # classified. The prompt itself falls back to bug for anything unknown.
+    mode = mode or detected_mode
     vectors = await embed_many(queries)
     embedding = vectors[0]
     identifiers = code_search.issue_identifiers(issue_text)
 
-    # 1. Which services. Summary similarity alone misjudges a service whose
-    #    summary is generic — a large UI repo ranked 4th of 6 for a bug in
-    #    its own form validation — so the services' own code gets a vote:
-    #    every service on the shortlist is searched, and its best function
-    #    match counts as much as its summary match. A service the issue
-    #    names outright is always included.
+    # 1. Which services. EVERY service in the run has its code searched —
+    #    nothing is eliminated on its summary first. Summary similarity
+    #    misjudges a service whose summary is generic: a large UI repo
+    #    ranked 4th of 6 for a bug in its own form validation, and was cut
+    #    before a line of that code was read. Ranking only afterwards, on
+    #    summary AND code together, is what makes that impossible.
+    #
+    #    This is affordable because `service_names` is the list a person
+    #    typed into the form, and because the searches below run in
+    #    parallel: measured on a 12-service graph, the extra services are
+    #    the small ones (~0.1s each) while the slowest was already being
+    #    searched. A run large enough to need a budget should get one
+    #    measured in CHUNKS SCANNED, which is what actually costs — not in
+    #    services, and not guessed.
     summary = graph_reader.summary_scores(embedding, service_names)
     by_summary = sorted(summary, key=lambda name: -summary[name])
+    # A subset of by_summary (services_named_in filters the list it is
+    # given), so it needs no separate place in the shortlist — only in the
+    # selection below, where it overrides the ranking.
     named = code_search.services_named_in(issue_text, by_summary)
-    shortlist = list(dict.fromkeys(named + by_summary[: top_k + _CODE_EVIDENCE_EXTRA]))
+    shortlist = by_summary
 
     # 2. What code, per service: each service's own top chunks (never a
     #    shared top-k a large service can monopolize), test code excluded.
@@ -230,6 +289,7 @@ async def build_tdd(
     selection_log: list[dict] = []
     parent_of: dict[tuple[str, str], tuple[str, str]] = {}
     for service in selected:
+        whole_source_left = _WHOLE_SOURCE_BUDGET_CHARS
         for hit in ranked_by_service[service]:
             key = (service, hit["function_qualified_name"])
             symbol = by_key.get(key)
@@ -239,11 +299,22 @@ async def build_tdd(
             code_symbols_by_service.setdefault(service, []).append(symbol)
             if symbol.get("parent_class"):
                 parent_of[key] = (service, symbol["parent_class"])
-            # A short function is shown whole; a long one only by its
-            # best-matching chunk — the relevant slice, exactly the point of
-            # chunking.
+            # Whole source while this service's budget lasts, best match
+            # first; a chunk once it is spent. A chunk is the right unit for
+            # the supporting cast — showing the relevant slice of something
+            # peripheral is the point of chunking — and the wrong unit for
+            # the thing about to be edited, where the surrounding code is how
+            # a reader learns what calls it and what it assumes. Always whole
+            # below _FULL_SOURCE_MAX_CHARS, so a long tail of small matches
+            # still arrives intact after the budget runs out.
             source = symbol.get("source_snippet") or ""
-            snippet_map[key] = source if 0 < len(source) <= _FULL_SOURCE_MAX_CHARS else hit["text"]
+            if 0 < len(source) <= _FULL_SOURCE_MAX_CHARS:
+                snippet_map[key] = source
+            elif 0 < len(source) <= whole_source_left:
+                snippet_map[key] = source
+                whole_source_left -= len(source)
+            else:
+                snippet_map[key] = hit["text"]
             reason = f"score {hit['score']:.3f}"
             if hit["identifiers"]:
                 reason += f", contains {', '.join(hit['identifiers'])}"
@@ -258,18 +329,67 @@ async def build_tdd(
             )
     _widen_to_small_classes(parent_of, code_symbols_by_service, snippet_map)
 
-    file_context = graph_reader.load_file_context(
-        sorted(
-            {
-                (service, symbol["file_path"])
-                for service, symbols_ in code_symbols_by_service.items()
-                for symbol in symbols_
-                if symbol.get("file_path")
-            }
-        )
+    shown_files = sorted(
+        {
+            (service, symbol["file_path"])
+            for service, symbols_ in code_symbols_by_service.items()
+            for symbol in symbols_
+            if symbol.get("file_path")
+        }
     )
+    file_context = graph_reader.load_file_context(shown_files)
+    # How this file imports things, so code written for it uses module paths
+    # that exist rather than invented ones.
+    file_imports = graph_reader.load_file_imports(shown_files)
+    # Paths only, looked up AFTER the files are chosen — test code still never
+    # competes in the search (see graph_reader.load_sibling_tests).
+    sibling_tests = graph_reader.load_sibling_tests(shown_files)
+    # Tests that NAME a symbol being changed, wherever they live. The sibling
+    # lookup above only sees the same folder, which finds nothing on a project
+    # that keeps src/common/ apart from src/apps/ — and a design that believes
+    # no test exists has a new one written from scratch instead of the real one
+    # edited.
+    #
+    # Each symbol is looked up by the identifiers its OWN SOURCE mentions,
+    # plus any issue identifier that appears there. The name alone finds
+    # nothing on a UI project — no test contains "AtsIntegrationSectionView"
+    # or "handleCcEmailAddressesBlur", because a component renders through a
+    # wrapper and a handler is never named — and the ticket alone finds
+    # nothing either, because a real ticket is English prose: "ATS Link CC
+    # email addresses changes semi-colon to comma" yields no identifiers at
+    # all. What does work is the field the handler reads,
+    # sendReportRequestedLinkCcEmailAddresses, which is in its source and in
+    # the three specs that cover it.
+    tests_by_symbol = graph_reader.tests_naming(
+        [
+            (service, symbol["name"], _test_lookup_terms(source, identifiers))
+            for service, symbols_ in code_symbols_by_service.items()
+            for symbol in symbols_
+            if symbol.get("name")
+            for source in [snippet_map.get((service, symbol["qualified_name"])) or ""]
+        ]
+    )
+    # Their actual text, so the planner copies a fixture that works instead
+    # of inventing one. Only test files carry source, so this reads nothing
+    # for anything else.
+    test_sources = graph_reader.load_test_sources(
+        sorted({(service, path_) for (service, _), paths in tests_by_symbol.items() for path_ in paths})
+    )
+    # Where a NEW test would go, for the shown files that have none beside
+    # them. Only for services whose tests demonstrably sit beside their
+    # code — a service with a mirrored test tree gets nothing here rather
+    # than a path nobody measured, and the planner asks instead.
+    conventions = graph_reader.test_naming_conventions(selected)
+    new_test_paths = {}
+    for service, file_path in shown_files:
+        infix = conventions.get(service)
+        if not infix or sibling_tests.get((service, file_path)):
+            continue
+        suggested = graph_reader.new_test_path(file_path, infix)
+        if suggested:
+            new_test_paths[(service, file_path)] = suggested
 
-    system_prompt = planner.build_system_prompt()
+    system_prompt = planner.build_system_prompt(mode)
     user_prompt = planner.build_user_prompt(
         issue_text,
         candidate_docs,
@@ -280,6 +400,11 @@ async def build_tdd(
         file_context=file_context,
         technology_constraints=technology_constraints,
         api_contracts=api_contracts,
+        file_imports=file_imports,
+        sibling_tests=sibling_tests,
+        tests_by_symbol=tests_by_symbol,
+        test_sources=test_sources,
+        new_test_paths=new_test_paths,
     )
 
     if debug_dump_prompts:

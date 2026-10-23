@@ -46,6 +46,11 @@ class FakeGraph:
         self.neighbors = []
         self.edges = []
         self.file_context = {}
+        self.sibling_tests = {}
+        self.test_conventions = {}
+        self.tests_by_symbol = {}
+        self.file_imports = {}
+        self.test_sources = {}
         self.calls = []
         self.prompt = {}
         self.tdd = FakeTdd()
@@ -83,9 +88,29 @@ def graph(monkeypatch):
         g.calls.append(("load_symbols", list(pairs)))
         return [g.symbols[p] for p in pairs if p in g.symbols]
 
+    def load_sibling_tests(pairs):
+        g.calls.append(("load_sibling_tests", list(pairs)))
+        return g.sibling_tests
+
     def load_file_context(pairs):
         g.calls.append(("load_file_context", list(pairs)))
         return {p: g.file_context.get(p, []) for p in pairs}
+
+    def test_naming_conventions(services):
+        g.calls.append(("test_naming_conventions", list(services)))
+        return g.test_conventions
+
+    def tests_naming(pairs, limit=4):
+        g.calls.append(("tests_naming", list(pairs)))
+        return g.tests_by_symbol
+
+    def load_file_imports(pairs):
+        g.calls.append(("load_file_imports", list(pairs)))
+        return g.file_imports
+
+    def load_test_sources(pairs):
+        g.calls.append(("load_test_sources", list(pairs)))
+        return g.test_sources
 
     def build_user_prompt(issue_text, docs, code_symbols_by_service=None, snippets_by_key=None, **kwargs):
         g.prompt = {
@@ -108,9 +133,14 @@ def graph(monkeypatch):
         "get_edges_among": get_edges_among,
         "load_symbols": load_symbols,
         "load_file_context": load_file_context,
+        "load_sibling_tests": load_sibling_tests,
+        "test_naming_conventions": test_naming_conventions,
+        "tests_naming": tests_naming,
+        "load_file_imports": load_file_imports,
+        "load_test_sources": load_test_sources,
     }.items():
         monkeypatch.setattr(query_flow.graph_reader, name, fn)
-    monkeypatch.setattr(query_flow.planner, "build_system_prompt", lambda: "system")
+    monkeypatch.setattr(query_flow.planner, "build_system_prompt", lambda mode=None: "system")
     monkeypatch.setattr(query_flow.planner, "build_user_prompt", build_user_prompt)
     monkeypatch.setattr(query_flow.planner, "call_llm", call_llm)
     monkeypatch.setattr(query_flow.planner, "parse_tdd", lambda raw: g.tdd)
@@ -146,8 +176,29 @@ async def test_code_evidence_can_outrank_a_better_summary_match(graph):
 
     assert set(graph.prompt["seed_names"]) == {"ui", "candidate"}
     assert set(graph.prompt["code"]) == {"ui", "candidate"}
-    # the shortlist that got searched is wider than top_k (2 + 3 extra)
+    # every service in the run was searched, not just the top few by summary
     assert set(_searched(graph)) == {"compliance", "reports", "candidate", "ui", "pdf"}
+
+
+@pytest.mark.asyncio
+async def test_no_service_is_cut_before_its_code_is_searched(graph):
+    """The one the previous test cannot catch: with more services than any
+    old shortlist would have held, the WORST summary match still gets its
+    code read — and wins on it. A shortlist built on summary alone would
+    have dropped `ui` here before anyone looked at a line of it."""
+    graph.summary = {
+        "a": 0.70, "b": 0.69, "c": 0.68, "d": 0.67, "e": 0.66,
+        "f": 0.65, "g": 0.64, "h": 0.63, "i": 0.62, "ui": 0.10,
+    }
+    graph.hits = {"ui": [_hit("form.ts::validationSchema", 0.95)]}
+    for s, rows in graph.hits.items():
+        for h in rows:
+            graph.symbols[(s, h["function_qualified_name"])] = _fn(s, h["function_qualified_name"])
+
+    await query_flow.build_tdd("issue", top_k=2, hops=0)
+
+    assert set(_searched(graph)) == set(graph.summary)
+    assert "ui" in graph.prompt["seed_names"]
 
 
 @pytest.mark.asyncio
@@ -232,19 +283,61 @@ async def test_a_large_class_is_not_pulled_in(graph):
 
 
 @pytest.mark.asyncio
-async def test_short_functions_are_shown_whole_and_long_ones_by_their_chunk(graph):
+async def test_a_long_best_match_is_shown_whole_while_the_budget_lasts(graph):
+    """A large component is the case the short-function rule handles worst.
+    On a real ticket the component holding the bug was 12,135 characters, so
+    the design saw one ~700-character chunk of it — and a review done with
+    the file open found four things inside the rest that it had missed. It
+    ranked THIRD, behind two much smaller matches, which is why this is a
+    character budget and not a count of symbols."""
     graph.summary = {"ui": 0.9}
-    graph.hits = {"ui": [_hit("a.ts::short", 0.9), _hit("b.ts::long", 0.89), _hit("gone.ts::stale", 0.88)]}
-    graph.symbols[("ui", "a.ts::short")] = _fn("ui", "a.ts::short", source="short body")
-    graph.symbols[("ui", "b.ts::long")] = _fn("ui", "b.ts::long", source="x" * 5000)
+    graph.hits = {
+        "ui": [
+            _hit("a.ts::small", 0.9),
+            _hit("b.ts::tiny", 0.89),
+            _hit("c.ts::component", 0.88),
+            _hit("gone.ts::stale", 0.87),
+        ]
+    }
+    component = "x" * 12135
+    graph.symbols[("ui", "a.ts::small")] = _fn("ui", "a.ts::small", source="short body")
+    graph.symbols[("ui", "b.ts::tiny")] = _fn("ui", "b.ts::tiny", source="tiny body")
+    graph.symbols[("ui", "c.ts::component")] = _fn("ui", "c.ts::component", source=component)
 
     await query_flow.build_tdd("issue", top_k=1, hops=0)
 
     snippets = graph.prompt["snippets"]
-    assert snippets[("ui", "a.ts::short")] == "short body"
-    assert snippets[("ui", "b.ts::long")] == "chunk of b.ts::long"
+    assert snippets[("ui", "a.ts::small")] == "short body"
+    assert snippets[("ui", "b.ts::tiny")] == "tiny body"
+    # third by score, and long — a count of two would have missed it
+    assert snippets[("ui", "c.ts::component")] == component
     # a chunk whose function no longer exists is skipped, never fabricated
-    assert [s["qualified_name"] for s in graph.prompt["code"]["ui"]] == ["a.ts::short", "b.ts::long"]
+    assert [s["qualified_name"] for s in graph.prompt["code"]["ui"]] == [
+        "a.ts::small",
+        "b.ts::tiny",
+        "c.ts::component",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_once_the_budget_is_spent_later_long_matches_fall_back_to_chunks(graph):
+    """Small matches still arrive whole afterwards — only the expensive ones
+    are affected, which is the point of budgeting characters."""
+    graph.summary = {"ui": 0.9}
+    graph.hits = {
+        "ui": [_hit("a.ts::big", 0.9), _hit("b.ts::also_big", 0.89), _hit("c.ts::small", 0.88)]
+    }
+    big = "x" * (query_flow._WHOLE_SOURCE_BUDGET_CHARS - 100)
+    graph.symbols[("ui", "a.ts::big")] = _fn("ui", "a.ts::big", source=big)
+    graph.symbols[("ui", "b.ts::also_big")] = _fn("ui", "b.ts::also_big", source=big)
+    graph.symbols[("ui", "c.ts::small")] = _fn("ui", "c.ts::small", source="small body")
+
+    await query_flow.build_tdd("issue", top_k=1, hops=0)
+
+    snippets = graph.prompt["snippets"]
+    assert snippets[("ui", "a.ts::big")] == big
+    assert snippets[("ui", "b.ts::also_big")] == "chunk of b.ts::also_big"
+    assert snippets[("ui", "c.ts::small")] == "small body"
 
 
 @pytest.mark.asyncio
@@ -386,3 +479,79 @@ async def test_technology_constraints_come_from_the_build_files_never_the_model(
         "issue", top_k=1, hops=0, technology_constraints=["Language: Java 17 (from pom.xml)."]
     )
     assert result.technology_constraints == ["Language: Java 17 (from pom.xml)."]
+
+
+@pytest.mark.asyncio
+async def test_tests_are_looked_up_by_the_identifiers_a_symbol_touches(graph):
+    """The symbol name alone finds nothing on a UI project: no test in the
+    repo names the component or its handler, because a component is rendered
+    through a wrapper. Four tests name the field the ticket is about."""
+    graph.summary = {"ui": 0.9}
+    qname = "src/m/view.tsx::AtsIntegrationSectionView"
+    graph.hits = {"ui": [_hit(qname, 0.9)]}
+    graph.symbols[("ui", qname)] = _fn(
+        "ui", qname, source="const x = settings.sendReportRequestedLinkCcEmailAddresses;"
+    )
+
+    await query_flow.build_tdd(
+        "CC email addresses in sendReportRequestedLinkCcEmailAddresses use a comma",
+        top_k=1,
+        hops=0,
+    )
+
+    lookups = [c[1] for c in graph.calls if c[0] == "tests_naming"][0]
+    assert lookups == [
+        ("ui", "AtsIntegrationSectionView", ["sendReportRequestedLinkCcEmailAddresses"])
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_identifier_absent_from_a_symbol_is_not_attributed_to_it(graph):
+    """A ticket's identifier only earns a test lookup when the symbol being
+    changed genuinely touches it — otherwise every symbol in the service
+    would be handed the same tests."""
+    graph.summary = {"ui": 0.9}
+    qname = "src/m/other.tsx::unrelatedThing"
+    graph.hits = {"ui": [_hit(qname, 0.9)]}
+    graph.symbols[("ui", qname)] = _fn("ui", qname, source="const y = 1;")
+
+    await query_flow.build_tdd(
+        "CC email addresses in sendReportRequestedLinkCcEmailAddresses use a comma",
+        top_k=1,
+        hops=0,
+    )
+
+    lookups = [c[1] for c in graph.calls if c[0] == "tests_naming"][0]
+    assert lookups == [("ui", "unrelatedThing", [])]
+
+
+def test_lookup_terms_come_from_the_symbol_not_the_ticket():
+    """"ATS Link CC email addresses changes semi-colon to comma" yields no
+    identifiers, so a lookup keyed on the ticket had nothing to search."""
+    source = "atsIntegration.sendReportRequestedLinkCcEmailAddresses.split(/[;,]+/)"
+
+    terms = query_flow._test_lookup_terms(source, [])
+
+    assert "sendReportRequestedLinkCcEmailAddresses" in terms
+
+
+def test_lookup_terms_keep_a_ticket_identifier_the_symbol_touches():
+    terms = query_flow._test_lookup_terms("const x = reportNumber;", ["reportNumber"])
+    assert "reportNumber" in terms
+
+
+def test_lookup_terms_drop_a_ticket_identifier_the_symbol_never_touches():
+    terms = query_flow._test_lookup_terms("const x = 1;", ["reportNumber"])
+    assert terms == []
+
+
+def test_lookup_terms_keep_the_longest_when_a_symbol_names_many():
+    """Each term costs a scan of the service's spec files, and a long name
+    is the specific one."""
+    source = " ".join(f"name{'x' * n}Thing" for n in range(1, 30))
+
+    terms = query_flow._test_lookup_terms(source, [])
+
+    assert len(terms) == query_flow._MAX_TEST_LOOKUP_TERMS
+    assert f"name{'x' * 29}Thing" in terms
+    assert "namexThing" not in terms

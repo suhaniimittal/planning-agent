@@ -1,4 +1,6 @@
 
+from src.ingestion import code_parser
+
 from src.ingestion.code_parser import (
     _CHUNK_TARGET_CHARS,
     LANGUAGE_BY_EXTENSION,
@@ -572,3 +574,110 @@ def test_parse_repo_mixes_real_symbols_and_tracked_only_files(tmp_path):
 
     assert any(f.name == "handler" for f in graph.functions)
     assert graph.tracked_files == {"index.html": "html"}
+
+
+def test_extract_imports_takes_the_block_at_the_top_and_stops_at_real_code():
+    """Nothing else in the pipeline records imports — parse_file extracts
+    only classes and functions — which is why generated code invents module
+    paths."""
+    source = (
+        'import React from "react";\n'
+        "// a comment between imports\n"
+        'import { render } from "@testing-library/react";\n'
+        "\n"
+        'import stubs from "../../stubs";\n'
+        "\n"
+        "export const x = 1;\n"
+        'import { late } from "nope";\n'
+    )
+    assert code_parser.extract_imports(source) == (
+        'import React from "react";\n'
+        'import { render } from "@testing-library/react";\n'
+        'import stubs from "../../stubs";'
+    )
+
+
+def test_extract_imports_handles_every_language_this_parser_reads():
+    assert "from pathlib import Path" in code_parser.extract_imports(
+        "from pathlib import Path\nimport os\n\ndef f(): pass\n"
+    )
+    assert "import com.asurint.Thing" in code_parser.extract_imports(
+        "package com.asurint\n\nimport com.asurint.Thing\n\nclass X\n"
+    )
+    assert 'export { a } from "./a"' in code_parser.extract_imports('export { a } from "./a";\n')
+
+
+def test_extract_imports_is_empty_when_a_file_imports_nothing():
+    assert code_parser.extract_imports("def f():\n    return 1\n") == ""
+
+
+def test_extract_imports_is_capped():
+    source = "\n".join(f'import a{i} from "m{i}";' for i in range(200))
+    assert len(code_parser.extract_imports(source)) <= code_parser.MAX_IMPORT_CHARS
+
+
+def test_embedding_text_carries_the_path_and_name_the_code_often_lacks():
+    """An arrow function's chunk begins at its parameter list, so the name it
+    was assigned to is lost. Measured on a real graph: 22% of single-chunk
+    functions do not contain their own name anywhere in their text, and 93%
+    of functions are a single chunk."""
+    text = code_parser.embedding_text(
+        "src/common/utils/utils/multipleEmailFieldValidation.tsx",
+        "multipleEmailFieldValidation",
+        None,
+        "(value: string) => {",
+    )
+    assert text.startswith("src/common/utils/utils/multipleEmailFieldValidation.tsx\n")
+    assert "multipleEmailFieldValidation" in text
+    assert text.endswith("(value: string) => {")
+
+
+def test_embedding_text_includes_the_parent_class_for_a_method():
+    text = code_parser.embedding_text("A.kt", "toAvro", "EmploymentVerificationInput", "builder()")
+    assert "EmploymentVerificationInput" in text
+    assert "toAvro" in text
+
+
+def test_embedding_text_leaves_the_code_last_and_unchanged():
+    """Chunk.text is what the planner reads, and is stored unprefixed; only
+    what is sent to the embedding model gains the header."""
+    code = "return 1"
+    assert code_parser.embedding_text("a.py", "f", None, code).endswith(code)
+
+
+def test_parse_repo_stores_a_test_file_whole(tmp_path):
+    """A test file reaches the graph as a fraction of itself: parse_file()
+    extracts functions and classes, and a Jest file is top-level describe()
+    calls and object literals, so a 3,920-char test was stored as 192
+    characters — never the fixture, which is the one thing a planner writing
+    a test cannot guess."""
+    (tmp_path / "view.test.tsx").write_text(
+        'const settings = { canEdit: true };\nit("works", () => {});\n'
+    )
+
+    graph = parse_repo(tmp_path, "ui")
+
+    assert graph.file_source["view.test.tsx"] == (
+        'const settings = { canEdit: true };\nit("works", () => {});\n'
+    )
+
+
+def test_parse_repo_stores_no_source_for_production_files(tmp_path):
+    """Their symbols are already extracted; storing both would double the
+    graph for nothing."""
+    (tmp_path / "view.tsx").write_text("export const view = () => null;\n")
+
+    graph = parse_repo(tmp_path, "ui")
+
+    assert "view.tsx" not in graph.file_source
+
+
+def test_parse_repo_caps_a_long_test_file(tmp_path):
+    """One real suite covering a whole settings tab is 29,652 characters;
+    its first 6,000 are its imports and first fixture, the part worth
+    copying."""
+    (tmp_path / "big.test.tsx").write_text("x" * (code_parser.MAX_TEST_SOURCE_CHARS + 500))
+
+    graph = parse_repo(tmp_path, "ui")
+
+    assert len(graph.file_source["big.test.tsx"]) == code_parser.MAX_TEST_SOURCE_CHARS

@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from src.ingestion.secret_store import secret
 
 from . import code_graph_writer, github_api, graph_writer
 from .code_parser import (
+    extract_imports,
+    embedding_text,
     LANGUAGE_BY_EXTENSION,
     TRACKED_ONLY_EXTENSIONS,
     CodeChunk,
@@ -42,14 +44,31 @@ from .repo_fetcher import (
     cloned_repo,
     local_folder_fingerprint,
     local_repo_root,
+    service_list_fingerprint,
 )
-from .summarizer import SummarizerError, build_digest, generate_summaries
+from . import service_doc
 from .test_paths import is_test_path
 
 # How many repos to sync concurrently — serially syncing 40-50 repos would
 # otherwise dominate ingestion runtime; unbounded concurrency risks GitHub
 # rate limits and disk/CPU contention (for first-ingestion clones), so a
 # small fixed pool instead.
+# Bump this whenever a service's graph would come out DIFFERENT from the
+# same source — a change to parsing, chunking, what a chunk is embedded as,
+# or what is stored on a node. Not for a comment, a log line or a refactor
+# that produces identical output.
+#
+# Without it, "has this service changed?" only ever asked whether the FILES
+# changed. Improving how code is embedded therefore had no effect on any
+# already-ingested service, silently, and the only way to pick it up was to
+# know to go and clear the stored fingerprints by hand.
+#
+# 1 — the first version to record this at all. Its predecessors embedded a
+#     chunk as its code alone and stored no imports.
+# 2 — every test file now stores its own text on its File node, so the
+#     planner can be shown a real test instead of only its name.
+PIPELINE_VERSION = 2
+
 _CODE_GRAPH_CONCURRENCY = 4
 
 # How many chunk-embedding requests to have in flight at once, per service — a
@@ -189,7 +208,12 @@ async def _embed_chunks(
         nonlocal batches_done
         async with semaphore:
             embedded: list[tuple[ParsedSymbol, CodeChunk, list[float]]] = []
-            vectors = await _embed_many_with_retry([chunk.text for _, chunk in batch])
+            vectors = await _embed_many_with_retry(
+                [
+                    embedding_text(fn.file_path, fn.name, fn.parent_class, chunk.text)
+                    for fn, chunk in batch
+                ]
+            )
             if vectors is not None:
                 embedded = [
                     (fn, chunk, vector) for (fn, chunk), vector in zip(batch, vectors, strict=True)
@@ -197,8 +221,12 @@ async def _embed_chunks(
             else:
                 for fn, chunk in batch:
                     try:
-                        vector = await embed(chunk.text)
-                    except Exception as e:  # noqa: BLE001 - one bad embed call must never abort the run
+                        vector = await embed(
+                            embedding_text(fn.file_path, fn.name, fn.parent_class, chunk.text)
+                        )
+                    except (
+                        Exception
+                    ) as e:  # noqa: BLE001 - one bad embed call must never abort the run
                         print(
                             f"    [CHUNK-EMBED SKIP] {service_name}: "
                             f"{fn.qualified_name}::chunk{chunk.index}: {e}"
@@ -270,8 +298,8 @@ async def _ingest_full(
     ingested (next run retries a full ingest, not a silent permanent skip).
     """
     try:
-        graph, references_by_file, commit_sha, blob_shas = (
-            await asyncio.to_thread(_clone_and_parse_full, spec, github_token, known_service_names)
+        graph, references_by_file, commit_sha, blob_shas = await asyncio.to_thread(
+            _clone_and_parse_full, spec, github_token, known_service_names
         )
     except RepoFetchError as e:
         print(f"  [SKIP] {spec.name}: {e}")
@@ -302,6 +330,14 @@ async def _ingest_full(
             "language": lang,
             "blob_sha": blob_shas.get(fp),
             "references": sorted(references_by_file.get(fp, set())),
+            # "" for a file that imports nothing, so the property always
+            # exists and a reader can tell "no imports" from "never parsed".
+            "imports": graph.file_imports.get(fp, ""),
+            # Only ever non-empty for a test file (see RepoGraph.file_source):
+            # the planner is shown an existing test whole, because a test
+            # file's fixture and render setup are what it cannot guess and
+            # what parse_file() never extracted.
+            "source": graph.file_source.get(fp, ""),
         }
         for fp, lang in language_by_file.items()
     ]
@@ -315,9 +351,13 @@ async def _ingest_full(
     code_graph_writer.upsert_functions(spec.name, [_function_row(f) for f in graph.functions])
 
     class_pairs = [(c.file_path, c.qualified_name) for c in graph.classes]
-    top_level_fn_pairs = [(f.file_path, f.qualified_name) for f in graph.functions if not f.is_method]
+    top_level_fn_pairs = [
+        (f.file_path, f.qualified_name) for f in graph.functions if not f.is_method
+    ]
     method_pairs = [
-        (f.parent_class, f.qualified_name) for f in graph.functions if f.is_method and f.parent_class
+        (f.parent_class, f.qualified_name)
+        for f in graph.functions
+        if f.is_method and f.parent_class
     ]
 
     code_graph_writer.create_has_file_edges(spec.name, file_paths)
@@ -401,9 +441,16 @@ async def _ingest_incremental(
             print(f"  [INCREMENTAL] {spec.name}: removed {path}")
             continue
 
-        if status == "renamed" and previous_path and sha and sha == existing_blob_shas.get(previous_path):
+        if (
+            status == "renamed"
+            and previous_path
+            and sha
+            and sha == existing_blob_shas.get(previous_path)
+        ):
             code_graph_writer.rename_file(spec.name, previous_path, path)
-            print(f"  [INCREMENTAL] {spec.name}: renamed {previous_path} -> {path} (content unchanged)")
+            print(
+                f"  [INCREMENTAL] {spec.name}: renamed {previous_path} -> {path} (content unchanged)"
+            )
             continue
 
         if sha and sha == existing_blob_shas.get(path):
@@ -473,6 +520,7 @@ async def _ingest_incremental(
                     "language": language,
                     "blob_sha": sha,
                     "references": sorted(references),
+                    "imports": extract_imports(text),
                 }
             ],
         )
@@ -503,6 +551,37 @@ async def _ingest_incremental(
         print(f"  [DEPENDENCIES] {spec.name} -> {sorted(targets)}")
 
 
+async def _rescan_dependencies_only(
+    spec: ServiceSpec, root: Path, known_service_names: set[str]
+) -> None:
+    """Recompute this service's CALLS edges and nothing else.
+
+    Runs when the folder is untouched but the service LIST changed — adding
+    a service means every file must be re-checked for references to the new
+    name, while not one line of this service's own code has moved. The
+    expensive half of ingestion (parse, chunk, embed) is therefore skipped
+    entirely: this is a text scan, no model calls, no cost.
+
+    Reuses the same per-file storage the incremental GitHub path uses — each
+    File node carries its own `references`, and the service's edges are the
+    union of them, recomputed from the graph rather than from a second scan.
+    """
+    references_by_file = await asyncio.to_thread(
+        find_service_references, root, spec.name, known_service_names
+    )
+    existing = await asyncio.to_thread(code_graph_writer.load_file_blob_shas, spec.name)
+    rows = [
+        {"file_path": path, "references": sorted(references_by_file.get(path, ()))}
+        for path in existing
+    ]
+    if rows:
+        await asyncio.to_thread(code_graph_writer.upsert_files, spec.name, rows)
+    targets = await asyncio.to_thread(code_graph_writer.get_aggregated_file_references, spec.name)
+    await asyncio.to_thread(graph_writer.set_service_dependencies, spec.name, sorted(targets))
+    if targets:
+        print(f"  [DEPENDENCIES] {spec.name} -> {sorted(targets)}")
+
+
 async def sync_service(
     spec: ServiceSpec, github_token: str | None, known_service_names: set[str]
 ) -> RepoGraph | None:
@@ -511,7 +590,7 @@ async def sync_service(
     ingest, or a per-file incremental sync.
 
     Returns the freshly-parsed RepoGraph only when a FULL ingest just
-    happened (used to build this service's summarizer digest without a
+    happened (used to write this service's code graph without a
     second clone) — an incremental run or an unchanged/skip never returns
     one, since no full RepoGraph exists for those; the caller builds the
     digest from Neo4j directly in that case (see run() below).
@@ -529,12 +608,32 @@ async def sync_service(
     if local_root is not None:
         # Taken BEFORE ingesting: a file edited mid-ingest leaves the stored
         # fingerprint stale, so the next run re-ingests rather than skips.
-        fingerprint = await asyncio.to_thread(
-            local_folder_fingerprint, local_root, known_service_names
-        )
+        fingerprint = await asyncio.to_thread(local_folder_fingerprint, local_root)
+        services_fp = service_list_fingerprint(known_service_names)
         state = graph_writer.load_service_state(spec.name)
-        if state and state.get("local_fingerprint") == fingerprint:
-            print(f"  [UP TO DATE] {spec.name}: local folder unchanged since last ingest")
+        if (
+            state
+            and state.get("local_fingerprint") == fingerprint
+            and state.get("pipeline_version") == PIPELINE_VERSION
+        ):
+            # The code is untouched. The only thing that can still be stale
+            # is this service's dependency links, and only if the set of
+            # service names changed since they were computed.
+            if state.get("services_fingerprint") == services_fp:
+                print(f"  [UP TO DATE] {spec.name}: local folder unchanged since last ingest")
+                return None
+            print(
+                f"  [DEPENDENCIES ONLY] {spec.name}: code unchanged, "
+                "service list changed — rescanning references"
+            )
+            await _rescan_dependencies_only(spec, local_root, known_service_names)
+            graph_writer.set_service_commit(
+                spec.name,
+                None,
+                local_fingerprint=fingerprint,
+                services_fingerprint=services_fp,
+                pipeline_version=PIPELINE_VERSION,
+            )
             return None
         print(f"  [LOCAL] {spec.name}: reading code from {local_root}")
         graph, commit_sha = await _ingest_full(spec, github_token, known_service_names)
@@ -542,7 +641,13 @@ async def sync_service(
             # Clear any stored GitHub commit: the graph now holds local code,
             # so the next GitHub-mode run must re-ingest fully, not report
             # "up to date" against a commit it no longer reflects.
-            graph_writer.set_service_commit(spec.name, None, local_fingerprint=fingerprint)
+            graph_writer.set_service_commit(
+                spec.name,
+                None,
+                local_fingerprint=fingerprint,
+                services_fingerprint=services_fp,
+                pipeline_version=PIPELINE_VERSION,
+            )
         return graph
 
     try:
@@ -555,18 +660,38 @@ async def sync_service(
 
     state = graph_writer.load_service_state(spec.name)
 
-    if state and state.get("commit_sha") == head_sha:
+    if (
+        state
+        and state.get("commit_sha") == head_sha
+        and state.get("pipeline_version") == PIPELINE_VERSION
+    ):
         print(f"  [UP TO DATE] {spec.name} @ {head_sha[:8]}")
         return None
+
+    if state and state.get("commit_sha") == head_sha:
+        # Same commit, older pipeline: the files are identical but the graph
+        # built from them would not be, so a per-file diff has nothing to
+        # work from and this has to be a full ingest.
+        print(f"  [REBUILD] {spec.name}: same commit, built by an older pipeline")
+        graph, commit_sha = await _ingest_full(spec, github_token, known_service_names)
+        if commit_sha:
+            graph_writer.set_service_commit(
+                spec.name, commit_sha, pipeline_version=PIPELINE_VERSION
+            )
+        return graph
 
     if not state or not state.get("commit_sha"):
         graph, commit_sha = await _ingest_full(spec, github_token, known_service_names)
         if commit_sha:
-            graph_writer.set_service_commit(spec.name, commit_sha)
+            graph_writer.set_service_commit(
+                spec.name, commit_sha, pipeline_version=PIPELINE_VERSION
+            )
         return graph
 
-    await _ingest_incremental(spec, github_token, known_service_names, state["commit_sha"], head_sha)
-    graph_writer.set_service_commit(spec.name, head_sha)
+    await _ingest_incremental(
+        spec, github_token, known_service_names, state["commit_sha"], head_sha
+    )
+    graph_writer.set_service_commit(spec.name, head_sha, pipeline_version=PIPELINE_VERSION)
     return None
 
 
@@ -626,50 +751,75 @@ async def run(
                 graph = None
             return spec.name, graph
 
-    results = await asyncio.gather(*(_one(spec) for spec in specs))
+    await asyncio.gather(*(_one(spec) for spec in specs))
 
-    print("\n=== Generating code-derived service summaries (one batched LLM call) ===")
-    # A summary is written ONCE and then left alone. Re-summarizing unchanged
-    # code rewords the summary every run, which moves its embedding, which
-    # silently reshuffles which services a TDD considers at all — the same
-    # ticket then gets a different answer for no real reason. Only a service
-    # whose code actually changed this run, or one that has no summary yet,
-    # is sent to the model.
-    already_summarized = graph_writer.services_with_summaries([name for name, _ in results])
-    digests = []
-    for name, graph in results:
-        if graph is not None:
-            # A full ingest just happened — build the digest from the
-            # RepoGraph already in memory, no extra read.
-            classes = [_class_row(c) for c in graph.classes]
-            functions = [_function_row(f) for f in graph.functions]
-            digests.append(build_digest(name, classes, functions))
-        elif name not in already_summarized:
-            # Unchanged this run but has no summary yet (first-ever run, or a
-            # previous summarizer failure) — rebuild the digest from the
-            # service's CURRENT state in Neo4j, never from a repo clone.
-            classes, functions = code_graph_writer.load_current_symbols(name)
-            if classes or functions:
-                digests.append(build_digest(name, classes, functions))
+    print("\n=== Reading each service's SERVICE.md ===")
+    await _sync_service_docs(specs, github_token)
 
-    kept = sorted(name for name, graph in results if graph is None and name in already_summarized)
-    if kept:
-        print(f"  keeping existing summaries (code unchanged): {', '.join(kept)}")
 
-    if not digests:
-        print("  every service already has a summary — nothing to regenerate")
-        return
+def _read_service_doc(spec: ServiceSpec, github_token: str | None) -> str | None:
+    """A service's committed SERVICE.md, from wherever this run can reach it.
 
+    Local mode reads the folder. GitHub mode asks the API for that one file
+    rather than the checkout, because an incremental run never clones — it
+    fetches only the files the Compare API says changed, so there is no tree
+    to look in. One small request per service covers both kinds of run.
+    """
     try:
-        summaries = await generate_summaries(digests)
-    except SummarizerError as e:
-        print(f"  [SUMMARIZER SKIP] batched call failed, no summaries written this run: {e}")
-        return
+        local_root = local_repo_root(spec.name)
+    except RepoFetchError:
+        local_root = None
+    if local_root is not None:
+        return service_doc.read_local_service_doc(local_root)
+    try:
+        text = github_api.fetch_file_content(
+            spec.repo, service_doc.SERVICE_DOC_FILENAME, spec.branch or "HEAD", github_token
+        )
+    except github_api.GitHubApiError:
+        return None
+    return text if text.strip() else None
 
-    for name, summary_text in summaries.items():
-        embedding = await embed(summary_text)
-        graph_writer.update_service_summary(name, summary_text, embedding)
-        print(f"  updated summary: {name}: {summary_text[:80]!r}...")
+
+async def _sync_service_docs(specs: list[ServiceSpec], github_token: str | None) -> None:
+    """Embeds each service's SERVICE.md, skipping any whose text is unchanged.
+
+    Keyed on the text's own hash rather than on the commit: a commit that
+    touches only code must not move a service's embedding, and editing the
+    doc must take effect even when no code changed.
+    """
+    stored = graph_writer.service_doc_hashes([spec.name for spec in specs])
+    unchanged: list[str] = []
+    for spec in specs:
+        text = await asyncio.to_thread(_read_service_doc, spec, github_token)
+        if text is None:
+            # Deliberately not fatal, and deliberately loud. The service is
+            # still ingested and still searched; it scores 0 on the doc half
+            # and has to win on its code (see graph_reader.summary_scores).
+            print(
+                f"  [NO DOC] {spec.name}: no {service_doc.SERVICE_DOC_FILENAME} — "
+                "this service will score 0 on the description half of its ranking"
+            )
+            continue
+        # The whole file is stored on the node and shown to the planner; a
+        # trimmed extract of it is what gets embedded (see
+        # service_doc.embedding_text), so the size warning is about the
+        # extract — that is the text the 8000-byte cap actually truncates.
+        to_embed = service_doc.embedding_text(text)
+        note = service_doc.oversize_note(spec.name, to_embed)
+        if note:
+            print(note)
+        text_hash = service_doc.doc_hash(text)
+        if stored.get(spec.name) == text_hash:
+            unchanged.append(spec.name)
+            continue
+        embedding = await embed(to_embed)
+        graph_writer.update_service_doc(spec.name, text, embedding, text_hash)
+        first_line = text.strip().splitlines()[0][:70]
+        dropped = len(text) - len(to_embed)
+        trimmed = f", {dropped} chars of exclusions not embedded" if dropped > 0 else ""
+        print(f"  embedded {spec.name}: {len(text)} chars{trimmed}, starting {first_line!r}")
+    if unchanged:
+        print(f"  unchanged, left alone: {', '.join(sorted(unchanged))}")
 
 
 if __name__ == "__main__":

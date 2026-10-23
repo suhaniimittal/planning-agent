@@ -30,6 +30,7 @@ _KEYS = {
     "Function": ("qualified_name", "service"),
     "Chunk": ("qualified_name", "service"),
     "Service": ("name", "name"),
+    "File": ("file_path", "service"),
 }
 
 
@@ -49,7 +50,9 @@ def _plain_nodes(session, label: str) -> list[dict]:
 
 
 def _sealed(label: str, row: dict) -> dict:
-    out = code_crypto.encrypt_row(row, label=label, service=row["service"])
+    out = code_crypto.encrypt_row(
+        row, label=label, service=row["service"], qualified_name=row["qualified_name"]
+    )
     if label == "Chunk" and not code_crypto.is_encrypted(row.get("text")):
         out["text_terms"] = code_crypto.text_terms(row["service"], row.get("text") or "")
     return out

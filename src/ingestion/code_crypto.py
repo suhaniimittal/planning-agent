@@ -1,7 +1,8 @@
 """Encryption of the code stored in Neo4j (2026-10-22).
 
 The graph holds a whole codebase: every function's source, its signature and
-docstring, every chunk of code, and each service's summary. Anyone who could
+docstring, every chunk of code, each service's SERVICE.md, and each file's
+import lines and (for tests) full text. Anyone who could
 open Neo4j (a database login, a backup, the browser) could read all of it. Now
 those fields are stored encrypted, and are decrypted only by the reads that
 hand a specific function or chunk to the planner, at the moment it asks.
@@ -60,7 +61,11 @@ ENCRYPTED_FIELDS = {
     "Class": ("source_snippet", "signature", "docstring"),
     "Function": ("source_snippet", "signature", "docstring"),
     "Chunk": ("text",),
-    "Service": ("summary",),
+    # `doc` is the committed SERVICE.md; `summary` the generated text it replaced.
+    "Service": ("doc", "summary"),
+    # A test file's stored text, and every file's import lines. A File is named
+    # by its path, which a rename changes: see code_graph_writer.rename_file.
+    "File": ("source", "imports"),
 }
 
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -154,20 +159,20 @@ def decrypt(value: object, *, label: str, service: str, qualified_name: str, fie
     return plain.decode("utf-8")
 
 
-def encrypt_row(row: dict, *, label: str, service: str) -> dict:
+def encrypt_row(
+    row: dict, *, label: str, service: str, qualified_name: str | None = None
+) -> dict:
     """A copy of a node's row with its code fields encrypted (the input is
-    left as it was). The row must carry its own ``qualified_name``."""
+    left as it was). The node is named by ``qualified_name``, else by the
+    row's own ``qualified_name``."""
     fields = [f for f in ENCRYPTED_FIELDS[label] if f in row]
     if not fields:
         return row
+    name = qualified_name if qualified_name is not None else row["qualified_name"]
     out = dict(row)
     for field in fields:
         out[field] = encrypt(
-            row[field],
-            label=label,
-            service=service,
-            qualified_name=row["qualified_name"],
-            field=field,
+            row[field], label=label, service=service, qualified_name=name, field=field
         )
     return out
 
