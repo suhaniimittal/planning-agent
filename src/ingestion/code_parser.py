@@ -103,6 +103,16 @@ class RepoGraph:
     # Production files are not stored this way; their symbols are already
     # extracted, and storing both would double the graph for nothing.
     file_source: dict[str, str] = field(default_factory=dict)
+    # file_path -> chunks of its raw text, for files that produced NO class
+    # and NO function. Those files used to leave the graph entirely: a File
+    # node was created only for a path some symbol reported, so a file that
+    # is one exported object literal, a barrel of re-exports, a constants
+    # table or a type declaration simply did not exist. Measured on ui:
+    # 3,369 of 10,285 parseable files, a third of the repository, including
+    # all 118 messages*.ts files — every piece of user-facing English in the
+    # product. A ticket quoting a label or a help string could match none of
+    # it.
+    file_chunks: dict[str, list[CodeChunk]] = field(default_factory=dict)
     files_parsed: int = 0
     files_skipped_unsupported: int = 0
     files_skipped_oversized: int = 0
@@ -447,6 +457,49 @@ def embedding_text(file_path: str, name: str, parent_class: str | None, chunk_te
     return f"{head}\n{name}\n{chunk_text}"
 
 
+def chunk_text(text: str) -> list[CodeChunk]:
+    """Split a whole file's text into embeddable pieces, cut at line ends.
+
+    Used only for a file that produced no class and no function, where
+    chunk_function has no node to work with. Greedy, same target size, so a
+    64KB messages.ts becomes ~90 searchable chunks instead of nothing at
+    all.
+    """
+    lines = text.splitlines(keepends=True)
+    chunks: list[CodeChunk] = []
+    buf: list[str] = []
+    start_line = 1
+    line_no = 1
+
+    def flush() -> None:
+        nonlocal buf, start_line
+        if not buf:
+            return
+        chunks.append(
+            CodeChunk(
+                index=len(chunks),
+                line_start=start_line,
+                line_end=line_no - 1,
+                text="".join(buf),
+            )
+        )
+        buf = []
+        start_line = line_no
+
+    size = 0
+    for line in lines:
+        # A single line longer than the target still becomes its own chunk
+        # rather than being split mid-token.
+        if buf and size + len(line) > _CHUNK_TARGET_CHARS:
+            flush()
+            size = 0
+        buf.append(line)
+        size += len(line)
+        line_no += 1
+    flush()
+    return chunks
+
+
 def chunk_function(node: Node, body: Node | None, signature: str, source: bytes) -> list[CodeChunk]:
     """Split a function's body into embeddable pieces.
 
@@ -784,6 +837,16 @@ MAX_IMPORT_CHARS = 1200
 # the files that teach least.
 MAX_TEST_SOURCE_CHARS = 6000
 
+# A file with no symbols is chunked by LINES, not by syntax: there is no
+# useful tree to cut on — the content is an object literal, a re-export
+# list, a constants table. Lines are the natural boundary instead.
+#
+# Below this, a file is given its node but no chunks. 1,609 of ui's
+# symbol-less files are under 200 bytes, and almost all are a single
+# `export * from "./view"`. Embedded, they are noise competing with real
+# code; as a File node alone they still tell a coding agent the file exists.
+MIN_CHUNKED_FILE_CHARS = 200
+
 
 def extract_imports(source: str) -> str:
     """The import lines at the top of `source`, in order, as one block.
@@ -991,17 +1054,27 @@ def parse_repo(
         dirnames[:] = [d for d in dirnames if d not in denylist]
         for filename in filenames:
             path = Path(dirpath) / filename
+            rel_path = str(path.relative_to(repo_root).as_posix())
             language = LANGUAGE_BY_EXTENSION.get(path.suffix)
             if language is None:
-                tracked_language = TRACKED_ONLY_EXTENSIONS.get(path.suffix.lower())
-                if tracked_language is not None:
-                    rel_path = str(path.relative_to(repo_root).as_posix())
-                    graph.tracked_files[rel_path] = tracked_language
-                else:
-                    graph.files_skipped_unsupported += 1
+                # EVERY file gets a node, whatever its extension. A node is
+                # cheap — path, language, size, blob sha — and it answers
+                # "does this file exist, what is beside it". A Jenkinsfile,
+                # a .yaml, a .properties, a .sh is often exactly what a
+                # ticket is about, and a coding agent told to edit one has
+                # to know it is there.
+                graph.tracked_files[rel_path] = (
+                    TRACKED_ONLY_EXTENSIONS.get(path.suffix.lower())
+                    or path.suffix.lower().lstrip(".")
+                    or "text"
+                )
+                graph.files_skipped_unsupported += 1
                 continue
             try:
                 if path.stat().st_size > max_file_size_bytes:
+                    # Still a node — the file exists and something may need
+                    # to edit it — but too large to parse or embed.
+                    graph.tracked_files[rel_path] = language
                     graph.files_skipped_oversized += 1
                     continue
             except OSError:
@@ -1013,7 +1086,6 @@ def parse_repo(
                 graph.files_failed += 1
                 continue
             graph.files_parsed += 1
-            rel_path = str(path.relative_to(repo_root).as_posix())
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -1029,5 +1101,14 @@ def parse_repo(
                     graph.classes.append(symbol)
                 else:
                     graph.functions.append(symbol)
+            if not symbols:
+                # Parsed fine, but holds no class and no function — an
+                # exported object literal, a barrel, a constants table, a
+                # type declaration. Its node comes from tracked_files and
+                # its content is chunked by line, because nothing else in
+                # the pipeline would record either.
+                graph.tracked_files[rel_path] = language
+                if text and len(text) >= MIN_CHUNKED_FILE_CHARS:
+                    graph.file_chunks[rel_path] = chunk_text(text)
 
     return graph

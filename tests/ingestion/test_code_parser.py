@@ -558,14 +558,57 @@ def test_parse_repo_tracks_html_css_csv_without_fake_symbols(tmp_path):
     }
 
 
-def test_parse_repo_still_counts_truly_unsupported_extensions(tmp_path):
+def test_parse_repo_gives_every_file_a_node_whatever_its_extension(tmp_path):
+    """A node is cheap and it answers "does this file exist". A Jenkinsfile,
+    a .yaml, a .properties is often exactly what a ticket is about, and a
+    coding agent told to edit one has to know it is there. The counter still
+    records that nothing was parsed out of them."""
     (tmp_path / "index.html").write_text("<html></html>")
     (tmp_path / "photo.png").write_bytes(b"binary")
+    (tmp_path / "Jenkinsfile").write_text("pipeline { agent any }")
+    (tmp_path / "config.yaml").write_text("a: 1")
 
     graph = parse_repo(tmp_path, "orders")
 
-    assert graph.tracked_files == {"index.html": "html"}
-    assert graph.files_skipped_unsupported == 1
+    assert graph.tracked_files == {
+        "index.html": "html",
+        "photo.png": "png",
+        # no extension at all — still a node, labelled as text
+        "Jenkinsfile": "text",
+        "config.yaml": "yaml",
+    }
+    # all four have no parser — the counter now means "given a node, not
+    # parsed", which includes the html/css/csv that were already tracked
+    assert graph.files_skipped_unsupported == 4
+    # nothing is embedded from them: binary has no meaning, and the rest
+    # produced no symbols to chunk
+    assert graph.file_chunks == {}
+
+
+def test_parse_repo_chunks_a_file_that_has_no_symbols(tmp_path):
+    """Measured on ui: 3,369 of 10,285 parseable files produced no class and
+    no function, every messages*.ts among them, and none of them existed in
+    the graph at all. A ticket quoting a label could match nothing."""
+    body = "".join(f'  key{i}: "Comma-separated value {i}",\n' for i in range(200))
+    (tmp_path / "messages.ts").write_text("export const messages = {\n" + body + "};\n")
+
+    graph = parse_repo(tmp_path, "ui")
+
+    assert graph.tracked_files == {"messages.ts": "typescript"}
+    assert len(graph.file_chunks["messages.ts"]) > 1
+    assert "Comma-separated value 7" in "".join(c.text for c in graph.file_chunks["messages.ts"])
+
+
+def test_parse_repo_does_not_chunk_a_tiny_barrel_file(tmp_path):
+    """1,609 of ui's symbol-less files are under 200 bytes and almost all are
+    a single re-export. Embedded they are noise competing with real code; as
+    a node alone they still tell a coding agent the file exists."""
+    (tmp_path / "index.ts").write_text('export * from "./view";\n')
+
+    graph = parse_repo(tmp_path, "ui")
+
+    assert graph.tracked_files == {"index.ts": "typescript"}
+    assert graph.file_chunks == {}
 
 
 def test_parse_repo_mixes_real_symbols_and_tracked_only_files(tmp_path):

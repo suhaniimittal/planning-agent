@@ -24,6 +24,7 @@ from pathlib import Path, PurePosixPath
 
 from . import code_graph_writer, github_api, graph_writer
 from .code_parser import (
+    chunk_text,
     extract_imports,
     embedding_text,
     LANGUAGE_BY_EXTENSION,
@@ -66,7 +67,12 @@ from .test_paths import is_test_path
 #     chunk as its code alone and stored no imports.
 # 2 — every test file now stores its own text on its File node, so the
 #     planner can be shown a real test instead of only its name.
-PIPELINE_VERSION = 2
+# 3 — EVERY file gets a node, whatever its extension, and a file that holds
+#     no class and no function has its text chunked and embedded. Before
+#     this, a File node existed only for a path some symbol reported, so a
+#     third of ui — 3,369 of 10,285 parseable files, every messages*.ts
+#     among them — was absent from the graph entirely.
+PIPELINE_VERSION = 3
 
 _CODE_GRAPH_CONCURRENCY = 4
 
@@ -144,6 +150,60 @@ def _chunk_row(function_symbol: ParsedSymbol, chunk: CodeChunk, embedding: list[
         "language": function_symbol.language,
         "is_test": is_test_path(function_symbol.file_path),
     }
+
+
+def _file_chunk_row(file_path: str, language: str, chunk: CodeChunk, embedding: list[float]) -> dict:
+    """A chunk of a file that has no symbols. Shaped exactly like a
+    function's chunk except that `function_qualified_name` is null — the
+    file itself is the parent, reached by a File-[:HAS_CHUNK]->Chunk edge."""
+    return {
+        "qualified_name": f"{file_path}::filechunk{chunk.index}",
+        "function_qualified_name": None,
+        "chunk_index": chunk.index,
+        "file_path": file_path,
+        "line_start": chunk.line_start,
+        "line_end": chunk.line_end,
+        "text": chunk.text,
+        "embedding": embedding,
+        "language": language,
+        "is_test": is_test_path(file_path),
+    }
+
+
+async def _embed_file_chunks(
+    service_name: str,
+    file_chunks: dict[str, list[CodeChunk]],
+    language_by_file: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Embed and write every symbol-less file's chunks, returning the
+    (file_path, chunk_qname) pairs to link.
+
+    Reuses the function path's batching by pretending each file is a
+    one-symbol unit; the embedding text is the file path followed by the
+    chunk, the same shape embedding_text() gives a function's chunk, so a
+    search matches on the path as well as the content.
+    """
+    pairs = [(fp, chunk) for fp, chunks in file_chunks.items() for chunk in chunks]
+    if not pairs:
+        return []
+    print(f"  [FILE CHUNKS] {service_name}: {len(pairs)} chunk(s) from "
+          f"{len(file_chunks)} file(s) with no symbols")
+    edges: list[tuple[str, str]] = []
+    for start in range(0, len(pairs), _EMBEDDING_BATCH_SIZE):
+        batch = pairs[start : start + _EMBEDDING_BATCH_SIZE]
+        texts = [embedding_text(fp, Path(fp).name, None, chunk.text) for fp, chunk in batch]
+        try:
+            vectors = await embed_many(texts)
+        except Exception as e:  # noqa: BLE001 - one bad batch must not cost the service
+            print(f"    [FILE CHUNKS] {service_name}: batch failed ({e}); skipped")
+            continue
+        rows = [
+            _file_chunk_row(fp, language_by_file.get(fp, "text"), chunk, vector)
+            for (fp, chunk), vector in zip(batch, vectors, strict=True)
+        ]
+        await asyncio.to_thread(code_graph_writer.upsert_chunks, service_name, rows)
+        edges.extend((fp, row["qualified_name"]) for (fp, _), row in zip(batch, rows, strict=True))
+    return edges
 
 
 async def _embed_chunks(
@@ -373,6 +433,8 @@ async def _ingest_full(
     _, chunk_edge_pairs = await _embed_chunks(
         spec.name, graph.functions, write_batch=write_chunk_batch
     )
+    file_chunk_edges = await _embed_file_chunks(spec.name, graph.file_chunks, language_by_file)
+    code_graph_writer.create_file_has_chunk_edges(spec.name, file_chunk_edges)
 
     # Runs last, once every current node is written: anything of this
     # service's not in the latest parse (or a chunk that failed to embed)
@@ -381,6 +443,7 @@ async def _ingest_full(
         [c.qualified_name for c in graph.classes]
         + [f.qualified_name for f in graph.functions]
         + [chunk_qname for _, chunk_qname in chunk_edge_pairs]
+        + [chunk_qname for _, chunk_qname in file_chunk_edges]
     )
     code_graph_writer.prune_stale_code_nodes(spec.name, all_qualified_names)
 

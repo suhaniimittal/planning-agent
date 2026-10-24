@@ -295,6 +295,12 @@ def search_service_chunks(
     code_search.rank_functions' cap, which decides how much source reaches
     the prompt.
 
+    A chunk of a file that holds no class and no function has no Function
+    parent, so the join is OPTIONAL and such a chunk reports its FILE PATH
+    where a function's chunk reports its qualified name. Without that, a
+    third of ui — every messages.ts among them — would score and then be
+    silently dropped from the results.
+
     Returns [{"function_qualified_name", "text", "score", "identifiers"}].
     """
     score = (
@@ -310,9 +316,9 @@ def search_service_chunks(
             WHERE {_NOT_TEST}
             WITH c, {score} AS score
             ORDER BY score DESC LIMIT $k
-            MATCH (f:Function)-[:HAS_CHUNK]->(c)
-            RETURN f.qualified_name AS function_qualified_name, c.text AS text, score,
-                   [] AS identifiers
+            OPTIONAL MATCH (f:Function)-[:HAS_CHUNK]->(c)
+            RETURN coalesce(f.qualified_name, c.file_path) AS function_qualified_name,
+                   c.text AS text, score, [] AS identifiers
             """,
             k=k,
             **params,
@@ -324,8 +330,9 @@ def search_service_chunks(
                 MATCH (c:Chunk {{service: $service}})
                 WHERE any(w IN $identifiers WHERE c.text CONTAINS w) AND {_NOT_TEST}
                 WITH c, {score} AS score
-                MATCH (f:Function)-[:HAS_CHUNK]->(c)
-                RETURN f.qualified_name AS function_qualified_name, c.text AS text, score,
+                OPTIONAL MATCH (f:Function)-[:HAS_CHUNK]->(c)
+                RETURN coalesce(f.qualified_name, c.file_path) AS function_qualified_name,
+                       c.text AS text, score,
                        [w IN $identifiers WHERE c.text CONTAINS w] AS identifiers
                 LIMIT 200
                 """,
@@ -338,7 +345,14 @@ def search_service_chunks(
 
 def load_symbols(service_qualified_name_pairs: list[tuple[str, str]]) -> list[dict]:
     """Full metadata AND source for exactly these (service, qualified_name)
-    Class/Function symbols — the final shortlist only."""
+    Class/Function symbols — the final shortlist only.
+
+    A pair whose "qualified_name" is a FILE PATH resolves to that File
+    instead, shaped like a symbol so every caller downstream treats it the
+    same way. That is how a file with no class and no function reaches the
+    planner at all: search_service_chunks reports such a chunk by its file
+    path, and without this it would resolve to nothing and be dropped.
+    """
     if not service_qualified_name_pairs:
         return []
     rows = [{"service": s, "qualified_name": q} for s, q in service_qualified_name_pairs]
@@ -359,7 +373,33 @@ def load_symbols(service_qualified_name_pairs: list[tuple[str, str]]) -> list[di
             """,
             rows=rows,
         )
-        return [dict(r) for r in result]
+        found = [dict(r) for r in result]
+        seen = {(r["service"], r["qualified_name"]) for r in found}
+        unresolved = [r for r in rows if (r["service"], r["qualified_name"]) not in seen]
+        if not unresolved:
+            return found
+        files = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (f:File {service: row.service, file_path: row.qualified_name})
+            RETURN f.service AS service, f.file_path AS qualified_name,
+                   f.file_path AS file_path,
+                   split(f.file_path, '/')[-1] AS name,
+                   f.language AS language
+            """,
+            rows=unresolved,
+        )
+        for row in files:
+            record = dict(row)
+            # Shaped like a symbol, with the fields a file has no answer
+            # for left empty rather than invented. `kind` says File so the
+            # prompt can say what this is.
+            record.update(
+                line_start=1, line_end=None, signature=None, docstring=None,
+                source_snippet=None, is_method=False, parent_class=None, kind="File",
+            )
+            found.append(record)
+        return found
 
 
 def load_file_imports(service_file_pairs: list[tuple[str, str]]) -> dict[tuple[str, str], str]:

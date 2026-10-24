@@ -124,6 +124,25 @@ def upsert_chunks(service: str, records: list[dict]) -> None:
     )
 
 
+def create_file_has_chunk_edges(service: str, file_to_chunk_qnames: list[tuple[str, str]]) -> None:
+    """(File)-[:HAS_CHUNK]->(Chunk), for a file that holds no class and no
+    function — an object literal, a barrel, a constants table. Its chunks
+    have no Function to hang off, and without this edge they would be
+    unreachable from anything."""
+    rows = [{"file_path": f, "chunk_qname": c} for f, c in file_to_chunk_qnames]
+    _run_batched(
+        """
+        UNWIND $rows AS row
+        MATCH (f:File {service: $service, file_path: row.file_path})
+        MATCH (c:Chunk {service: $service, qualified_name: row.chunk_qname})
+        MERGE (f)-[:HAS_CHUNK]->(c)
+        """,
+        "rows",
+        rows,
+        service=service,
+    )
+
+
 def create_has_chunk_edges(service: str, function_to_chunk_qnames: list[tuple[str, str]]) -> None:
     """(Function)-[:HAS_CHUNK]->(Chunk) for every (function_qname, chunk_qname) pair."""
     rows = [{"function_qname": f, "chunk_qname": c} for f, c in function_to_chunk_qnames]
