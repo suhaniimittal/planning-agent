@@ -21,7 +21,12 @@ from pydantic import BaseModel, Field
 
 class FileChange(BaseModel):
     file_path: str | None = None
-    function_or_symbol: str
+    # None for a change to a file that HAS no symbols — a message catalogue,
+    # a constants table, a config file. Those files reach the planner now
+    # that every file is in the graph, and forcing a symbol name made the
+    # model write the string "None", which then rendered as
+    # "Change 3: None (modify)" and "`None` is not in it today".
+    function_or_symbol: str | None = None
     # What this symbol currently does, distinct from what changes — None
     # when the symbol has no real source and no doc description to ground
     # this in (never invented).

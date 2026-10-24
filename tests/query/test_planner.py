@@ -1109,3 +1109,42 @@ def test_prompt_forbids_an_undeclared_second_edit():
 def test_self_check_covers_undeclared_edits():
     prompt = build_system_prompt("bug")
     assert "nothing narrowed, dropped or tidied along the way" in prompt
+
+
+def test_a_symbol_with_no_test_is_shown_how_its_peers_are_tested():
+    """Twenty-one specs sit beside this component under the same parent,
+    every one wrapping it in the context provider it actually needs. The
+    design instead copied a spec from another app that renders through
+    props, and the test could not work."""
+    path = "src/common/.../sections/AtsIntegrationSection/view.tsx"
+    peer = "src/common/.../sections/DomainsSection/view.test.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        tests_by_symbol={},
+        peer_tests={("ui", path): [peer]},
+        test_sources={("ui", peer): "<SettingsFormContext.Provider value={...}>"},
+    )
+    assert "Components beside it are tested in:" in prompt
+    assert "<SettingsFormContext.Provider value={...}>" in prompt
+
+
+def test_a_symbol_with_its_own_test_is_not_shown_a_peer_instead():
+    """A test that actually covers the symbol always wins; a peer's test is
+    the fallback, not an addition."""
+    path = "a/b/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        tests_by_symbol={("ui", "X"): ["a/b/view.test.tsx"]},
+        peer_tests={("ui", path): ["a/c/view.test.tsx"]},
+        test_sources={("ui", "a/b/view.test.tsx"): "covers it"},
+    )
+    assert "Existing test files that cover this symbol:" in prompt
+    assert "Components beside it are tested in:" not in prompt
+
+
+def test_prompt_says_a_file_with_no_symbols_names_none():
+    """Forcing a symbol name on a message catalogue made the model write the
+    string "None", which rendered as "Change 3: None (modify)"."""
+    prompt = build_system_prompt("bug")
+    assert "A FILE WITH NO SYMBOLS NAMES NO SYMBOL" in prompt
+    assert "LEAVE `function_or_symbol` EMPTY" in prompt

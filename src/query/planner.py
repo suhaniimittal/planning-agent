@@ -501,6 +501,15 @@ def build_system_prompt(mode: str = "bug") -> str:
         "needed, leave that line exactly as the source has it — including "
         "the parts that look redundant. A condition you did not have to "
         "touch is a condition you do not get to simplify.\n\n"
+        "A FILE WITH NO SYMBOLS NAMES NO SYMBOL. Some files hold no "
+        "function and no class at all — a message catalogue, a constants "
+        "table, a config file. They appear in the evidence as `File` rather "
+        "than as a symbol. When you change one, LEAVE "
+        "`function_or_symbol` EMPTY and let `file_path` and "
+        "`change_description` carry the change. Do not write the word "
+        '"None", do not invent a symbol name, and do not name a key inside '
+        "the file as though it were a symbol — the renderer says \"the file "
+        "itself\" and a reader understands that.\n\n"
         "WHEN A CHANGE ADDS SOMETHING THAT DOES NOT EXIST YET, NAME THE NEW "
         "THING. Put the name of the symbol to be CREATED in "
         "`function_or_symbol`, and name the file it belongs in as "
@@ -890,6 +899,7 @@ def _format_code_symbol(
     tests_naming_it: list[str] | None = None,
     imports: str | None = None,
     test_sources: dict[str, str] | None = None,
+    peer_tests_for_file: list[str] | None = None,
 ) -> str:
     location = f"{symbol['file_path']}:{symbol['line_start']}-{symbol['line_end']}"
     line = f"- `{location}` `{symbol['qualified_name']}` — `{symbol['signature']}`"
@@ -927,6 +937,15 @@ def _format_code_symbol(
         named = ", ".join(f"`{t}`" for t in tests_naming_it)
         line += f"\n  Existing test files that cover this symbol: {named}"
         line += _format_test_sources(tests_naming_it, test_sources or {})
+    elif peer_tests_for_file:
+        # No test covers this symbol, so show how a PEER component in the
+        # same part of the codebase is tested. That is where the render
+        # helper and the providers it needs are visible, and a design that
+        # copied a test from elsewhere rendered the component a way it does
+        # not work.
+        named = ", ".join(f"`{t}`" for t in peer_tests_for_file)
+        line += f"\n  No test covers this symbol. Components beside it are tested in: {named}"
+        line += _format_test_sources(peer_tests_for_file, test_sources or {})
     if imports:
         # Verbatim, because the point is the exact module paths — a
         # paraphrase would be no better than guessing.
@@ -951,6 +970,7 @@ def build_user_prompt(
     tests_by_symbol: dict[tuple[str, str], list[str]] | None = None,
     file_imports: dict[tuple[str, str], str] | None = None,
     test_sources: dict[tuple[str, str], str] | None = None,
+    peer_tests: dict[tuple[str, str], list[str]] | None = None,
 ) -> str:
     """`known_dependencies`: real CALLS edges among the candidate services,
     read from the graph BEFORE the LLM call — shown here as confirmed
@@ -984,6 +1004,7 @@ def build_user_prompt(
     sibling_tests = sibling_tests or {}
     new_test_paths = new_test_paths or {}
     tests_by_symbol = tests_by_symbol or {}
+    peer_tests = peer_tests or {}
     file_imports = file_imports or {}
     # Regrouped per service, because a symbol is formatted knowing only its
     # own service and the test paths attached to it.
@@ -1044,6 +1065,7 @@ def build_user_prompt(
                     tests_by_symbol.get((doc["name"], symbol["name"])),
                     file_imports.get((doc["name"], symbol["file_path"])),
                     test_sources_by_service.get(doc["name"], {}),
+                    peer_tests.get((doc["name"], symbol["file_path"])),
                 )
                 for symbol in code_symbols
             ]

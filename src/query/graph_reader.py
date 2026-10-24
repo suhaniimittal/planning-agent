@@ -647,6 +647,63 @@ def load_test_sources(
         return {(r["service"], r["file_path"]): r["source"] for r in result}
 
 
+def tests_of_sibling_components(
+    service_file_pairs: list[tuple[str, str]], limit: int = 3
+) -> dict[tuple[str, str], list[str]]:
+    """{(service, file_path): [spec files testing components BESIDE it]}.
+
+    The third place a test can live, and the one the other two lookups
+    cannot reach. load_sibling_tests sees only the file's own folder, which
+    is empty for a component that has no test yet. tests_naming matches the
+    identifiers a symbol touches, which a sibling component's test never
+    contains — it tests a different component.
+
+    What a sibling test carries is the one thing neither of those gives:
+    how components in THIS part of the codebase are wired up for a test.
+    Observed on the ATS CC-email ticket, where the design was told to copy
+    a spec from another app that renders its component through props, while
+    the component being changed reads a React context. Twenty-one specs sit
+    beside it under the same parent, every one of them wrapping the
+    component in the context provider it actually needs.
+
+    "Beside" means sharing the file's grandparent directory — the parent
+    holds the component itself, the grandparent holds its peers.
+    """
+    if not service_file_pairs:
+        return {}
+    rows = []
+    for service, path in service_file_pairs:
+        parts = path.split("/")
+        if len(parts) < 3:
+            continue
+        rows.append({"service": service, "file_path": path, "near": "/".join(parts[:-2]) + "/"})
+    if not rows:
+        return {}
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (f:File {service: row.service})
+            WHERE f.file_path STARTS WITH row.near
+              AND f.file_path <> row.file_path
+              AND f.file_path =~ $spec_re
+              AND f.source IS NOT NULL AND f.source <> ''
+            RETURN row.service AS service, row.file_path AS file_path,
+                   f.file_path AS test_path, size(f.source) AS size
+            ORDER BY size
+            """,
+            rows=rows,
+            spec_re=CYPHER_SPEC_FILE_RE,
+        )
+        found: dict[tuple[str, str], list[str]] = {}
+        for r in result:
+            key = (r["service"], r["file_path"])
+            paths = found.setdefault(key, [])
+            if len(paths) < limit:
+                paths.append(r["test_path"])
+    return found
+
+
 def load_sibling_tests(
     service_file_pairs: list[tuple[str, str]],
 ) -> dict[tuple[str, str], list[str]]:

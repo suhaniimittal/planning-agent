@@ -24,6 +24,22 @@ _VERIFICATION_LABELS = {
 }
 
 
+def _symbol_text(c) -> str:
+    """What to call the thing being changed.
+
+    A change to a file that holds no symbols — a message catalogue, a
+    constants table, a config file — names no symbol, and saying "the file
+    itself" is both true and readable. Printing the raw value instead gave
+    "Change 3: None (modify)".
+    """
+    return c.function_or_symbol or "the file itself"
+
+
+def _symbol_label(c) -> str:
+    """_symbol_text, backticked only when it is a real symbol name."""
+    return f"`{c.function_or_symbol}`" if c.function_or_symbol else "_the file itself_"
+
+
 def _change_type_label(c) -> str:
     """A bare "reference" reads like a change; spell out that it is not."""
     return "reference (read, not changed)" if c.change_type == "reference" else c.change_type
@@ -176,7 +192,7 @@ def _md_change_block(c) -> list[str]:
         if c.has_real_source
         else "Proposed approach (illustrative pseudocode, not real code):"
     )
-    lines = [f"##### {loc}`{c.function_or_symbol}`{source_tag}", ""]
+    lines = [f"##### {loc}{_symbol_label(c)}{source_tag}", ""]
     if c.current_behavior:
         lines += [f"- **Current behavior:** {c.current_behavior}"]
     lines += [f"- **Change type:** {_change_type_label(c)}"]
@@ -351,7 +367,7 @@ def render_markdown(tdd: TechnicalDesignDoc) -> str:
     )
 
     summary_rows = [
-        [s.service, c.file_path or "Unknown", c.function_or_symbol, c.change_type, s.complexity]
+        [s.service, c.file_path or "Unknown", _symbol_text(c), c.change_type, s.complexity]
         for s in tdd.services
         for c in s.changes
     ]
@@ -529,7 +545,7 @@ def _txt_change_block(number: str, c) -> str:
     graph confirmed it, then what/how/why and when it's done."""
     status = _code_check(c)
     lines = [
-        f"{number} {c.function_or_symbol}  ({_change_type_label(c)})",
+        f"{number} {_symbol_text(c)}  ({_change_type_label(c)})",
         f"    File: {c.file_path or 'Unknown'}",
     ]
     if status:
@@ -643,7 +659,7 @@ def _cf_change_block(c) -> str:
         if c.has_real_source
         else " (illustrative only, not verified code)"
     )
-    lines = [f"<h4>{loc}<code>{_cf_escape(c.function_or_symbol)}</code>{source_tag}</h4>"]
+    lines = [f"<h4>{loc}<code>{_cf_escape(_symbol_text(c))}</code>{source_tag}</h4>"]
     facts = []
     if c.current_behavior:
         facts.append(f"Current behavior: {c.current_behavior}")
@@ -790,7 +806,7 @@ def render_confluence(tdd: TechnicalDesignDoc) -> str:
     sections.append(_cf_section(22, "Open Questions", _cf_bullets(tdd.open_questions)))
 
     summary_rows = [
-        [s.service, c.file_path or "Unknown", c.function_or_symbol, c.change_type, s.complexity]
+        [s.service, c.file_path or "Unknown", _symbol_text(c), c.change_type, s.complexity]
         for s in tdd.services
         for c in s.changes
     ]

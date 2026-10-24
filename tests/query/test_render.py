@@ -606,3 +606,25 @@ def test_root_cause_splits_every_label_the_prompts_emit():
         "Not the cause:",
     ):
         assert f"\n{label}" in text, label
+
+
+def test_a_change_with_no_symbol_renders_as_the_file_itself():
+    """A message catalogue holds no symbol. Printing the raw value gave
+    "Change 3: None (modify)"."""
+    from src.query.render import render_text
+
+    change = FileChange(
+        file_path="src/common/accounts/messages.en.ts",
+        function_or_symbol=None,
+        change_description="Update the ATS CC help text.",
+        implementation_notes="n", pseudocode_sketch="p", reasoning="r",
+    )
+    tdd = TechnicalDesignDoc(
+        title="t", issue_summary="s", overall_reasoning="r",
+        services=[ServicePlan(service="ui", complexity="low", reasoning="r", changes=[change])],
+    )
+
+    text = render_text(tdd)
+
+    assert "the file itself" in text
+    assert "None" not in text.split("SERVICES AND CHANGES")[1].split("FILES TO CHANGE")[0]

@@ -342,6 +342,12 @@ async def build_tdd(
     # Paths only, looked up AFTER the files are chosen — test code still never
     # competes in the search (see graph_reader.load_sibling_tests).
     sibling_tests = graph_reader.load_sibling_tests(shown_files)
+    # The third place a test can live: beside a PEER component, under the
+    # same parent. Neither lookup above reaches it — the file's own folder
+    # is empty, and a peer's test never names this symbol. It is the only
+    # one that shows how components in this part of the codebase are wired
+    # up, which is what the design kept getting wrong.
+    peer_tests = graph_reader.tests_of_sibling_components(shown_files)
     # Tests that NAME a symbol being changed, wherever they live. The sibling
     # lookup above only sees the same folder, which finds nothing on a project
     # that keeps src/common/ apart from src/apps/ — and a design that believes
@@ -371,7 +377,10 @@ async def build_tdd(
     # of inventing one. Only test files carry source, so this reads nothing
     # for anything else.
     test_sources = graph_reader.load_test_sources(
-        sorted({(service, path_) for (service, _), paths in tests_by_symbol.items() for path_ in paths})
+        sorted(
+            {(service, p) for (service, _), paths in tests_by_symbol.items() for p in paths}
+            | {(service, p) for (service, _), paths in peer_tests.items() for p in paths}
+        )
     )
     # Where a NEW test would go, for the shown files that have none beside
     # them. Only for services whose tests demonstrably sit beside their
@@ -398,6 +407,7 @@ async def build_tdd(
         file_context=file_context,
         file_imports=file_imports,
         sibling_tests=sibling_tests,
+        peer_tests=peer_tests,
         tests_by_symbol=tests_by_symbol,
         test_sources=test_sources,
         new_test_paths=new_test_paths,

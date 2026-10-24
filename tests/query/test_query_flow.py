@@ -51,6 +51,7 @@ class FakeGraph:
         self.tests_by_symbol = {}
         self.file_imports = {}
         self.test_sources = {}
+        self.peer_tests = {}
         self.calls = []
         self.prompt = {}
         self.tdd = FakeTdd()
@@ -112,6 +113,10 @@ def graph(monkeypatch):
         g.calls.append(("load_test_sources", list(pairs)))
         return g.test_sources
 
+    def tests_of_sibling_components(pairs):
+        g.calls.append(("tests_of_sibling_components", list(pairs)))
+        return g.peer_tests
+
     def build_user_prompt(issue_text, docs, code_symbols_by_service=None, snippets_by_key=None, **kwargs):
         g.prompt = {
             "docs": [d["name"] for d in docs],
@@ -138,6 +143,7 @@ def graph(monkeypatch):
         "tests_naming": tests_naming,
         "load_file_imports": load_file_imports,
         "load_test_sources": load_test_sources,
+        "tests_of_sibling_components": tests_of_sibling_components,
     }.items():
         monkeypatch.setattr(query_flow.graph_reader, name, fn)
     monkeypatch.setattr(query_flow.planner, "build_system_prompt", lambda mode=None: "system")
