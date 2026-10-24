@@ -891,8 +891,24 @@ def test_prompt_tells_the_model_to_copy_the_setup_it_was_shown():
     short to render and drove the component the wrong way."""
     prompt = build_system_prompt("bug")
     assert "TAKE A TEST'S SETUP FROM THE TEST YOU WERE SHOWN" in prompt
-    assert "HOW THE VALUE REACHES THE CODE" in prompt
-    assert "passes before your fix and fails after it" in prompt
+    assert "A TEST DRIVES THE CODE THE WAY THE CODE READS ITS DATA" in prompt
+    assert "passes before the fix and fails after it" in prompt
+
+
+def test_prompt_names_the_mocked_callback_trap():
+    """Three TDDs in a row wrote the same unusable test: the handler reads
+    its value from a context, so typing into the input calls a mocked
+    callback that never updates what the handler reads."""
+    prompt = build_system_prompt("bug")
+    assert "a mock does not update the context" in prompt
+    assert "SEED IT IN THE SETUP" in prompt
+
+
+def test_prompt_warns_a_quoted_test_may_cover_another_symbol():
+    """The specs shown for this component covered a sibling that takes
+    props, while the component being changed reads a context."""
+    prompt = build_system_prompt("bug")
+    assert "may cover a DIFFERENT symbol from the one you are changing" in prompt
 
 
 def test_self_check_covers_test_work():
