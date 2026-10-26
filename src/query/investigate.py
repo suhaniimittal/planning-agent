@@ -30,6 +30,9 @@ SYSTEM_PROMPT = """You investigate a bug report against the code shown, as a sen
 3. List the AFFECTED FILES: only paths that appear in a "Code" label below, exactly as written.
 4. Propose a FIX in a few sentences. Do not write the code.
 
+Write for a busy developer, in plain words: "root_cause" at most 2 sentences,
+"proposed_fix" at most 3, at most 3 "evidence" items, each "why" one short line.
+
 "root_cause_confidence": "high" only when code shown proves the faulty logic; "medium" when the
 code strongly suggests it; "low" otherwise. With no relevant code, never "high".
 

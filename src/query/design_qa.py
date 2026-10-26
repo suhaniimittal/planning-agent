@@ -50,7 +50,8 @@ files from the TDD or code shown: {"service","file_path","symbol"}).
 
 Respond with ONLY a JSON object:
 {
-  "answer": "the answer, 3-10 short paragraphs or bullet lines, no markdown headings",
+  "answer": "the answer in plain, simple words: 2-5 short sentences or bullet lines, \
+under 120 words, no markdown headings",
   "verdict": "answer_only" | "apply" | "partial" | "refuse" | "already_present",
   "apply": ["each change to make to the design, one or two sentences"],
   "refused": [{"change": "...", "reason": "..."}],
@@ -76,7 +77,8 @@ the code excerpts given. Never invent code, files or facts that are not there.
 
 Respond with ONLY a JSON object:
 {
-  "answer": "the answer, 3-10 short paragraphs or bullet lines, no markdown headings",
+  "answer": "the answer in plain, simple words: 2-5 short sentences or bullet lines, \
+under 120 words, no markdown headings",
   "change_recommended": true or false,
   "proposed_change": "if true: the change to make to the design, one or two sentences; else empty"
 }"""
