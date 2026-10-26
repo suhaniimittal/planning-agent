@@ -6,15 +6,19 @@ reads and writes, and the model calls. The agent only routes to these.
 
 from __future__ import annotations
 
+import asyncio
+
 from aetherion_sdk import tool
 
-from src.memory import conversation, operations
+from src.memory import conversation, legacy, operations
 from src.query.investigate import investigate
 
 
 @tool()
 async def story_facts(issue_key: str, story_text: str) -> dict:
-    """Is this story the same requirement its TDD answered? Stores nothing."""
+    """Is this story the same requirement its TDD answered? Stores nothing in
+    the memory; the first check removes the old Neo4j memory nodes (legacy)."""
+    await asyncio.to_thread(legacy.drop_once)
     return await operations.check_story(issue_key, story_text)
 
 
