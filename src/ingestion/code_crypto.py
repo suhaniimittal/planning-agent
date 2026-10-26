@@ -66,11 +66,6 @@ ENCRYPTED_FIELDS = {
     # A test file's stored text, and every file's import lines. A File is named
     # by its path, which a rename changes: see code_graph_writer.rename_file.
     "File": ("source", "imports"),
-    # Planning memory (2026-10-26): a story's requirement facts and the design
-    # decisions its TDDs keep. A Fact is named by its slot within its story,
-    # a Decision by its uid within its project.
-    "Fact": ("statement", "values"),
-    "Decision": ("title", "choice", "reason"),
 }
 
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")

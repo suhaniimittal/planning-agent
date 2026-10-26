@@ -11,8 +11,17 @@ from src.memory import equivalence, facts, record
 
 async def check_story(issue_key: str, story_text: str, judge=None, extract=None) -> dict:
     """The contract's mode "facts" response, without status/mode. Stores nothing."""
-    stored = record.load_requirement(issue_key)
-    current = record.current_version(issue_key)
+    seq, snapshot = record.load_snapshot(issue_key)
+    stored = (
+        {
+            "facts": list(snapshot.get("facts") or []),
+            "facts_hash": snapshot.get("facts_hash") or "",
+            "story_text_hash": snapshot.get("story_text_hash") or "",
+        }
+        if snapshot.get("facts") or snapshot.get("facts_hash")
+        else None
+    )
+    current = record.current_version(issue_key, snapshot)
     text_hash = facts.text_hash(story_text)
     if stored and stored["story_text_hash"] == text_hash:
         return {
@@ -49,11 +58,12 @@ async def check_story(issue_key: str, story_text: str, judge=None, extract=None)
 
 
 def remember(payload: dict) -> dict:
-    """The contract's mode "record": the published version, its facts, its decisions."""
+    """The contract's mode "record": the published version, its facts, its decisions —
+    one new memory snapshot in Memsy holding all of it (2026-10-26)."""
     issue_key = str(payload.get("issue_key") or "").upper()
     if not issue_key:
         raise ValueError("record needs the issue_key")
-    record.create_memory_indexes()
+    seq, snapshot = record.load_snapshot(issue_key)
     stored_facts = 0
     story_facts = payload.get("facts")
     facts_hash = str(payload.get("facts_hash") or "")
@@ -64,23 +74,25 @@ def remember(payload: dict) -> dict:
         # "the same text" for mode "facts" and for what is stored.
         story_text = str(payload.get("story_text") or "")
         text_hash = facts.text_hash(story_text) if story_text else ""
-        stored_facts = record.save_requirement(
-            issue_key,
-            canonical,
-            facts_hash,
-            text_hash or str(payload.get("story_text_hash") or ""),
+        snapshot = record.with_facts(
+            snapshot, canonical, facts_hash, text_hash or str(payload.get("story_text_hash") or "")
         )
+        stored_facts = len(canonical)
     elif not facts_hash:
         # A revision asked on the TDD page: the story did not change, so its
         # stored facts and hashes stay; the new version answers the same facts.
-        facts_hash = ((record.load_requirement(issue_key) or {}).get("facts_hash")) or ""
+        facts_hash = snapshot.get("facts_hash") or ""
     version = str(payload.get("tdd_version") or "")
     if version:
-        record.save_version(issue_key, version, str(payload.get("page_id") or ""), facts_hash)
-    stored_decisions = record.save_decisions(
+        snapshot = record.with_version(
+            snapshot, version, str(payload.get("page_id") or ""), facts_hash
+        )
+    snapshot, stored_decisions = record.with_decisions(
+        snapshot,
         issue_key,
         list(payload.get("decisions") or []),
         superseded=[str(s) for s in payload.get("superseded") or []],
         source=str(payload.get("source") or ""),
     )
+    record.save_snapshot(issue_key, seq + 1, snapshot)
     return {"facts": stored_facts, "decisions": stored_decisions}

@@ -1,130 +1,108 @@
-"""The memory is encrypted, and the facts check follows its rules (2026-10-26)."""
+"""Planning's memory in Memsy (2026-10-26): exact, encrypted, newest snapshot wins."""
+
+import hashlib
 
 import pytest
-import json
 
-from src.ingestion import code_crypto
 from src.memory import operations, record
+from tests.memory.fake_memsy import FakeMemsy
 
 LIMIT = {
     "slot": "daily_limit",
     "kind": "limit",
-    "statement": "Outgoing transfers are limited to 2,00,000 INR per IST day",
+    "statement": "2,00,000 INR a day",
     "values": ["2,00,000 INR"],
 }
+ON_TRANSFER = [{"service": "bank", "file_path": "TransferService.java", "symbol": "transfer"}]
 
 
-class FakeResult(list):
-    def single(self):
-        return self[0] if self else None
+@pytest.fixture
+def memsy(monkeypatch):
+    fake = FakeMemsy()
+    monkeypatch.setattr(record, "_client", lambda: fake)
+    return fake
 
 
-class FakeSession:
-    def __init__(self, answers=None):
-        self.queries = []
-        self.answers = list(answers or [])
-
-    def run(self, query, **params):
-        self.queries.append((query, params))
-        return FakeResult(self.answers.pop(0) if self.answers else [])
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+def _record(**payload):
+    return operations.remember({"issue_key": "BTS-25", **payload})
 
 
-def _driver(monkeypatch, answers=None):
-    session = FakeSession(answers)
-    monkeypatch.setattr(
-        record, "get_driver", lambda: type("D", (), {"session": lambda s: session})()
+def test_the_memory_is_stored_encrypted_in_memsy(memsy):
+    _record(
+        tdd_version="v1.0",
+        page_id="9",
+        facts=[LIMIT],
+        facts_hash="fh",
+        decisions=[
+            {"id": "paise", "title": "Paise", "choice": "long paise", "applies_to": ON_TRANSFER}
+        ],
     )
-    return session
+    (event,) = memsy.stored("tdd:BTS-25")
+    assert event.session_id == "memory:BTS-25:1:1" and event.kind == "app_event"
+    assert "2,00,000" not in event.metadata and "long paise" not in event.metadata
+    assert "enc:v1:" in event.metadata
 
 
-def test_facts_are_stored_encrypted(monkeypatch):
-    session = _driver(monkeypatch)
-    record.save_requirement("bts-25", [LIMIT], "fh", "th")
-    rows = session.queries[1][1]["rows"]
-    assert code_crypto.is_encrypted(rows[0]["statement"]) and code_crypto.is_encrypted(
-        rows[0]["values"]
-    )
-    assert "2,00,000" not in json.dumps(rows)
-    assert rows[0]["slot"] == "daily_limit"
-
-
-def test_stored_facts_are_read_back_in_plain(monkeypatch):
-    sealed = record._sealed_fact("BTS-25", LIMIT)
-    _driver(monkeypatch, [[{"facts_hash": "fh", "story_text_hash": "th"}], [sealed]])
+def test_values_come_back_exactly_although_memsy_rewrites_its_text(memsy):
+    _record(tdd_version="v1.0", page_id="9", facts=[LIMIT], facts_hash="fh")
     found = record.load_requirement("BTS-25")
-    assert found["facts"] == [{**LIMIT, "values": ["2,00,000 INR"]}]
-    assert found["facts_hash"] == "fh"
+    assert found["facts"] == [LIMIT] and found["facts_hash"] == "fh"
+    assert record.current_version("BTS-25") == {"tdd_version": "v1.0", "page_id": "9"}
 
 
-def test_decisions_are_stored_encrypted_with_their_targets(monkeypatch):
-    session = _driver(monkeypatch)
-    decision = {
-        "id": "money-integer-paise",
-        "title": "Money as paise",
-        "choice": "Sum in long paise",
-        "reason": "No rounding",
-        "applies_to": [{"service": "bank", "file_path": "T.java", "symbol": "transfer"}],
-    }
-    record.save_decisions("BTS-25", [decision], superseded=["money-double"])
-    supersede, write = session.queries
-    assert supersede[1] == {"uid": "BTS-25:money-double", "status": "superseded"}
-    row = write[1]["rows"][0]
-    assert row["uid"] == "BTS-25:money-integer-paise" and row["status"] == "agreed"
-    assert code_crypto.is_encrypted(row["choice"]) and "paise" not in row["choice"]
-    assert row["target_rows"] == [{"service": "bank", "file_path": "T.java", "symbol": "transfer"}]
+def test_the_newest_snapshot_wins_and_replaced_decisions_drop_out(memsy):
+    _record(
+        tdd_version="v1.0",
+        page_id="9",
+        facts=[LIMIT],
+        facts_hash="fh",
+        decisions=[{"id": "double", "choice": "double", "applies_to": ON_TRANSFER}],
+    )
+    _record(
+        tdd_version="v1.1",
+        page_id="9",
+        decisions=[{"id": "paise", "choice": "long paise", "applies_to": ON_TRANSFER}],
+        superseded=["double"],
+    )
+    assert record.current_version("BTS-25")["tdd_version"] == "v1.1"
+    assert [d["id"] for d in record.decisions_in_force("BTS-25")] == ["paise"]
+    assert record.load_requirement("BTS-25")["facts"] == [LIMIT]  # a page revision keeps facts
 
 
-def test_project_decisions_reach_a_later_story_on_the_same_service(monkeypatch):
-    def stored(story, did, service):
-        uid = f"{story}:{did}"
-        sealed = code_crypto.encrypt_row(
-            {"title": did, "choice": f"{did} choice", "reason": "r"},
-            label="Decision",
-            service="BTS",
-            qualified_name=uid,
-        )
-        return {
-            **sealed,
-            "uid": uid,
-            "id": did,
-            "story_key": story,
-            "project_key": "BTS",
-            "status": "agreed",
-            "override_by": "",
-            "targets": json.dumps([{"service": service, "file_path": "T.java", "symbol": ""}]),
-        }
+def test_a_large_memory_is_split_into_parts_and_joined_back(memsy):
+    noise = [hashlib.sha512(str(i).encode()).hexdigest() for i in range(40)]
+    many = [{**LIMIT, "slot": f"rule_{i}", "statement": noise[i]} for i in range(40)]
+    _record(tdd_version="v1.0", page_id="9", facts=many, facts_hash="fh")
+    parts = memsy.stored("tdd:BTS-25")
+    assert len(parts) > 1 and all(len(p.metadata) <= 4096 for p in parts)
+    assert len({p.session_id for p in parts}) == len(parts)  # Memsy merges one session
+    assert len(record.load_requirement("BTS-25")["facts"]) == 40
 
-    rows = [
-        stored("BTS-25", "paise", "bank"),
-        stored("BTS-40", "other", "ui"),
-        stored("BTS-41", "mine", "bank"),
-    ]
-    _driver(monkeypatch, [rows])
+
+def test_project_decisions_reach_a_later_story_on_the_same_service(memsy):
+    _record(
+        tdd_version="v1.0",
+        page_id="9",
+        decisions=[
+            {"id": "paise", "title": "Paise", "choice": "long paise", "applies_to": ON_TRANSFER}
+        ],
+    )
     found = record.decisions_in_force("BTS-41", ["bank"])
-    assert [d["id"] for d in found] == ["mine", "paise"]
-    assert found[1]["choice"] == "paise choice"
+    assert [(d["id"], d["story_key"]) for d in found] == [("paise", "BTS-25")]
+    assert record.decisions_in_force("BTS-41", ["other-service"]) == []
     assert "[paise]" in record.decisions_block(found, "BTS-41")
 
 
+def test_without_memsy_settings_the_memory_says_so(monkeypatch):
+    monkeypatch.setattr(record, "secret", lambda name, default="": "")
+    with pytest.raises(record.MemoryUnavailable):
+        record.load_snapshot("BTS-25")
+
+
 @pytest.mark.asyncio
-async def test_an_unchanged_text_is_same_without_extracting(monkeypatch):
-    monkeypatch.setattr(
-        record,
-        "load_requirement",
-        lambda k: {
-            "facts": [LIMIT],
-            "facts_hash": "fh",
-            "story_text_hash": operations.facts.text_hash("Limit 2,00,000"),
-        },
-    )
-    monkeypatch.setattr(
-        record, "current_version", lambda k: {"tdd_version": "v1.3", "page_id": "9"}
+async def test_an_unchanged_text_is_same_without_extracting(memsy):
+    _record(
+        tdd_version="v1.3", page_id="9", facts=[LIMIT], facts_hash="fh", story_text="Limit 2,00,000"
     )
 
     async def never(text):
@@ -135,36 +113,9 @@ async def test_an_unchanged_text_is_same_without_extracting(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_story_with_no_memory_is_new(monkeypatch):
-    monkeypatch.setattr(record, "load_requirement", lambda k: None)
-    monkeypatch.setattr(record, "current_version", lambda k: None)
-
+async def test_a_story_with_no_memory_is_new(memsy):
     async def extract(text):
         return [LIMIT]
 
     found = await operations.check_story("BTS-25", "anything", extract=extract)
     assert found["verdict"] == "new" and found["facts"][0]["slot"] == "daily_limit"
-
-
-def test_record_stores_facts_version_and_decisions(monkeypatch):
-    calls = []
-    monkeypatch.setattr(record, "create_memory_indexes", lambda: None)
-    monkeypatch.setattr(record, "save_requirement", lambda *a: calls.append(("facts", a)) or 1)
-    monkeypatch.setattr(record, "save_version", lambda *a: calls.append(("version", a)))
-    monkeypatch.setattr(
-        record, "save_decisions", lambda *a, **k: calls.append(("decisions", a, k)) or 2
-    )
-    out = operations.remember(
-        {
-            "issue_key": "bts-25",
-            "tdd_version": "v1.4",
-            "page_id": "9",
-            "facts": [LIMIT],
-            "facts_hash": "fh",
-            "decisions": [{"id": "x", "choice": "c"}],
-            "superseded": ["y"],
-        }
-    )
-    assert out == {"facts": 1, "decisions": 2}
-    assert [c[0] for c in calls] == ["facts", "version", "decisions"]
-    assert calls[2][2]["superseded"] == ["y"]

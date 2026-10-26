@@ -18,19 +18,21 @@ LIMIT = {
 
 @pytest.fixture
 def store(monkeypatch):
-    calls = []
-    monkeypatch.setattr(record, "create_memory_indexes", lambda: None)
-    monkeypatch.setattr(record, "save_requirement", lambda *a: calls.append(("facts", a)) or 1)
-    monkeypatch.setattr(record, "save_version", lambda *a: calls.append(("version", a)))
-    monkeypatch.setattr(
-        record, "save_decisions", lambda *a, **k: calls.append(("decisions", a, k)) or len(a[1])
+    from tests.memory.fake_memsy import FakeMemsy
+
+    fake = FakeMemsy()
+    monkeypatch.setattr(record, "_client", lambda: fake)
+    operations.remember(
+        {
+            "issue_key": "BTS-25",
+            "tdd_version": "v1.4",
+            "page_id": "9",
+            "facts": [LIMIT],
+            "facts_hash": "stored-fh",
+            "story_text": "story",
+        }
     )
-    monkeypatch.setattr(
-        record,
-        "load_requirement",
-        lambda k: {"facts": [LIMIT], "facts_hash": "stored-fh", "story_text_hash": "th"},
-    )
-    return calls
+    return fake
 
 
 def test_a_page_revision_keeps_the_stored_facts(store):
@@ -43,10 +45,14 @@ def test_a_page_revision_keeps_the_stored_facts(store):
             "superseded": ["double"],
         }
     )
-    assert [c[0] for c in store] == ["version", "decisions"]
-    assert store[0][1] == ("BTS-25", "v1.5", "9", "stored-fh")
-    assert store[1][2]["superseded"] == ["double"]
     assert out == {"facts": 0, "decisions": 1}
+    assert record.load_requirement("BTS-25")["facts_hash"] == "stored-fh"
+    _, snap = record.load_snapshot("BTS-25")
+    assert snap["versions"][-1] == {
+        **snap["versions"][-1],
+        "version": "v1.5",
+        "facts_hash": "stored-fh",
+    }
 
 
 def test_the_stored_text_hash_is_computed_from_the_story(store):
@@ -59,7 +65,9 @@ def test_the_stored_text_hash_is_computed_from_the_story(store):
             "story_text_hash": "theirs",
         }
     )
-    assert store[0][1][3] == facts.text_hash("daily limit 2,00,000 inr")
+    assert record.load_requirement("BTS-25")["story_text_hash"] == facts.text_hash(
+        "daily limit 2,00,000 inr"
+    )
 
 
 @pytest.mark.asyncio

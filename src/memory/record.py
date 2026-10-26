@@ -1,44 +1,56 @@
-"""Planning's memory in Neo4j (2026-10-26): what a story requires, which TDD
+"""Planning's memory in Memsy (2026-10-26): what a story requires, which TDD
 version answered it, and the design decisions its versions keep.
 
-The same database as the code graph, encrypted the same way (code_crypto):
-a fact's statement and values, a decision's title, choice and reason are
-stored as ciphertext; slots, ids, statuses, hashes and versions stay plain so
-they can be queried. Only the Planning agent reads or writes this.
+Neo4j keeps only the code. Memsy keeps the memory, next to the conversation
+about the same TDD (conversation.py):
 
-    (:Requirement {story_key, project_key, facts_hash, story_text_hash, updated})
-        -[:HAS_FACT]->(:Fact {story_key, slot, kind, statement*, values*})
-    (:TddVersion {story_key, version, page_id, facts_hash, created})
-    (:Decision {uid, id, story_key, project_key, status, source, override_by,
-                title*, choice*, reason*, targets})
-        -[:APPLIES_TO]->(:Function | :Class | :File)        * = encrypted
+    actor  tdd:<STORY>       session memory:<STORY>:<seq>:<part>   the story's snapshots
+    actor  project:<PROJECT> session memory:project:<PROJECT>:...  the project's agreed decisions
 
-A decision is agreed on one story and visible to the project: a later design
-in the same project that touches the same service gets it as a constraint.
+Memsy rewrites the text it stores and cannot update or delete, so the memory is
+kept as numbered SNAPSHOTS whose exact data rides in each event's metadata,
+which Memsy returns unchanged (``payload.source_metadata``):
+
+- every save writes snapshot N+1, the whole state; reading takes the newest
+  complete snapshot, so a newer one replaces an older one without deleting it;
+- the data is compressed, then encrypted with CODE_GRAPH_KEY before it leaves
+  Planning (company requirements and decisions); a snapshot too big for Memsy's
+  4 KB metadata is split into parts, each in its own session, because Memsy
+  merges similar events of one session and keeps only one of them;
+- a save waits until Memsy has processed it, so the next request reads it.
+
+Snapshot (decrypted): {"facts", "facts_hash", "story_text_hash",
+"versions": [{"version", "page_id", "facts_hash", "created"}],
+"decisions": [{"uid", "id", "story_key", "title", "choice", "reason", "status",
+"override_by", "source", "applies_to"}]}
 """
 
 from __future__ import annotations
 
+import ast
+import base64
 import json
+import logging
+import os
+import time
+import zlib
 from datetime import UTC, datetime
 
 from src.ingestion import code_crypto
-from src.ingestion.graph_writer import get_driver
+from src.ingestion.secret_store import secret
+
+logger = logging.getLogger(__name__)
 
 AGREED, SUPERSEDED = "agreed", "superseded"
+PART_CHARS = 3_500  # Memsy keeps at most 4,096 characters of metadata per event
+LIST_PAGE = 100
+LIST_PAGES = 10  # newest 1,000 memories of an actor are searched for its snapshot
+WAIT_SECONDS = 30
+FORMAT = "zlib-aesgcm-1"  # snapshots of another format are not read
 
 
-def create_memory_indexes() -> None:
-    """Idempotent: safe on every run."""
-    with get_driver().session() as session:
-        for statement in (
-            "CREATE INDEX requirement_story_idx IF NOT EXISTS FOR (r:Requirement) ON (r.story_key)",
-            "CREATE INDEX fact_story_idx IF NOT EXISTS FOR (f:Fact) ON (f.story_key)",
-            "CREATE INDEX tdd_version_story_idx IF NOT EXISTS FOR (v:TddVersion) ON (v.story_key)",
-            "CREATE INDEX decision_uid_idx IF NOT EXISTS FOR (d:Decision) ON (d.uid)",
-            "CREATE INDEX decision_project_idx IF NOT EXISTS FOR (d:Decision) ON (d.project_key)",
-        ):
-            session.run(statement)
+class MemoryUnavailable(RuntimeError):
+    """Memsy is not configured or not reachable."""
 
 
 def project_of(story_key: str) -> str:
@@ -49,129 +61,214 @@ def decision_uid(story_key: str, decision_id: str) -> str:
     return f"{story_key.upper()}:{decision_id}"
 
 
-# --- facts --------------------------------------------------------------------------
+def _client():
+    key = secret("MEMSY_API_KEY")
+    base = os.environ.get("MEMSY_BASE_URL", "").strip()
+    if not key or not base:
+        raise MemoryUnavailable("MEMSY_API_KEY and MEMSY_BASE_URL are not set")
+    from memsy import MemsyClient
+
+    return MemsyClient(base_url=base, api_key=key, timeout=15.0, max_retries=2)
 
 
-def _sealed_fact(story_key: str, fact: dict) -> dict:
-    row = {
-        "slot": fact["slot"],
-        "kind": fact.get("kind") or "rule",
-        "statement": fact.get("statement") or "",
-        "values": json.dumps(list(fact.get("values") or []), ensure_ascii=False),
-    }
-    return code_crypto.encrypt_row(row, label="Fact", service=story_key, qualified_name=row["slot"])
+# --- snapshots ------------------------------------------------------------------------
 
 
-def _opened_fact(story_key: str, row: dict) -> dict:
-    opened = code_crypto.decrypt_row(
-        dict(row), label="Fact", service=story_key, qualified_name=row["slot"]
-    )
-    values = opened.get("values") or "[]"
-    try:
-        opened["values"] = json.loads(values)
-    except (TypeError, ValueError):
-        opened["values"] = []
-    return {k: opened.get(k) for k in ("slot", "kind", "statement", "values")}
+def _scope(story_key: str = "", project: str = "") -> tuple[str, str, str]:
+    """(actor, session, kind of snapshot) for a story or a project."""
+    if project:
+        return f"project:{project}", f"memory:project:{project}", "project_memory"
+    key = story_key.upper()
+    return f"tdd:{key}", f"memory:{key}", "tdd_memory"
 
 
-def save_requirement(
-    story_key: str, facts: list[dict], facts_hash: str, story_text_hash: str
-) -> int:
-    """Replaces the story's facts with ``facts``; returns how many were stored."""
-    story_key = story_key.upper()
-    rows = [_sealed_fact(story_key, f) for f in facts if f.get("slot")]
-    with get_driver().session() as session:
-        session.run(
-            """
-            MERGE (r:Requirement {story_key: $story_key})
-            SET r.project_key = $project_key, r.facts_hash = $facts_hash,
-                r.story_text_hash = $story_text_hash, r.updated = $now
-            WITH r
-            OPTIONAL MATCH (r)-[:HAS_FACT]->(old:Fact)
-            DETACH DELETE old
-            """,
-            story_key=story_key,
-            project_key=project_of(story_key),
-            facts_hash=facts_hash,
-            story_text_hash=story_text_hash,
-            now=datetime.now(UTC).isoformat(timespec="seconds"),
-        )
-        if rows:
-            session.run(
-                """
-                MATCH (r:Requirement {story_key: $story_key})
-                UNWIND $rows AS row
-                CREATE (f:Fact {story_key: $story_key})
-                SET f += row
-                CREATE (r)-[:HAS_FACT]->(f)
-                """,
-                story_key=story_key,
-                rows=rows,
+def _payload(item) -> dict:
+    payload = getattr(item, "payload", None)
+    if isinstance(payload, dict):
+        return payload
+    for parse in (json.loads, ast.literal_eval):
+        try:
+            value = parse(str(payload))
+            if isinstance(value, dict):
+                return value
+        except (ValueError, SyntaxError):
+            continue
+    return {}
+
+
+def _load(actor: str, kind: str, client=None) -> tuple[int, dict]:
+    """(seq, snapshot) of the newest complete snapshot; (0, {}) when none."""
+    client = client or _client()
+    parts: dict[int, dict[int, str]] = {}
+    sizes: dict[int, int] = {}
+    for page in range(LIST_PAGES):
+        listed = client.memories.list(actor_id=actor, limit=LIST_PAGE, offset=page * LIST_PAGE)
+        for item in listed.items or []:
+            for source in _payload(item).get("source_metadata") or []:
+                meta = source.get("metadata") or {}
+                if (meta.get("type"), meta.get("actor"), meta.get("format")) != (
+                    kind,
+                    actor,
+                    FORMAT,
+                ):
+                    continue
+                seq, part = int(meta["seq"]), int(meta["part"])
+                parts.setdefault(seq, {})[part] = str(meta["data"])
+                sizes[seq] = int(meta["parts"])
+        if len(listed.items or []) < LIST_PAGE:
+            break
+    for seq in sorted(parts, reverse=True):
+        if len(parts[seq]) == sizes[seq]:
+            sealed = "".join(parts[seq][i] for i in range(sizes[seq]))
+            packed = code_crypto.decrypt(
+                sealed, label="MemsySnapshot", service=actor, qualified_name=str(seq), field="data"
             )
-    return len(rows)
+            return seq, json.loads(zlib.decompress(base64.b64decode(packed)))
+    return 0, {}
+
+
+def _save(actor: str, session: str, kind: str, seq: int, snapshot: dict, summary: str) -> None:
+    """Writes snapshot ``seq`` and waits until Memsy has made it readable."""
+    from memsy import EventPayload
+
+    client = _client()
+    packed = base64.b64encode(zlib.compress(json.dumps(snapshot, sort_keys=True).encode(), 9))
+    sealed = code_crypto.encrypt(
+        packed.decode(),
+        label="MemsySnapshot",
+        service=actor,
+        qualified_name=str(seq),
+        field="data",
+    )
+    chunks = [sealed[i : i + PART_CHARS] for i in range(0, len(sealed), PART_CHARS)]
+    events = [
+        EventPayload(
+            actor_id=actor,
+            session_id=f"{session}:{seq}:{i + 1}",
+            kind="app_event",
+            content=f"{summary} Memory snapshot {seq}, part {i + 1} of {len(chunks)}.",
+            metadata=json.dumps(
+                {
+                    "type": kind,
+                    "actor": actor,
+                    "format": FORMAT,
+                    "seq": seq,
+                    "part": i,
+                    "parts": len(chunks),
+                    "data": chunk,
+                }
+            ),
+        )
+        for i, chunk in enumerate(chunks)
+    ]
+    ids = client.ingest(events).event_ids
+    deadline = time.monotonic() + WAIT_SECONDS
+    while time.monotonic() < deadline:
+        status = client.status(ids)
+        if status.failed_ids:
+            raise MemoryUnavailable(f"Memsy could not process the memory snapshot: {status}")
+        if not status.pending_ids and _load(actor, kind, client)[0] >= seq:
+            return
+        time.sleep(1.5)
+    logger.warning("Memsy snapshot %s %s not readable after %ss", actor, seq, WAIT_SECONDS)
+
+
+# --- the story's memory ------------------------------------------------------------------
+
+
+def load_snapshot(story_key: str) -> tuple[int, dict]:
+    actor, _, kind = _scope(story_key)
+    return _load(actor, kind)
+
+
+def save_snapshot(story_key: str, seq: int, snapshot: dict) -> None:
+    actor, session, kind = _scope(story_key)
+    latest = (snapshot.get("versions") or [{}])[-1].get("version") or "no version"
+    summary = (
+        f"{story_key.upper()} TDD {latest}: {len(snapshot.get('facts') or [])} requirement "
+        f"facts and {len(agreed(snapshot))} decisions in force."
+    )
+    _save(actor, session, kind, seq, snapshot, summary)
+    _publish_to_project(story_key, snapshot)
+
+
+def agreed(snapshot: dict) -> list[dict]:
+    return [d for d in snapshot.get("decisions") or [] if d.get("status") == AGREED]
 
 
 def load_requirement(story_key: str) -> dict | None:
     """{facts, facts_hash, story_text_hash} for the story, or None when nothing is stored."""
-    story_key = story_key.upper()
-    with get_driver().session() as session:
-        head = session.run(
-            "MATCH (r:Requirement {story_key: $story_key}) "
-            "RETURN r.facts_hash AS facts_hash, r.story_text_hash AS story_text_hash",
-            story_key=story_key,
-        ).single()
-        if head is None:
-            return None
-        rows = session.run(
-            """
-            MATCH (:Requirement {story_key: $story_key})-[:HAS_FACT]->(f:Fact)
-            RETURN f.slot AS slot, f.kind AS kind, f.statement AS statement, f.values AS values
-            ORDER BY f.slot
-            """,
-            story_key=story_key,
-        )
-        facts = [_opened_fact(story_key, dict(r)) for r in rows]
+    _, snap = load_snapshot(story_key)
+    if not snap.get("facts") and not snap.get("facts_hash"):
+        return None
     return {
-        "facts": facts,
-        "facts_hash": head["facts_hash"] or "",
-        "story_text_hash": head["story_text_hash"] or "",
+        "facts": list(snap.get("facts") or []),
+        "facts_hash": snap.get("facts_hash") or "",
+        "story_text_hash": snap.get("story_text_hash") or "",
     }
 
 
-# --- TDD versions --------------------------------------------------------------------
-
-
-def save_version(story_key: str, version: str, page_id: str, facts_hash: str) -> None:
-    with get_driver().session() as session:
-        session.run(
-            """
-            MERGE (v:TddVersion {story_key: $story_key, version: $version})
-            SET v.page_id = $page_id, v.facts_hash = $facts_hash,
-                v.created = coalesce(v.created, $now)
-            """,
-            story_key=story_key.upper(),
-            version=version,
-            page_id=page_id,
-            facts_hash=facts_hash,
-            now=datetime.now(UTC).isoformat(timespec="seconds"),
-        )
-
-
-def current_version(story_key: str) -> dict | None:
+def current_version(story_key: str, snapshot: dict | None = None) -> dict | None:
     """The newest recorded version of the story's TDD: {tdd_version, page_id}."""
-    with get_driver().session() as session:
-        row = session.run(
-            """
-            MATCH (v:TddVersion {story_key: $story_key})
-            RETURN v.version AS version, v.page_id AS page_id
-            ORDER BY v.created DESC, v.version DESC LIMIT 1
-            """,
-            story_key=story_key.upper(),
-        ).single()
-    return {"tdd_version": row["version"], "page_id": row["page_id"]} if row else None
+    snap = snapshot if snapshot is not None else load_snapshot(story_key)[1]
+    versions = snap.get("versions") or []
+    if not versions:
+        return None
+    return {"tdd_version": versions[-1]["version"], "page_id": versions[-1].get("page_id", "")}
 
 
-# --- decisions -----------------------------------------------------------------------
+def with_facts(snapshot: dict, facts: list[dict], facts_hash: str, story_text_hash: str) -> dict:
+    return {
+        **snapshot,
+        "facts": facts,
+        "facts_hash": facts_hash,
+        "story_text_hash": story_text_hash,
+    }
+
+
+def with_version(snapshot: dict, version: str, page_id: str, facts_hash: str) -> dict:
+    versions = [v for v in snapshot.get("versions") or [] if v.get("version") != version]
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    versions.append(
+        {"version": version, "page_id": page_id, "facts_hash": facts_hash, "created": now}
+    )
+    return {**snapshot, "versions": versions}
+
+
+def with_decisions(
+    snapshot: dict,
+    story_key: str,
+    decisions: list[dict],
+    superseded: list[str] | None = None,
+    source: str = "",
+) -> tuple[dict, int]:
+    """The snapshot with ``decisions`` agreed (same id = updated in place) and
+    ``superseded`` ids retired; (snapshot, how many decisions were stored)."""
+    story_key = story_key.upper()
+    by_uid = {d["uid"]: dict(d) for d in snapshot.get("decisions") or []}
+    for old in superseded or []:
+        uid = decision_uid(story_key, str(old))
+        if uid in by_uid:
+            by_uid[uid]["status"] = SUPERSEDED
+    stored = 0
+    for decision in decisions:
+        if not decision.get("id") or not decision.get("choice"):
+            continue
+        uid = decision_uid(story_key, str(decision["id"]))
+        by_uid[uid] = {
+            "uid": uid,
+            "id": str(decision["id"]),
+            "story_key": story_key,
+            "title": str(decision.get("title") or decision["id"]),
+            "choice": str(decision["choice"]),
+            "reason": str(decision.get("reason") or ""),
+            "status": str(decision.get("status") or AGREED),
+            "override_by": str(decision.get("override_by") or ""),
+            "source": source,
+            "applies_to": _targets(decision),
+        }
+        stored += 1
+    return {**snapshot, "decisions": sorted(by_uid.values(), key=lambda d: d["uid"])}, stored
 
 
 def _targets(decision: dict) -> list[dict]:
@@ -188,130 +285,34 @@ def _targets(decision: dict) -> list[dict]:
     return out
 
 
-def save_decisions(
-    story_key: str,
-    decisions: list[dict],
-    superseded: list[str] | None = None,
-    source: str = "",
-) -> int:
-    """Stores agreed decisions (by stable id, per story) and marks superseded ones.
+# --- the project's decisions -------------------------------------------------------------
 
-    A decision with the same id is updated in place — the newest version's
-    wording wins. Links go only to code nodes that exist.
-    """
-    story_key = story_key.upper()
+
+def _publish_to_project(story_key: str, snapshot: dict) -> None:
+    """The project's snapshot: every story's agreed decisions, this story's replaced."""
     project = project_of(story_key)
-    rows = []
-    for decision in decisions:
-        if not decision.get("id") or not decision.get("choice"):
-            continue
-        uid = decision_uid(story_key, str(decision["id"]))
-        sealed = code_crypto.encrypt_row(
-            {
-                "title": str(decision.get("title") or decision["id"]),
-                "choice": str(decision["choice"]),
-                "reason": str(decision.get("reason") or ""),
-            },
-            label="Decision",
-            service=project,
-            qualified_name=uid,
-        )
-        rows.append(
-            {
-                **sealed,
-                "uid": uid,
-                "id": str(decision["id"]),
-                "status": str(decision.get("status") or AGREED),
-                "override_by": str(decision.get("override_by") or ""),
-                "targets": json.dumps(_targets(decision)),
-                "target_rows": _targets(decision),
-            }
-        )
-    with get_driver().session() as session:
-        for old in superseded or []:
-            session.run(
-                "MATCH (d:Decision {uid: $uid}) SET d.status = $status",
-                uid=decision_uid(story_key, str(old)),
-                status=SUPERSEDED,
-            )
-        if rows:
-            session.run(
-                """
-                UNWIND $rows AS row
-                MERGE (d:Decision {uid: row.uid})
-                SET d.id = row.id, d.story_key = $story_key, d.project_key = $project,
-                    d.status = row.status, d.override_by = row.override_by,
-                    d.title = row.title, d.choice = row.choice, d.reason = row.reason,
-                    d.targets = row.targets, d.source = $source, d.updated = $now
-                WITH d, row
-                OPTIONAL MATCH (d)-[old:APPLIES_TO]->()
-                DELETE old
-                WITH DISTINCT d, row
-                UNWIND row.target_rows AS t
-                OPTIONAL MATCH (f:File {service: t.service, file_path: t.file_path})
-                OPTIONAL MATCH (s) WHERE (s:Function OR s:Class) AND s.service = t.service
-                  AND s.file_path = t.file_path AND t.symbol <> ''
-                  AND (s.name = t.symbol OR s.qualified_name ENDS WITH t.symbol)
-                FOREACH (_ IN CASE WHEN s IS NULL AND f IS NOT NULL THEN [1] ELSE [] END |
-                  MERGE (d)-[:APPLIES_TO]->(f))
-                FOREACH (_ IN CASE WHEN s IS NOT NULL THEN [1] ELSE [] END |
-                  MERGE (d)-[:APPLIES_TO]->(s))
-                """,
-                rows=rows,
-                story_key=story_key,
-                project=project,
-                source=source,
-                now=datetime.now(UTC).isoformat(timespec="seconds"),
-            )
-    return len(rows)
-
-
-def _opened_decision(row: dict) -> dict:
-    opened = code_crypto.decrypt_row(
-        dict(row), label="Decision", service=row["project_key"], qualified_name=row["uid"]
-    )
-    try:
-        targets = json.loads(row.get("targets") or "[]")
-    except ValueError:
-        targets = []
-    return {
-        "id": opened["id"],
-        "story_key": opened["story_key"],
-        "title": opened["title"],
-        "choice": opened["choice"],
-        "reason": opened["reason"],
-        "status": opened["status"],
-        "override_by": opened.get("override_by") or "",
-        "applies_to": targets,
-    }
+    actor, session, kind = _scope(project=project)
+    seq, current = _load(actor, kind)
+    keep = [d for d in current.get("decisions") or [] if d["story_key"] != story_key.upper()]
+    merged = {"decisions": sorted(keep + agreed(snapshot), key=lambda d: d["uid"])}
+    if merged == {"decisions": current.get("decisions") or []}:
+        return
+    summary = f"Project {project}: {len(merged['decisions'])} agreed design decisions."
+    _save(actor, session, kind, seq + 1, merged, summary)
 
 
 def decisions_in_force(story_key: str, services: list[str] | None = None) -> list[dict]:
     """The story's agreed decisions, then the project's agreed decisions on the
     same services (a later story's design must keep them too)."""
     story_key = story_key.upper()
-    with get_driver().session() as session:
-        rows = session.run(
-            """
-            MATCH (d:Decision)
-            WHERE d.status = $agreed AND (d.story_key = $story_key OR d.project_key = $project)
-            RETURN d.uid AS uid, d.id AS id, d.story_key AS story_key,
-                   d.project_key AS project_key, d.status AS status,
-                   d.override_by AS override_by, d.title AS title, d.choice AS choice,
-                   d.reason AS reason, d.targets AS targets
-            ORDER BY d.story_key, d.id
-            """,
-            agreed=AGREED,
-            story_key=story_key,
-            project=project_of(story_key),
-        )
-        decisions = [_opened_decision(dict(r)) for r in rows]
+    own = agreed(load_snapshot(story_key)[1])
+    actor, _, kind = _scope(project=project_of(story_key))
     wanted = set(services or [])
-    own = [d for d in decisions if d["story_key"] == story_key]
     project = [
         d
-        for d in decisions
+        for d in _load(actor, kind)[1].get("decisions") or []
         if d["story_key"] != story_key
+        and d.get("status") == AGREED
         and (not wanted or any(t.get("service") in wanted for t in d["applies_to"]))
     ]
     return own + project
