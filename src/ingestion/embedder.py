@@ -48,9 +48,10 @@ def _use_gateway() -> bool:
 def _get_openai_client():
     global _openai_client
     if _openai_client is None:
-        from openai import AsyncOpenAI
+        from src.ingestion import local_client
 
-        _openai_client = AsyncOpenAI()  # reads OPENAI_API_KEY from the environment
+        # Installed by the laptop launcher; the platform always uses the gateway.
+        _openai_client = local_client.new_client()
     return _openai_client
 
 

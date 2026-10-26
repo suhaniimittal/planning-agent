@@ -284,6 +284,16 @@ def _cf_change_block(c) -> str:
     return "\n".join(lines)
 
 
+def _decision_lines(tdd: TechnicalDesignDoc) -> list[str]:
+    """Each decision a later version and the Coding agent must keep (2026-10-26)."""
+    lines = []
+    for d in tdd.decisions:
+        files = ", ".join(sorted({t.file_path for t in d.applies_to}))
+        line = f"[{d.id}] {d.title}: {d.choice} Why: {d.reason}"
+        lines.append(line + (f" (applies to {files})" if files else ""))
+    return lines
+
+
 def render_confluence(tdd: TechnicalDesignDoc) -> str:
     """The full TDD as Confluence storage-format XHTML — same section
     coverage/numbering as render_text(), for easy cross-reference, but with
@@ -462,6 +472,9 @@ def render_confluence(tdd: TechnicalDesignDoc) -> str:
     sections.append(_cf_section(24, "Files to Create / Modify / Delete", *parts_24))
 
     sections.append(_cf_section(25, "Overall Reasoning", _cf_p(tdd.overall_reasoning)))
+    sections.append(
+        _cf_section(26, "Decisions in Force", _cf_bullets(_decision_lines(tdd)))
+    )
 
     return "\n".join(s for s in sections if s)
 
@@ -553,6 +566,7 @@ def render_text(tdd: TechnicalDesignDoc) -> str:
     if tdd.rollout_order:
         order = "\n".join(f"{i}. {step}" for i, step in enumerate(tdd.rollout_order, start=1))
         body.append(("Rollout Order", [order]))
+    body.append(("Decisions in Force", [_txt_bullets(_decision_lines(tdd))]))
     body.append(("Risks", [_txt_bullets(tdd.risks)]))
     body.append(("Open Questions", [_txt_bullets(tdd.open_questions)]))
 

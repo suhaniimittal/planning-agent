@@ -178,6 +178,7 @@ async def build_tdd(
     technology_constraints: list[str] | None = None,
     api_contracts: str = "",
     mode: str | None = None,
+    decisions_text: str = "",
 ) -> TechnicalDesignDoc:
     """`service_names`: the services this run covers (the Repositories the
     user listed) — only those are ever considered. None considers every
@@ -406,6 +407,9 @@ async def build_tdd(
         test_sources=test_sources,
         new_test_paths=new_test_paths,
     )
+    if decisions_text:
+        # What earlier versions and the project decided (2026-10-26).
+        user_prompt += "\n\n" + decisions_text
 
     if debug_dump_prompts:
         with open("llm_system_prompt.txt", "w") as f:
@@ -470,5 +474,18 @@ async def build_tdd(
         for service, symbols in code_symbols_by_service.items()
     }
     verify_tdd(tdd, shown_files_by_service)
+    tdd.decisions = ground_decisions(tdd.decisions, shown_files_by_service)
 
     return tdd
+
+
+def ground_decisions(decisions, shown_files_by_service: dict[str, set[str]]):
+    """A decision's targets kept only where the file was shown or exists in the graph."""
+    for decision in decisions:
+        kept = []
+        for target in decision.applies_to:
+            shown = target.file_path in shown_files_by_service.get(target.service, set())
+            if shown or graph_reader.file_exists(target.service, target.file_path):
+                kept.append(target)
+        decision.applies_to = kept
+    return decisions

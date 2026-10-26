@@ -67,13 +67,14 @@ async def test_the_orchestrator_can_ask_for_the_document_itself(tools):
     assert recorder.calls[1] == (
         "generate_technical_design",
         # top_k/hops left as None: generate_technical_design owns their defaults;
-        # the last value is the optional bug/feature mode.
-        ("Add a daily limit", None, None, ["bank"], True, {"bank": "o/bank"}, None),
+        # then the optional bug/feature mode, then the story whose decisions are kept.
+        ("Add a daily limit", None, None, ["bank"], True, {"bank": "o/bank"}, None, None),
     )
     assert out["document"] == {
         "title": "Daily limit",
         "confluence_html": "<h1>Daily limit</h1>",
         "text": "1. Overview",
+        "decisions": [],
     }
 
 
@@ -104,3 +105,55 @@ async def test_a_design_question_needs_the_tdd(tools):
     tools()
     out = await agent_module.planning_agent.fn({"mode": "discuss", "question": "Why?"})
     assert out["status"] == "error" and "TDD" in out["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_facts_check_runs_no_ingestion_and_no_design(tools):
+    recorder = tools(story_facts={"verdict": "reworded", "facts": [], "changes": []})
+    out = await agent_module.planning_agent.fn(
+        {"mode": "facts", "issue_key": "BTS-25", "story_text": "Daily cap of 2,00,000 INR"}
+    )
+    assert recorder.calls == [("story_facts", ("BTS-25", "Daily cap of 2,00,000 INR"))]
+    assert out == {
+        "status": "success",
+        "mode": "facts",
+        "verdict": "reworded",
+        "facts": [],
+        "changes": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_record_passes_the_whole_payload(tools):
+    recorder = tools(record_tdd={"facts": 3, "decisions": 1})
+    payload = {"mode": "record", "issue_key": "BTS-25", "tdd_version": "v1.4"}
+    out = await agent_module.planning_agent.fn(payload)
+    assert recorder.calls == [("record_tdd", (payload,))]
+    assert out["stored"] == {"facts": 3, "decisions": 1}
+
+
+@pytest.mark.asyncio
+async def test_an_investigation_reads_the_graph_only(tools):
+    recorder = tools(investigate_bug={"root_cause": "x", "affected_files": []})
+    out = await agent_module.planning_agent.fn(
+        {"mode": "investigate", "issue_key": "BTS-31", "report_text": "Submit does nothing"}
+    )
+    assert [n for n, _ in recorder.calls] == ["investigate_bug"]
+    assert out["investigation"]["root_cause"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_a_discussion_carries_the_story_and_the_kind(tools):
+    recorder = tools(answer_design_question={"answer": "No", "verdict": "refuse"})
+    await agent_module.planning_agent.fn(
+        {"mode": "discuss", "question": "use double", "tdd_text": "TDD", "issue_key": "BTS-25",
+         "kind": "update"}
+    )
+    assert recorder.calls[0][1] == ("use double", "TDD", [], "BTS-25", "update")
+
+
+@pytest.mark.asyncio
+async def test_missing_input_is_an_error_not_a_crash(tools):
+    tools()
+    out = await agent_module.planning_agent.fn({"mode": "facts", "issue_key": "BTS-25"})
+    assert out["status"] == "error" and out["error"] == "MissingInput"

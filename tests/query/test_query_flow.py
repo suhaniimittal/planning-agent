@@ -16,6 +16,7 @@ class FakeTdd:
         self.services = list(services)
         self.current_architecture_components = list(current_architecture_components)
         self.proposed_architecture_components = list(proposed_architecture_components)
+        self.decisions = []
 
 
 def _fn(service, qname, source="def f(): pass", file_path=None):

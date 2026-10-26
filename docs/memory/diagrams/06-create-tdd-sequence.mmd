@@ -1,0 +1,20 @@
+sequenceDiagram
+    participant U as Person (Jira)
+    participant O as Orchestration
+    participant P as Planning
+    participant R as System of record
+    participant M as Memsy
+    U->>O: @Aetherion create TDD
+    O->>P: mode=facts (story)
+    P->>R: stored facts + current version
+    P->>M: search actor_id=tdd:BTS-25 (history)
+    P-->>O: same / changed slots / unsure
+    alt same
+        O-->>U: TDD v1.3 unchanged (link)
+    else changed
+        O->>P: revise v1.3, changed slots only, decisions in force
+        P->>R: facts, v1.4, decisions
+        P->>M: ingest app_event + tool_result (async)
+        P-->>O: TDD v1.4 + what changed
+        O-->>U: TDD v1.4: daily_limit 2,00,000 → 2,50,000
+    end

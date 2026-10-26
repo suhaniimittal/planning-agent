@@ -31,6 +31,8 @@ _KEYS = {
     "Chunk": ("qualified_name", "service"),
     "Service": ("name", "name"),
     "File": ("file_path", "service"),
+    "Fact": ("slot", "story_key"),
+    "Decision": ("uid", "project_key"),
 }
 
 

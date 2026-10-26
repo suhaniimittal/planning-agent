@@ -480,6 +480,10 @@ async def test_both_llm_paths_use_a_low_temperature(monkeypatch):
             self.chat = types.SimpleNamespace(completions=Completions())
 
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    # The laptop launcher installs the client class (src/ingestion/local_client.py).
+    from src.ingestion import local_client
+
+    monkeypatch.setattr(local_client, "_factory", FakeOpenAI)
 
     class FakeGateway:
         def __init__(self, **kwargs):

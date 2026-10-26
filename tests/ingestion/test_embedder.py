@@ -50,6 +50,10 @@ def _inject_fake_openai_module(monkeypatch):
     fake_module = types.ModuleType("openai")
     fake_module.AsyncOpenAI = FakeAsyncOpenAI
     monkeypatch.setitem(sys.modules, "openai", fake_module)
+    # The laptop launcher installs the client class (src/ingestion/local_client.py).
+    from src.ingestion import local_client
+
+    monkeypatch.setattr(local_client, "_factory", FakeAsyncOpenAI)
 
 
 class FakeGatewayClient:

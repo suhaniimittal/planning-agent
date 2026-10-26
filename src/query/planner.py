@@ -1161,9 +1161,10 @@ def _openai_params(model: str) -> dict:
 
 
 async def _plan_via_openai(system_prompt: str, user_prompt: str) -> str:
-    from openai import AsyncOpenAI
+    from src.ingestion import local_client
 
-    client = AsyncOpenAI()  # reads OPENAI_API_KEY from the environment
+    # Installed by the laptop launcher; the platform always uses the gateway.
+    client = local_client.new_client()
     resp = await client.chat.completions.create(
         model=_OPENAI_MODEL,
         messages=[

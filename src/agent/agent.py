@@ -71,8 +71,11 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
     # overrode the real defaults, so generate_technical_design owns them.
     top_k = payload.get("top_k")
     hops = payload.get("hops")
-    if str(payload.get("mode") or "").strip().lower() == "discuss":
+    requested = str(payload.get("mode") or "").strip().lower()
+    if requested == "discuss":
         return await _discuss(payload, workflow_id)
+    if requested in _MEMORY_MODES:
+        return await _MEMORY_MODES[requested](payload, workflow_id)
     # Optional override. Left unset (the normal case), the ticket is
     # classified from its own text during the issue split.
     mode = payload.get("mode") or None
@@ -104,6 +107,8 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
             # Their repositories: the build files give the design its versions.
             dict(ingestion.get("repos") or {}),
             mode,
+            # Its decisions in force, and its project's, are kept (2026-10-26).
+            str(payload.get("issue_key") or "") or None,
             start_to_close_timeout=_TDD_TIMEOUT,
         )
 
@@ -120,6 +125,8 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
         out = {"status": "success", "results": structured_results}
         if return_document:
             out["document"] = {k: result.get(k, "") for k in ("title", "confluence_html", "text")}
+            # The decisions the design uses, for Orchestration to record (2026-10-26).
+            out["document"]["decisions"] = list(result.get("decisions") or [])
         return out
     except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
         logger.error("planning_agent run failed: %s", error, exc_info=True)
@@ -151,6 +158,9 @@ async def _discuss(payload: dict[str, Any], workflow_id: str | None) -> dict[str
             question,
             tdd_text,
             list(payload.get("discussion") or []),
+            str(payload.get("issue_key") or "") or None,
+            # No kind = memory off: answered exactly as before 2026-10-26.
+            str(payload.get("kind") or "") or None,
             start_to_close_timeout=_TDD_TIMEOUT,
         )
     except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
@@ -162,3 +172,76 @@ async def _discuss(payload: dict[str, Any], workflow_id: str | None) -> dict[str
             "details": {"workflow_id": workflow_id},
         }
     return {"status": "success", "mode": "discuss", **answer}
+
+
+# --- memory and bug investigation (2026-10-26) ------------------------------------------
+
+
+def _failed(what: str, error: Exception, workflow_id: str | None) -> dict[str, Any]:
+    logger.error("planning_agent %s failed: %s", what, error, exc_info=True)
+    return {
+        "status": "error",
+        "error": type(error).__name__,
+        "message": f"{what} failed: {type(error).__name__}: {error}"[:500],
+        "details": {"workflow_id": workflow_id},
+    }
+
+
+async def _facts(payload: dict[str, Any], workflow_id: str | None) -> dict[str, Any]:
+    """Is this story the requirement its TDD answered? (contract mode "facts")"""
+    issue_key = str(payload.get("issue_key") or "").strip()
+    story_text = str(payload.get("story_text") or "").strip()
+    if not issue_key or not story_text:
+        return {
+            "status": "error",
+            "error": "MissingInput",
+            "message": "A facts check needs the issue_key and the story_text.",
+        }
+    try:
+        found = await toolExecutor.execute(
+            "story_facts", issue_key, story_text, start_to_close_timeout=_TDD_TIMEOUT
+        )
+    except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
+        return _failed("The facts check", error, workflow_id)
+    return {"status": "success", "mode": "facts", **found}
+
+
+async def _record(payload: dict[str, Any], workflow_id: str | None) -> dict[str, Any]:
+    """A published TDD version, remembered (contract mode "record")."""
+    if not str(payload.get("issue_key") or "").strip():
+        return {
+            "status": "error",
+            "error": "MissingInput",
+            "message": "record needs the issue_key.",
+        }
+    try:
+        stored = await toolExecutor.execute(
+            "record_tdd", dict(payload), start_to_close_timeout=timedelta(minutes=2)
+        )
+    except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
+        return _failed("Recording the TDD", error, workflow_id)
+    return {"status": "success", "mode": "record", "stored": stored}
+
+
+async def _investigate(payload: dict[str, Any], workflow_id: str | None) -> dict[str, Any]:
+    """A bug's root cause in the code graph (contract mode "investigate")."""
+    report_text = str(payload.get("report_text") or "").strip()
+    if not report_text:
+        return {
+            "status": "error",
+            "error": "MissingInput",
+            "message": "An investigation needs the bug report's text.",
+        }
+    try:
+        found = await toolExecutor.execute(
+            "investigate_bug",
+            report_text,
+            str(payload.get("repos") or ""),
+            start_to_close_timeout=_TDD_TIMEOUT,
+        )
+    except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
+        return _failed("The investigation", error, workflow_id)
+    return {"status": "success", "mode": "investigate", "investigation": found}
+
+
+_MEMORY_MODES = {"facts": _facts, "record": _record, "investigate": _investigate}

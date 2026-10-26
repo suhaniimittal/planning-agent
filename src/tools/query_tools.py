@@ -11,8 +11,9 @@ from common_lib.storage.storage_client import storage
 
 from src.ingestion import github_api
 from src.ingestion.confluence_api import ConfluenceApiError, create_page
+from src.memory import record
 from src.query import contracts, stack
-from src.query.design_qa import answer_question
+from src.query.design_qa import answer_question, legacy_answer
 from src.query.pdf_render import render_pdf
 from src.query.query_flow import build_tdd
 from src.query.render import render_confluence, render_text
@@ -78,12 +79,27 @@ def _stamp(generated_at: str | None) -> str:
 
 @tool()
 async def answer_design_question(
-    question: str, tdd_text: str, discussion: list[str] | None = None
+    question: str,
+    tdd_text: str,
+    discussion: list[str] | None = None,
+    issue_key: str | None = None,
+    kind: str | None = None,
 ) -> dict:
-    """A question about a TDD ("why this approach?", "why not X?"), answered from
-    the TDD, the discussion so far and the related code — and whether the
-    design should change. Changes nothing itself."""
-    answer = await answer_question(question, tdd_text, discussion)
+    """A comment on a TDD ("why this approach?", "why not X?", "update the TDD: X"),
+    answered from the TDD, the story's facts, the decisions in force, the
+    discussion and the related code — and judged: a change is applied only when
+    it is valid (2026-10-26). Changes nothing itself; the caller revises.
+    With no ``kind`` (a caller with memory off) it answers exactly as before."""
+    if not kind:
+        return await legacy_answer(question, tdd_text, discussion)
+    facts, decisions = [], []
+    if issue_key:
+        stored = record.load_requirement(issue_key)
+        facts = (stored or {}).get("facts") or []
+        decisions = record.decisions_in_force(issue_key)
+    answer = await answer_question(
+        question, tdd_text, discussion, kind or "question", facts, decisions
+    )
     return answer.to_dict()
 
 
@@ -130,6 +146,7 @@ async def generate_technical_design(
     return_document: bool = False,
     service_repos: dict[str, str] | None = None,
     mode: str | None = None,
+    issue_key: str | None = None,
 ) -> dict:
     """Search the service graph for services relevant to a requirement/bug
     report and produce a technical design doc: structured data plus a real
@@ -147,8 +164,15 @@ async def generate_technical_design(
     repositories whose build files give the design its technology
     constraints. `return_document`: also return the title, the
     Confluence HTML and the plain text, for the orchestrator. `mode`:
-    "bug" or "feature" to override how the ticket is classified."""
+    "bug" or "feature" to override how the ticket is classified. `issue_key`:
+    the story, whose decisions in force — and its project's, on the same
+    services — the design must keep (2026-10-26)."""
     constraints, api_contracts = repository_facts(service_repos or {})
+    decisions_text = ""
+    if issue_key:
+        decisions_text = record.decisions_block(
+            record.decisions_in_force(issue_key, service_names), issue_key
+        )
     # Only what the caller actually chose is forwarded, so build_tdd's own
     # signature stays the single definition of what top_k and hops default
     # to — nothing here restates the numbers.
@@ -161,6 +185,7 @@ async def generate_technical_design(
         technology_constraints=constraints,
         api_contracts=api_contracts,
         mode=mode,
+        decisions_text=decisions_text,
         **chosen,
     )
     pdf_bytes = render_pdf(tdd)
@@ -191,5 +216,6 @@ async def generate_technical_design(
             "title": tdd.title,
             "confluence_html": render_confluence(tdd),
             "text": render_text(tdd),
+            "decisions": [d.model_dump() for d in tdd.decisions],
         }
     return result

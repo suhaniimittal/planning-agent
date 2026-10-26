@@ -1,0 +1,15 @@
+sequenceDiagram
+    participant U as Reviewer (Confluence)
+    participant O as Orchestration
+    participant P as Planning
+    participant R as System of record
+    participant M as Memsy
+    U->>O: @Aetherion why not integer paise?
+    O->>P: validate(proposal, TDD, facts, decisions)
+    P->>M: search decisions and reasons for tdd:BTS-25 and team BTS
+    P-->>O: valid + better, supersedes D1
+    O->>P: revise TDD
+    P->>R: decision D2 agreed, D1 superseded, v1.4
+    P->>M: ingest user_message, assistant_message, app_event
+    P-->>O: TDD v1.4
+    O-->>U: Design revised: v1.4 uses integer paise

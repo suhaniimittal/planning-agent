@@ -1,0 +1,15 @@
+flowchart LR
+    JC["Jira story<br/>Confluence TDD page"] -- comments --> O[Orchestration]
+    O -- "replies, TDD versions" --> JC
+    O -- "modes: facts, validate,<br/>discuss, design" --> E
+    subgraph P[Planning agent - the only Memsy client]
+      direction TB
+      E[Meaning check<br/>facts + equivalence judge] --> V[Change validator]
+      V --> W[TDD writer]
+      M[Memory manager]
+    end
+    E <--> M
+    V <--> M
+    M <--> REC[("System of record<br/>Neo4j, encrypted:<br/>facts, TDD versions, decisions")]
+    M <--> MEM[("Memsy<br/>recall: requirements,<br/>decisions, discussions")]
+    W <--> G[("Neo4j code graph<br/>encrypted")]
