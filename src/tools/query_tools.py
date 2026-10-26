@@ -11,6 +11,7 @@ from common_lib.storage.storage_client import storage
 
 from src.ingestion import github_api
 from src.ingestion.confluence_api import ConfluenceApiError, create_page
+from src.memory import conversation
 from src.memory import record
 from src.query import contracts, stack
 from src.query.design_qa import answer_question, legacy_answer
@@ -84,6 +85,7 @@ async def answer_design_question(
     discussion: list[str] | None = None,
     issue_key: str | None = None,
     kind: str | None = None,
+    page_id: str = "",
 ) -> dict:
     """A comment on a TDD ("why this approach?", "why not X?", "update the TDD: X"),
     answered from the TDD, the story's facts, the decisions in force, the
@@ -97,10 +99,19 @@ async def answer_design_question(
         stored = record.load_requirement(issue_key)
         facts = (stored or {}).get("facts") or []
         decisions = record.decisions_in_force(issue_key)
+    # What was said before about this TDD, from Memsy (2026-10-26): earlier
+    # questions and answers, even from other days or another page's thread.
+    earlier = await conversation.recall(issue_key or "", question) if issue_key else []
+    context = list(discussion or []) + [f"(remembered) {line}" for line in earlier]
     answer = await answer_question(
-        question, tdd_text, discussion, kind or "question", facts, decisions
+        question, tdd_text, context, kind or "question", facts, decisions
     )
-    return answer.to_dict()
+    out = answer.to_dict()
+    if issue_key:
+        await conversation.remember_exchange(
+            issue_key, page_id, question, out.get("answer") or "", kind, out.get("verdict") or ""
+        )
+    return out
 
 
 def repository_facts(service_repos: dict[str, str]) -> tuple[list[str], str]:
@@ -117,6 +128,7 @@ def repository_facts(service_repos: dict[str, str]) -> tuple[list[str], str]:
         ref = branch or "HEAD"
         try:
             paths = github_api.list_tree(repo, branch or None)
+
             def read(path: str, repo: str = repo, ref: str = ref) -> str:
                 return github_api.fetch_file_content(repo, path, ref)
 

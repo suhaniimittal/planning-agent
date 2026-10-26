@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from aetherion_sdk import tool
 
-from src.memory import operations
+from src.memory import conversation, operations
 from src.query.investigate import investigate
 
 
@@ -20,8 +20,17 @@ async def story_facts(issue_key: str, story_text: str) -> dict:
 
 @tool()
 async def record_tdd(payload: dict) -> dict:
-    """A published TDD version: its facts and decisions, remembered."""
-    return operations.remember(payload)
+    """A published TDD version: its facts and decisions, remembered — and a note
+    in the TDD's Memsy conversation (2026-10-26)."""
+    stored = operations.remember(payload)
+    await conversation.remember_version(
+        str(payload.get("issue_key") or ""),
+        str(payload.get("tdd_version") or ""),
+        str(payload.get("page_id") or ""),
+        list(payload.get("decisions") or []),
+        list(payload.get("superseded") or []),
+    )
+    return stored
 
 
 @tool()

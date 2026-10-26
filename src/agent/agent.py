@@ -161,6 +161,8 @@ async def _discuss(payload: dict[str, Any], workflow_id: str | None) -> dict[str
             str(payload.get("issue_key") or "") or None,
             # No kind = memory off: answered exactly as before 2026-10-26.
             str(payload.get("kind") or "") or None,
+            # The TDD page the question was asked on: its Memsy session.
+            str(payload.get("page_id") or ""),
             start_to_close_timeout=_TDD_TIMEOUT,
         )
     except Exception as error:  # noqa: BLE001 - surface the failure, never hide it

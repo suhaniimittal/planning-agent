@@ -147,9 +147,10 @@ async def test_a_discussion_carries_the_story_and_the_kind(tools):
     recorder = tools(answer_design_question={"answer": "No", "verdict": "refuse"})
     await agent_module.planning_agent.fn(
         {"mode": "discuss", "question": "use double", "tdd_text": "TDD", "issue_key": "BTS-25",
-         "kind": "update"}
+         "kind": "update", "page_id": "28180482"}
     )
-    assert recorder.calls[0][1] == ("use double", "TDD", [], "BTS-25", "update")
+    # the page is the conversation's Memsy session (2026-10-26)
+    assert recorder.calls[0][1] == ("use double", "TDD", [], "BTS-25", "update", "28180482")
 
 
 @pytest.mark.asyncio
