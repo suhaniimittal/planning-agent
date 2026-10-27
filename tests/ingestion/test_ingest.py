@@ -6,6 +6,19 @@ from src.ingestion.manifest import ServiceSpec
 
 
 @pytest.fixture(autouse=True)
+def _no_real_database(monkeypatch):
+    """No test may reach a real Neo4j. A writer a test did not stub fails at
+    once; ingest treats Stage 3/4 and the embedding cache as non-fatal, so
+    a test that does not care about them still runs — against nothing."""
+
+    def unavailable():
+        raise RuntimeError("Neo4j not available in tests")
+
+    monkeypatch.setattr(ingest.code_graph_writer, "get_driver", unavailable)
+    monkeypatch.setattr(ingest.graph_writer, "get_driver", unavailable)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_embedding_calls(monkeypatch):
     """No test may reach the real embedding API. Tests that don't care about
     embeddings get a call that fails at once (a chunk embed failing is
@@ -77,6 +90,11 @@ def test_chunk_row_builds_expected_shape():
         "line_start": 1,
         "line_end": 3,
         "text": "def create_order():\n    pass",
+        "header": "",
+        # The hash of exactly what is embedded — the embedding cache's key.
+        "text_hash": ingest._text_hash(
+            "controller.py\ncreate_order\ndef create_order():\n    pass"
+        ),
         "embedding": [0.1, 0.2],
         "language": "python",
         "is_test": False,
@@ -294,9 +312,13 @@ def _patch_code_graph_writer_noop(monkeypatch, calls=None):
         "prune_stale_files",
         "upsert_classes",
         "upsert_functions",
+        "upsert_variables",
         "upsert_chunks",
         "create_declares_edges",
+        "create_contains_edges",
         "create_has_chunk_edges",
+        "create_file_has_chunk_edges",
+        "write_service_links",
     ):
         monkeypatch.setattr(ingest.code_graph_writer, name, lambda *a, **k: None)
 
@@ -621,7 +643,16 @@ def _patch_incremental_writers(monkeypatch, calls):
     )
     monkeypatch.setattr(ingest.code_graph_writer, "create_defines_edges", lambda *a: None)
     monkeypatch.setattr(ingest.code_graph_writer, "create_declares_edges", lambda *a: None)
+    monkeypatch.setattr(ingest.code_graph_writer, "create_contains_edges", lambda *a: None)
     monkeypatch.setattr(ingest.code_graph_writer, "create_has_chunk_edges", lambda *a: None)
+    monkeypatch.setattr(ingest.code_graph_writer, "create_file_has_chunk_edges", lambda *a: None)
+    monkeypatch.setattr(ingest.code_graph_writer, "upsert_variables", lambda *a: None)
+    monkeypatch.setattr(
+        ingest, "_link_service", lambda service, index: calls.setdefault("linked", service)
+    )
+    monkeypatch.setattr(
+        ingest.code_graph_writer, "load_service_index_rows", lambda service: ([], [])
+    )
     monkeypatch.setattr(
         ingest.code_graph_writer,
         "get_aggregated_file_references",
@@ -763,7 +794,11 @@ async def test_ingest_incremental_reparses_modified_file(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ingest_incremental_handles_non_source_file_without_reparse(monkeypatch):
+async def test_ingest_incremental_stores_a_non_source_file_like_a_full_ingest(monkeypatch):
+    """A changed config file used to be written with no text and, worse,
+    lost the chunks a full ingest had given it. It now gets exactly what a
+    full ingest gives it: its text, its references, its chunks — and its
+    stale nodes pruned."""
     calls = {}
     monkeypatch.setattr(
         github_api,
@@ -783,16 +818,17 @@ async def test_ingest_incremental_handles_non_source_file_without_reparse(monkey
     spec = ServiceSpec(name="orders", repo="org/orders-service")
     await ingest._ingest_incremental(spec, None, {"orders", "payment"}, "base", "head")
 
-    assert "pruned_files" not in calls
-    assert "upserted_classes" not in calls
-    assert calls["upserted_files"] == [
-        {
-            "file_path": "config.yaml",
-            "language": None,
-            "blob_sha": "sha2",
-            "references": ["payment"],
-        }
-    ]
+    assert calls["pruned_files"] == ["config.yaml"]
+    assert calls.get("upserted_classes", []) == []
+    row = calls["upserted_files"][0]
+    assert row["file_path"] == "config.yaml"
+    assert row["language"] == "yaml"
+    assert row["kind"] == "config"
+    assert row["source"] == "url: http://payment-service/graphql"
+    assert row["blob_sha"] == "sha2"
+    assert row["references"] == ["payment"]
+    # The service's links are rebuilt after any change.
+    assert calls["linked"] == "orders"
 
 
 @pytest.mark.asyncio
@@ -817,14 +853,10 @@ async def test_ingest_incremental_labels_tracked_only_extension_with_real_langua
     spec = ServiceSpec(name="orders", repo="org/orders-service")
     await ingest._ingest_incremental(spec, None, {"orders"}, "base", "head")
 
-    assert calls["upserted_files"] == [
-        {
-            "file_path": "index.html",
-            "language": "html",
-            "blob_sha": "sha2",
-            "references": [],
-        }
-    ]
+    row = calls["upserted_files"][0]
+    assert (row["file_path"], row["language"], row["blob_sha"], row["references"]) == (
+        "index.html", "html", "sha2", []
+    )
 
 
 @pytest.mark.asyncio
@@ -1423,3 +1455,85 @@ async def test_the_current_pipeline_version_is_recorded_so_the_next_run_can_skip
     await ingest.sync_service(ServiceSpec(name="orders", repo="org/o"), None, {"orders"})
 
     assert written["pipeline_version"] == ingest.PIPELINE_VERSION
+
+
+# --- pipeline version 4: embedding cache, file rows, links -------------------
+
+
+@pytest.mark.asyncio
+async def test_embed_chunks_reuses_a_cached_embedding_of_identical_text(monkeypatch):
+    """A version bump re-parses everything; only text that changed is paid
+    for again."""
+    cached_chunk = CodeChunk(index=0, line_start=1, line_end=2, text="unchanged")
+    new_chunk = CodeChunk(index=0, line_start=1, line_end=2, text="edited")
+    cached_fn = _fn_symbol(name="kept", chunks=[cached_chunk])
+    new_fn = _fn_symbol(name="changed", chunks=[new_chunk])
+    embedded = []
+
+    async def fake_embed(text):
+        embedded.append(text)
+        return [0.9]
+
+    _patch_embed(monkeypatch, fake_embed)
+    cached_hash = ingest._text_hash(ingest._chunk_embedding_text(cached_fn, cached_chunk))
+
+    def lookup(hashes):
+        return {h: [0.1] for h in hashes if h == cached_hash}
+
+    rows, _ = await ingest._embed_chunks("orders", [cached_fn, new_fn], cache_lookup=lookup)
+
+    assert embedded == [ingest._chunk_embedding_text(new_fn, new_chunk)]
+    assert {r["qualified_name"]: r["embedding"] for r in rows} == {
+        "controller.py::kept::chunk0": [0.1],
+        "controller.py::changed::chunk0": [0.9],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_failing_cache_lookup_only_costs_an_embed(monkeypatch):
+    chunk = CodeChunk(index=0, line_start=1, line_end=2, text="x")
+
+    async def fake_embed(text):
+        return [0.3]
+
+    _patch_embed(monkeypatch, fake_embed)
+
+    def broken(hashes):
+        raise RuntimeError("down")
+
+    rows, _ = await ingest._embed_chunks("orders", [_fn_symbol(chunks=[chunk])], cache_lookup=broken)
+
+    assert rows[0]["embedding"] == [0.3]
+
+
+def test_file_rows_carry_text_kind_imports_and_facts(tmp_path):
+    from src.ingestion.code_parser import parse_repo
+
+    (tmp_path / "Topics.kt").write_text(
+        "package com.asurint.kafka\n\nimport a.b.C\n\n"
+        'object Topics {\n    const val orders = "orders"\n}\n'
+    )
+    graph = parse_repo(tmp_path, "kafka")
+
+    rows, languages = ingest._file_rows(graph, {"Topics.kt": {"orders"}}, {"Topics.kt": "sha"})
+
+    row = rows[0]
+    assert row["source"].startswith("package com.asurint.kafka")
+    assert row["kind"] == "source" and row["parse_status"] == "ok"
+    assert row["package"] == "com.asurint.kafka"
+    assert '"module": "a.b.C"' in row["import_specs"]
+    assert '"Topics.orders"' in row["kotlin_constants"]
+    assert row["references"] == ["orders"] and row["blob_sha"] == "sha"
+    assert languages == {"Topics.kt": "kotlin"}
+
+
+@pytest.mark.asyncio
+async def test_run_links_services_across_the_whole_manifest(monkeypatch):
+    calls = _patch_run_dependencies(monkeypatch)
+    monkeypatch.setattr(ingest, "_link_services", lambda names: calls.setdefault("linked", names))
+
+    await ingest.run(service_filter={"orders"})
+
+    # Scoped to one service, but links among all of them are rebuilt: a link
+    # from an unchanged service to the changed one must move too.
+    assert calls["linked"] == sorted(s.name for s in _MANIFEST)

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 from aetherion_sdk import tool
-from common_lib.storage.storage_client import storage
+from common_lib.storage.storage_client import RetrievalMode, storage
 
 from src.ingestion.confluence_api import ConfluenceApiError, create_page
+from src.query import images as ticket_images
 from src.query.pdf_render import render_pdf
 from src.query.query_flow import build_tdd
 from src.query.render import render_confluence
@@ -41,6 +44,21 @@ def _team_id() -> str:
     STORAGE_AGENTS_BUCKET — the bucket name must equal the team_id per the
     storage client's own contract."""
     return os.environ.get("TENANT_ID") or os.environ["STORAGE_AGENTS_BUCKET"]
+
+
+def _read_upload(bucket: str, key: str) -> bytes:
+    """An uploaded file's bytes, from storage. Running locally, a key that
+    storage does not have is also tried as a path on this machine: the test
+    form uploads to the hosted platform's storage, while a local worker
+    reads its own MinIO, so a form upload is never found locally — a path
+    typed into the JSON payload is the way to attach a screenshot there."""
+    try:
+        return storage.retrieve(bucket, key, RetrievalMode.FULL_OBJECT)
+    except Exception:
+        local = Path(key).expanduser()
+        if os.environ.get("APP_ENV", "").strip().lower() == "local" and local.is_file():
+            return local.read_bytes()
+        raise
 
 
 def _slug(text: str, max_len: int = 45) -> str:
@@ -80,6 +98,7 @@ async def generate_technical_design(
     hops: int | None = None,
     service_names: list[str] | None = None,
     mode: str | None = None,
+    image_keys: list[str] | None = None,
 ) -> dict:
     """Search the service graph for services relevant to a requirement/bug
     report and produce a technical design doc: structured data plus a real
@@ -93,17 +112,27 @@ async def generate_technical_design(
     never blocks the PDF output if it fails or isn't configured.
 
     `service_names`: the services this run covers; None considers every
-    service in the graph."""
+    service in the graph. `image_keys`: storage keys of screenshots
+    uploaded with the ticket (optional), shown to the planner."""
     # Only what the caller actually chose is forwarded, so build_tdd's own
     # signature stays the single definition of what top_k and hops default
     # to — nothing here restates the numbers.
     chosen = {
         name: value for name, value in (("top_k", top_k), ("hops", hops)) if value is not None
     }
-    tdd = await build_tdd(issue_text, service_names=service_names, mode=mode, **chosen)
+    storage.init_client()
+    images = []
+    if image_keys:
+        bucket = _team_id()
+        images = await asyncio.to_thread(
+            ticket_images.load, list(image_keys),
+            lambda key: _read_upload(bucket, key),
+        )
+    tdd = await build_tdd(
+        issue_text, service_names=service_names, mode=mode, images=images, **chosen
+    )
     pdf_bytes = render_pdf(tdd)
 
-    storage.init_client()
     # Named from the TDD's own title, not the raw issue text: the title is
     # written to describe the change, while the ticket text opens with
     # whatever the reporter typed first and truncated to something like

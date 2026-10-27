@@ -72,6 +72,31 @@ def _code_check(c) -> str | None:
     return f"{label} — {c.verification_note}"
 
 
+def _coverage_lines(tdd: TechnicalDesignDoc) -> list[str]:
+    """Each ticket point: how far the design answers it, how, and with
+    which changes."""
+    from .ticket_points import label, uncovered
+
+    by_point = {entry.point: entry for entry in tdd.ticket_coverage}
+    missing = set(uncovered(tdd, tdd.ticket_points))
+    lines = []
+    for n, point in enumerate(tdd.ticket_points, start=1):
+        entry = by_point.get(n)
+        status = "not answered" if n in missing else label(entry.status)
+        line = f"{n}. {point}\n   [{status}]"
+        how = (entry.how or "").strip() if entry else ""
+        if how:
+            line += f" {how}"
+        refs = [
+            r.file_path + (f" ({r.function_or_symbol})" if r.function_or_symbol else "")
+            for r in (entry.addressed_by if entry else [])
+        ]
+        if refs:
+            line += "\n   -> " + "; ".join(refs)
+        lines.append(line)
+    return lines
+
+
 def _mermaid_id(name: str) -> str:
     """A safe Mermaid node id for an arbitrary display name — ids can't
     contain spaces or most punctuation, so this derives one deterministically
@@ -180,6 +205,11 @@ def _md_table(headers: list[str], rows: list[list[str]]) -> str | None:
     return "\n".join(lines)
 
 
+def _edge_case_lines(c) -> list[str]:
+    """Each traced state as one line: the state, then today and after."""
+    return [f"{e.case}: today {e.today}; after {e.after}" for e in c.edge_cases]
+
+
 def _md_change_block(c) -> list[str]:
     loc = f"`{c.file_path}` — " if c.file_path else ""
     source_tag = (
@@ -208,6 +238,9 @@ def _md_change_block(c) -> list[str]:
         c.pseudocode_sketch,
         "```",
     ]
+    if c.edge_cases:
+        lines.append("**Edge cases:**")
+        lines += [f"- {e}" for e in _edge_case_lines(c)]
     if c.acceptance_criteria:
         lines.append("**Acceptance criteria:**")
         lines += [f"- {ac}" for ac in c.acceptance_criteria]
@@ -263,7 +296,13 @@ def render_markdown(tdd: TechnicalDesignDoc) -> str:
 
     sections.append(_md_section(6, "Root Cause / Problem Analysis", tdd.root_cause_analysis))
 
-    sections.append(_md_section(7, "Proposed Solution", tdd.proposed_solution))
+    coverage = _coverage_lines(tdd)
+    sections.append(
+        _md_section(
+            7, "Proposed Solution", tdd.proposed_solution,
+            ("**Ticket coverage**\n\n" + "\n".join(coverage)) if coverage else None,
+        )
+    )
 
     proposed_arch_diagram = _mermaid_architecture_diagram(tdd.proposed_architecture_components)
     sections.append(
@@ -449,7 +488,7 @@ def _txt_table(headers: list[str], rows: list[list[str]]) -> str | None:
     return "\n".join(lines)
 
 
-def _architecture_parts(components, service_dependencies) -> list[str]:
+def _architecture_parts(components, service_dependencies, changed=None, services=None) -> list[str]:
     """The Architecture section's structured half: what the parts are, and
     which of them call which.
 
@@ -464,9 +503,35 @@ def _architecture_parts(components, service_dependencies) -> list[str]:
     rendered as "(no further dependencies)", which reads like something
     failed rather than like a fact. Here the two sources are merged into one
     aligned list and each edge carries its own provenance, so the reader can
-    tell a verified call from one this design is proposing."""
+    tell a verified call from one this design is proposing.
+
+    With `changed` (the services the design changes), a call between two
+    services that both stay unchanged is left out, and so is a service with
+    no call left: a UI-only fix listed all 32 calls among the eight services
+    it gave a verdict on. `services` is every service in the design, to
+    tell a service from another kind of component (a database), whose calls
+    and place are always kept."""
     if not components and not service_dependencies:
         return []
+    if changed is not None:
+        def touches(source: str, target: str) -> bool:
+            return any(end in changed or end not in (services or ()) for end in (source, target))
+
+        service_dependencies = [
+            d for d in service_dependencies or [] if touches(d.source, d.target)
+        ]
+        components = [
+            c.model_copy(update={"depends_on": [d for d in c.depends_on or []
+                                                if touches(c.name, d)]})
+            for c in components or []
+        ]
+        linked = set(changed)
+        for d in service_dependencies:
+            linked |= {d.source, d.target}
+        for c in components:
+            if c.depends_on:
+                linked |= {c.name, *c.depends_on}
+        components = [c for c in components if c.name in linked or c.name not in (services or ())]
 
     verified = {(d.source, d.target): d for d in service_dependencies or []}
     names = [c.name for c in components or []]
@@ -559,6 +624,9 @@ def _txt_change_block(number: str, c) -> str:
         label = "Sketch" if c.has_real_source else "Sketch (illustrative, not real code)"
         lines.append(f"    {label}:")
         lines += ["        " + line for line in c.pseudocode_sketch.strip().splitlines()]
+    if c.edge_cases:
+        lines.append("    Edge cases:")
+        lines += [f"      - {e}" for e in _edge_case_lines(c)]
     if c.acceptance_criteria:
         lines.append("    Done when:")
         lines += [f"      - {ac}" for ac in c.acceptance_criteria]
@@ -673,6 +741,9 @@ def _cf_change_block(c) -> str:
     ]
     lines.append(_cf_bullets(facts))
     lines.append(_cf_code(c.pseudocode_sketch))
+    if c.edge_cases:
+        lines.append("<p><strong>Edge cases:</strong></p>")
+        lines.append(_cf_bullets(_edge_case_lines(c)))
     if c.acceptance_criteria:
         lines.append("<p><strong>Acceptance criteria:</strong></p>")
         lines.append(_cf_bullets(c.acceptance_criteria))
@@ -710,7 +781,18 @@ def render_confluence(tdd: TechnicalDesignDoc) -> str:
     )
     sections.append(_cf_section(5, "Current Flow", _cf_flow_list(tdd.current_flow_steps)))
     sections.append(_cf_section(6, "Root Cause / Problem Analysis", _cf_p(tdd.root_cause_analysis)))
-    sections.append(_cf_section(7, "Proposed Solution", _cf_p(tdd.proposed_solution)))
+    # One list item per point: its text, status and changes on one line.
+    coverage = [
+        " ".join(part.strip() for part in line.split(". ", 1)[1].split("\n"))
+        for line in _coverage_lines(tdd)
+    ]
+    sections.append(
+        _cf_section(
+            7, "Proposed Solution", _cf_p(tdd.proposed_solution),
+            ("<p><strong>Ticket coverage</strong></p>" + _cf_numbered(coverage))
+            if coverage else None,
+        )
+    )
     sections.append(_cf_section(8, "Proposed Architecture", _cf_p(tdd.proposed_architecture)))
     sections.append(_cf_section(9, "Proposed Flow", _cf_flow_list(tdd.proposed_flow_steps)))
     sections.append(
@@ -874,6 +956,7 @@ def render_text(tdd: TechnicalDesignDoc) -> str:
 
     body.append(("Root Cause", [_one_finding_per_line(tdd.root_cause_analysis)]))
     body.append(("Proposed Solution", [tdd.proposed_solution]))
+    body.append(("Ticket Coverage", ["\n".join(_coverage_lines(tdd))]))
 
     service_parts = []
     change_number = 0
@@ -919,7 +1002,11 @@ def render_text(tdd: TechnicalDesignDoc) -> str:
     body.append(("Flow", flow))
 
     arch = [tdd.proposed_architecture]
-    arch.extend(_architecture_parts(tdd.proposed_architecture_components, tdd.service_dependencies))
+    arch.extend(_architecture_parts(
+        tdd.proposed_architecture_components, tdd.service_dependencies,
+        changed={s.service for s in tdd.services if s.changes},
+        services={s.service for s in tdd.services},
+    ))
     if tdd.communication_notes:
         arch.append("Communication:\n" + _txt_bullets(tdd.communication_notes))
     body.append(("Architecture", arch))

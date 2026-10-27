@@ -17,6 +17,15 @@
                 "required": true,
                 "description": "One service per line: 'name: org/repo' or 'name: org/repo@branch'. Example:\norders: myorg/orders-service\npayment: myorg/payment-service@develop",
                 "friendly_name": "Repositories"
+            },
+            {
+                "name": "uploaded_files",
+                "type": "file",
+                "required": false,
+                "multiple": true,
+                "accepts": ".png,.jpg,.jpeg,.webp,.gif",
+                "description": "Optional: screenshots from the ticket (up to 5). They are shown to the planner with the code.",
+                "friendly_name": "Screenshots"
             }
         ]
     }

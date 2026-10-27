@@ -28,6 +28,7 @@ from datetime import timedelta
 from typing import Any
 
 from aetherion_sdk import agent, toolExecutor
+from temporalio.common import RetryPolicy
 
 # Neither tool call below specifies a timeout by default, which leaves it at
 # whatever the platform's own default activity timeout is — observed in a
@@ -43,7 +44,14 @@ from aetherion_sdk import agent, toolExecutor
 # activity (left unset, it falls back to a short default), so this is a
 # ceiling only a truly stuck run would ever hit, not a cap on large repos.
 _INGESTION_TIMEOUT = timedelta(hours=6)
-_TDD_TIMEOUT = timedelta(minutes=10)
+# With the lookup loop (PLANNER_LOOP) a TDD makes several model calls: the
+# loop is told to answer by 6 minutes (tool_loop.MAX_SECONDS), and this
+# leaves room past that for its last rounds, the context and the PDF.
+_TDD_TIMEOUT = timedelta(minutes=15)
+# A TDD is never re-run on its own. A timed-out step was not stuck — it was
+# slow — and running it again starts a second, identical, paid run beside
+# the first one's still-unfinished work. A failure is reported instead.
+_TDD_RETRY = RetryPolicy(maximum_attempts=1)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +80,11 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
     # Optional override. Left unset (the normal case), the ticket is
     # classified from its own text during the issue split.
     mode = payload.get("mode") or None
+    # Optional screenshots. "uploaded_files" is the platform's own key for a
+    # `file` field: a list of storage keys (the files are already uploaded),
+    # or nothing when none were attached.
+    uploaded = payload.get("uploaded_files") or []
+    image_keys = [uploaded] if isinstance(uploaded, str) else list(uploaded)
     try:
         ingestion = await toolExecutor.execute(
             "run_ingestion", repos_text, start_to_close_timeout=_INGESTION_TIMEOUT
@@ -84,7 +97,9 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
             # The TDD considers only the services this run listed.
             ingestion["services"],
             mode,
+            image_keys,
             start_to_close_timeout=_TDD_TIMEOUT,
+            retry_policy=_TDD_RETRY,
         )
 
         structured_results = [

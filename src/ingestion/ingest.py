@@ -12,31 +12,43 @@ manifest.py) — no S3 bucket, no markdown doc, no RepoDocAI dependency.
 Adding a new service means adding an entry there; nothing here needs
 editing.
 
+Per service, in order (see docs/INGESTION_V2_PLAN.md):
+
+  Stage 0  every file gets a node with its full text (file_inventory.py)
+  Stage 1  symbols, imports and facts are parsed (code_parser.py)
+  Stage 2  chunks are embedded, reusing any embedding of identical text
+  Stage 3  links inside the service are rebuilt (links.py)
+
+and once every service is in, Stage 4 links services to each other
+(service_links.py). Stage 5, the coverage report, is printed per service
+and kept on its Service node.
+
 Run directly: python -m src.ingestion.ingest
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
-from . import code_graph_writer, github_api, graph_writer
+from . import code_graph_writer, github_api, graph_writer, links, service_doc, service_links
 from .code_parser import (
-    chunk_text,
-    extract_imports,
-    embedding_text,
     LANGUAGE_BY_EXTENSION,
-    TRACKED_ONLY_EXTENSIONS,
     CodeChunk,
     ParsedSymbol,
     RepoGraph,
+    add_file,
+    embedding_text,
+    language_of,
     parse_repo,
-    parse_source,
 )
 from .edge_detector import find_service_references, find_service_references_in_text
 from .embedder import embed, embed_many
+from .file_inventory import build_record, file_row
 from .manifest import ServiceSpec, load_services
 from .repo_fetcher import (
     RepoFetchError,
@@ -46,13 +58,8 @@ from .repo_fetcher import (
     local_repo_root,
     service_list_fingerprint,
 )
-from . import service_doc
 from .test_paths import is_test_path
 
-# How many repos to sync concurrently — serially syncing 40-50 repos would
-# otherwise dominate ingestion runtime; unbounded concurrency risks GitHub
-# rate limits and disk/CPU contention (for first-ingestion clones), so a
-# small fixed pool instead.
 # Bump this whenever a service's graph would come out DIFFERENT from the
 # same source — a change to parsing, chunking, what a chunk is embedded as,
 # or what is stored on a node. Not for a comment, a log line or a refactor
@@ -72,8 +79,19 @@ from .test_paths import is_test_path
 #     this, a File node existed only for a path some symbol reported, so a
 #     third of ui — 3,369 of 10,285 parseable files, every messages*.ts
 #     among them — was absent from the graph entirely.
-PIPELINE_VERSION = 3
+# 4 — every file's full text is stored; type aliases, enums, records,
+#     objects, constants, test blocks and useCallback handlers are symbols,
+#     nested symbols are named after their parent; chunks are cut by line
+#     ownership with no repeated signature; test files are no longer
+#     embedded; and imports, references, tests, tables, operations, routes
+#     and Kafka messages are linked. On 13 services: code lines inside a
+#     symbol or chunk went from 80.4% to ~100%, and no file is missing.
+PIPELINE_VERSION = 4
 
+# How many repos to sync concurrently — serially syncing 40-50 repos would
+# otherwise dominate ingestion runtime; unbounded concurrency risks GitHub
+# rate limits and disk/CPU contention (for first-ingestion clones), so a
+# small fixed pool instead.
 _CODE_GRAPH_CONCURRENCY = 4
 
 # How many chunk-embedding requests to have in flight at once, per service — a
@@ -97,6 +115,9 @@ _EMBEDDING_BATCH_MAX_CHARS = 200_000
 # same limit and drop every chunk in the batch.
 _EMBEDDING_RETRY_DELAYS = (5, 15, 30, 60)
 
+# (text hashes) -> {text hash: embedding already stored for that text}
+CacheLookup = Callable[[list[str]], dict[str, list[float]]]
+
 
 def _is_retryable(error: Exception) -> bool:
     """A 4xx other than 429 (e.g. an input the API rejects) fails the same
@@ -105,7 +126,11 @@ def _is_retryable(error: Exception) -> bool:
     return not (isinstance(status, int) and 400 <= status < 500 and status != 429)
 
 
-def _class_row(symbol: ParsedSymbol) -> dict:
+def _text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _symbol_row(symbol: ParsedSymbol) -> dict:
     return {
         "qualified_name": symbol.qualified_name,
         "name": symbol.name,
@@ -117,45 +142,81 @@ def _class_row(symbol: ParsedSymbol) -> dict:
         "source_snippet": symbol.source_snippet,
         "language": symbol.language,
         "is_test": is_test_path(symbol.file_path),
+        "symbol_kind": symbol.symbol_kind,
+        "parent_symbol": symbol.parent_symbol,
+        "identifiers": symbol.identifiers,
+        "supertypes": symbol.supertypes,
+        # Neo4j properties cannot be maps; the raw facts travel as JSON and
+        # what other stages query (kafka_*, avro_*) is written by them.
+        "facts": json.dumps(symbol.facts, sort_keys=True) if symbol.facts else None,
     }
+
+
+def _class_row(symbol: ParsedSymbol) -> dict:
+    return _symbol_row(symbol)
 
 
 def _function_row(symbol: ParsedSymbol) -> dict:
     return {
-        "qualified_name": symbol.qualified_name,
-        "name": symbol.name,
-        "file_path": symbol.file_path,
-        "line_start": symbol.line_start,
-        "line_end": symbol.line_end,
-        "signature": symbol.signature,
-        "docstring": symbol.docstring,
-        "source_snippet": symbol.source_snippet,
-        "language": symbol.language,
+        **_symbol_row(symbol),
         "is_method": symbol.is_method,
-        "is_test": is_test_path(symbol.file_path),
         "parent_class": symbol.parent_class,
     }
 
 
-def _chunk_row(function_symbol: ParsedSymbol, chunk: CodeChunk, embedding: list[float]) -> dict:
+def _variable_row(symbol: ParsedSymbol) -> dict:
+    return _symbol_row(symbol)
+
+
+def _owner_label(symbol: ParsedSymbol) -> str | None:
+    """The name a chunk's embedding is anchored with besides its own: the
+    method's class, or the symbol a nested function is declared in."""
+    if symbol.parent_class:
+        return symbol.parent_class
+    if symbol.parent_symbol:
+        return symbol.parent_symbol.split("::", 1)[-1]
+    return None
+
+
+def _chunk_embedding_text(symbol: ParsedSymbol, chunk: CodeChunk) -> str:
+    return embedding_text(symbol.file_path, symbol.name, _owner_label(symbol), chunk.text)
+
+
+def _chunk_row(
+    function_symbol: ParsedSymbol,
+    chunk: CodeChunk,
+    embedding: list[float],
+    text_hash: str | None = None,
+) -> dict:
     return {
         "qualified_name": f"{function_symbol.qualified_name}::chunk{chunk.index}",
+        # The owning symbol — a function, or since version 4 any symbol
+        # that owns lines. Name kept for the readers that already use it.
         "function_qualified_name": function_symbol.qualified_name,
         "chunk_index": chunk.index,
         "file_path": function_symbol.file_path,
         "line_start": chunk.line_start,
         "line_end": chunk.line_end,
         "text": chunk.text,
+        "header": chunk.header,
+        "text_hash": text_hash or _text_hash(_chunk_embedding_text(function_symbol, chunk)),
         "embedding": embedding,
         "language": function_symbol.language,
         "is_test": is_test_path(function_symbol.file_path),
     }
 
 
-def _file_chunk_row(file_path: str, language: str, chunk: CodeChunk, embedding: list[float]) -> dict:
-    """A chunk of a file that has no symbols. Shaped exactly like a
-    function's chunk except that `function_qualified_name` is null — the
-    file itself is the parent, reached by a File-[:HAS_CHUNK]->Chunk edge."""
+def _file_chunk_embedding_text(file_path: str, chunk: CodeChunk) -> str:
+    return embedding_text(file_path, Path(file_path).name, None, chunk.text)
+
+
+def _file_chunk_row(
+    file_path: str, language: str, chunk: CodeChunk, embedding: list[float]
+) -> dict:
+    """A chunk of the lines in a file that no symbol owns. Shaped exactly
+    like a symbol's chunk except that `function_qualified_name` is null —
+    the file itself is the parent, reached by a File-[:HAS_CHUNK]->Chunk
+    edge."""
     return {
         "qualified_name": f"{file_path}::filechunk{chunk.index}",
         "function_qualified_name": None,
@@ -164,19 +225,46 @@ def _file_chunk_row(file_path: str, language: str, chunk: CodeChunk, embedding: 
         "line_start": chunk.line_start,
         "line_end": chunk.line_end,
         "text": chunk.text,
+        "header": chunk.header,
+        "text_hash": _text_hash(_file_chunk_embedding_text(file_path, chunk)),
         "embedding": embedding,
         "language": language,
         "is_test": is_test_path(file_path),
     }
 
 
+async def _vectors_for(
+    service_name: str,
+    texts: list[str],
+    cache_lookup: CacheLookup | None,
+    embed_batch: Callable,
+) -> list[list[float] | None]:
+    """One vector per text: from the cache where the same text was embedded
+    before, from `embed_batch` for the rest. None where embedding failed."""
+    hashes = [_text_hash(t) for t in texts]
+    cached: dict[str, list[float]] = {}
+    if cache_lookup is not None:
+        try:
+            cached = await asyncio.to_thread(cache_lookup, hashes)
+        except Exception as e:  # noqa: BLE001 - a cache miss only costs an embed
+            print(f"    [EMBED CACHE] {service_name}: lookup failed ({e}); embedding all")
+    missing = [i for i, h in enumerate(hashes) if h not in cached]
+    vectors: list[list[float] | None] = [cached.get(h) for h in hashes]
+    if missing:
+        fresh = await embed_batch([texts[i] for i in missing])
+        for i, vector in zip(missing, fresh, strict=True):
+            vectors[i] = vector
+    return vectors
+
+
 async def _embed_file_chunks(
     service_name: str,
     file_chunks: dict[str, list[CodeChunk]],
     language_by_file: dict[str, str],
+    cache_lookup: CacheLookup | None = None,
 ) -> list[tuple[str, str]]:
-    """Embed and write every symbol-less file's chunks, returning the
-    (file_path, chunk_qname) pairs to link.
+    """Embed and write every file-owned chunk, returning the (file_path,
+    chunk_qname) pairs to link.
 
     Reuses the function path's batching by pretending each file is a
     one-symbol unit; the embedding text is the file path followed by the
@@ -187,22 +275,28 @@ async def _embed_file_chunks(
     if not pairs:
         return []
     print(f"  [FILE CHUNKS] {service_name}: {len(pairs)} chunk(s) from "
-          f"{len(file_chunks)} file(s) with no symbols")
+          f"{len(file_chunks)} file(s) outside any symbol")
+
+    async def embed_batch(texts: list[str]) -> list[list[float] | None]:
+        try:
+            return list(await embed_many(texts))
+        except Exception as e:  # noqa: BLE001 - one bad batch must not cost the service
+            print(f"    [FILE CHUNKS] {service_name}: batch failed ({e}); skipped")
+            return [None] * len(texts)
+
     edges: list[tuple[str, str]] = []
     for start in range(0, len(pairs), _EMBEDDING_BATCH_SIZE):
         batch = pairs[start : start + _EMBEDDING_BATCH_SIZE]
-        texts = [embedding_text(fp, Path(fp).name, None, chunk.text) for fp, chunk in batch]
-        try:
-            vectors = await embed_many(texts)
-        except Exception as e:  # noqa: BLE001 - one bad batch must not cost the service
-            print(f"    [FILE CHUNKS] {service_name}: batch failed ({e}); skipped")
-            continue
+        texts = [_file_chunk_embedding_text(fp, chunk) for fp, chunk in batch]
+        vectors = await _vectors_for(service_name, texts, cache_lookup, embed_batch)
         rows = [
             _file_chunk_row(fp, language_by_file.get(fp, "text"), chunk, vector)
             for (fp, chunk), vector in zip(batch, vectors, strict=True)
+            if vector is not None
         ]
-        await asyncio.to_thread(code_graph_writer.upsert_chunks, service_name, rows)
-        edges.extend((fp, row["qualified_name"]) for (fp, _), row in zip(batch, rows, strict=True))
+        if rows:
+            await asyncio.to_thread(code_graph_writer.upsert_chunks, service_name, rows)
+            edges.extend((row["file_path"], row["qualified_name"]) for row in rows)
     return edges
 
 
@@ -210,22 +304,27 @@ async def _embed_chunks(
     service_name: str,
     functions: list[ParsedSymbol],
     write_batch: Callable[[list[dict], list[tuple[str, str]]], None] | None = None,
+    cache_lookup: CacheLookup | None = None,
 ) -> tuple[list[dict], list[tuple[str, str]]]:
-    """Embed every chunk across every function, in batches (one embedding
-    request per batch), with bounded concurrency across batches.
+    """Embed every chunk across every symbol that owns chunks, in batches
+    (one embedding request per batch), with bounded concurrency across
+    batches.
 
-    Returns (chunk_rows, (function_qname, chunk_qname) edge pairs). If a
-    whole batch request fails (rate limit, one chunk the API rejects), that
-    batch is retried one chunk at a time, so only a chunk that fails on its
-    own is logged and skipped — never lets one bad call drop the whole
-    service's chunks, same "one failure never aborts the run" principle
-    used everywhere else in this pipeline.
+    Returns (chunk_rows, (owner_qname, chunk_qname) edge pairs). If a whole
+    batch request fails (rate limit, one chunk the API rejects), that batch
+    is retried one chunk at a time, so only a chunk that fails on its own is
+    logged and skipped — never lets one bad call drop the whole service's
+    chunks, same "one failure never aborts the run" principle used
+    everywhere else in this pipeline.
 
     With `write_batch`, each batch's rows and edge pairs are handed to it
     (in a worker thread) as soon as they're embedded and are NOT kept: the
     returned chunk_rows is then empty, and only the small edge pairs come
     back. A large repo's embeddings would otherwise all sit in memory at
     once (~40k chunks x 1536 numbers is several GB).
+
+    With `cache_lookup`, a chunk whose exact embedding text was embedded
+    before reuses that vector instead of calling the API.
     """
     pairs = [(fn, chunk) for fn in functions for chunk in fn.chunks]
     batches: list[list[tuple[ParsedSymbol, CodeChunk]]] = []
@@ -266,34 +365,28 @@ async def _embed_chunks(
     async def _embed_batch(batch: list[tuple[ParsedSymbol, CodeChunk]]) -> None:
         nonlocal batches_done
         async with semaphore:
-            embedded: list[tuple[ParsedSymbol, CodeChunk, list[float]]] = []
-            vectors = await _embed_many_with_retry(
-                [
-                    embedding_text(fn.file_path, fn.name, fn.parent_class, chunk.text)
-                    for fn, chunk in batch
-                ]
-            )
-            if vectors is not None:
-                embedded = [
-                    (fn, chunk, vector) for (fn, chunk), vector in zip(batch, vectors, strict=True)
-                ]
-            else:
-                for fn, chunk in batch:
-                    try:
-                        vector = await embed(
-                            embedding_text(fn.file_path, fn.name, fn.parent_class, chunk.text)
-                        )
-                    except (
-                        Exception
-                    ) as e:  # noqa: BLE001 - one bad embed call must never abort the run
-                        print(
-                            f"    [CHUNK-EMBED SKIP] {service_name}: "
-                            f"{fn.qualified_name}::chunk{chunk.index}: {e}"
-                        )
-                        continue
-                    embedded.append((fn, chunk, vector))
+            texts = [_chunk_embedding_text(fn, chunk) for fn, chunk in batch]
 
-            rows = [_chunk_row(fn, chunk, vector) for fn, chunk, vector in embedded]
+            async def embed_texts(missing: list[str]) -> list[list[float] | None]:
+                vectors = await _embed_many_with_retry(missing)
+                if vectors is not None:
+                    return list(vectors)
+                out: list[list[float] | None] = []
+                for text in missing:
+                    try:
+                        out.append(await embed(text))
+                    except Exception as e:  # noqa: BLE001 - one bad embed call must never abort the run
+                        where = text.splitlines()[0][:80]
+                        print(f"    [CHUNK-EMBED SKIP] {service_name}: {where}: {e}")
+                        out.append(None)
+                return out
+
+            vectors = await _vectors_for(service_name, texts, cache_lookup, embed_texts)
+            rows = [
+                _chunk_row(fn, chunk, vector, _text_hash(text))
+                for (fn, chunk), text, vector in zip(batch, texts, vectors, strict=True)
+                if vector is not None
+            ]
             batch_pairs = [(row["function_qualified_name"], row["qualified_name"]) for row in rows]
             if write_batch is not None:
                 # One write at a time: a large function's chunks can land in
@@ -342,13 +435,158 @@ def _clone_and_parse_full(
         return graph, references_by_file, commit_sha, blob_shas
 
 
+def _file_rows(
+    graph: RepoGraph, references_by_file: dict[str, set[str]], blob_shas: dict[str, str]
+) -> tuple[list[dict], dict[str, str]]:
+    """One row per file — every file in the inventory, plus (for a graph
+    built without one) every path a symbol or tracked file names.
+    Returns (rows, {file_path: language})."""
+    language_by_file: dict[str, str] = {p: r.language for p, r in graph.files.items()}
+    for path, language in graph.tracked_files.items():
+        language_by_file.setdefault(path, language)
+    for symbol in graph.symbols:
+        language_by_file.setdefault(symbol.file_path, symbol.language)
+    rows = []
+    for path, language in language_by_file.items():
+        record = graph.files.get(path)
+        row = file_row(record) if record is not None else {
+            "file_path": path,
+            "language": language,
+            "source": graph.file_source.get(path, ""),
+        }
+        facts = dict(graph.file_facts.get(path, {}))
+        constants = facts.pop("kotlin_constants", None)
+        row.update({
+            "blob_sha": blob_shas.get(path),
+            "references": sorted(references_by_file.get(path, set())),
+            # "" for a file that imports nothing, so the property always
+            # exists and a reader can tell "no imports" from "never parsed".
+            "imports": graph.file_imports.get(path, ""),
+        })
+        specs = graph.file_import_specs.get(path)
+        if specs:
+            row["import_specs"] = json.dumps([s.to_dict() for s in specs])
+        if path in graph.file_packages:
+            row["package"] = graph.file_packages[path]
+        if facts:
+            row["facts"] = json.dumps(facts, sort_keys=True)
+            # Lists the cross-service stage queries directly.
+            for key in ("graphql_operations", "graphql_exposes", "http_paths"):
+                if key in facts:
+                    row[key] = facts[key]
+        if constants:
+            row["kotlin_constants"] = json.dumps(constants, sort_keys=True)
+        rows.append(row)
+    return rows, language_by_file
+
+
+def _write_symbols(service: str, graph: RepoGraph, file_rows: list[dict]) -> None:
+    """Files, symbols and the structural edges between them."""
+    file_paths = [row["file_path"] for row in file_rows]
+    code_graph_writer.upsert_files(service, file_rows)
+    code_graph_writer.upsert_classes(service, [_class_row(c) for c in graph.classes])
+    code_graph_writer.upsert_functions(service, [_function_row(f) for f in graph.functions])
+    if graph.variables:
+        code_graph_writer.upsert_variables(service, [_variable_row(v) for v in graph.variables])
+
+    class_pairs = [(c.file_path, c.qualified_name) for c in graph.classes]
+    top_level_fn_pairs = [
+        (f.file_path, f.qualified_name) for f in graph.functions if not f.is_method
+    ]
+    method_pairs = [
+        (f.parent_class, f.qualified_name)
+        for f in graph.functions
+        if f.is_method and f.parent_class
+    ]
+    code_graph_writer.create_has_file_edges(service, file_paths)
+    code_graph_writer.create_defines_edges(service, class_pairs, "Class")
+    code_graph_writer.create_defines_edges(service, top_level_fn_pairs, "Function")
+    if graph.variables:
+        code_graph_writer.create_defines_edges(
+            service, [(v.file_path, v.qualified_name) for v in graph.variables], "Variable"
+        )
+    code_graph_writer.create_declares_edges(service, method_pairs)
+    contains = [(s.parent_symbol, s.qualified_name) for s in graph.symbols if s.parent_symbol]
+    if contains:
+        code_graph_writer.create_contains_edges(service, contains)
+
+
+def _link_service(service: str, index: links.ServiceIndex) -> links.ServiceLinks | None:
+    """Stage 3: rebuild every link inside `service`. Never fatal — a bug
+    here costs the links, not the ingested code."""
+    try:
+        result = links.compute_links(index)
+        code_graph_writer.write_service_links(service, result)
+    except Exception as e:  # noqa: BLE001 - links are rebuilt next run
+        print(f"  [LINKS SKIP] {service}: {e}")
+        return None
+    unresolved = sum(len(v) for v in result.unresolved_imports.values())
+    print(
+        f"  [LINKS] {service}: {len(result.imports)} imports ({unresolved} unresolved), "
+        f"{len(result.references)} references, {len(result.extends) + len(result.implements)} "
+        f"extends/implements, {len(result.tests)} tests, {len(result.tables)} tables, "
+        f"{len(result.operations)} operations, {len(result.endpoints)} routes, "
+        f"{len(result.kafka)} kafka classes"
+    )
+    return result
+
+
+def _link_services(names: list[str]) -> None:
+    """Stage 4: links across every service in the run. Never fatal."""
+    try:
+        result = service_links.link_services(names)
+    except Exception as e:  # noqa: BLE001 - recomputed next run
+        print(f"  [SERVICE LINKS SKIP] {e}")
+        return
+    vias: dict[str, int] = {}
+    for entry in result.service_links.values():
+        for via in entry["via"]:
+            vias[via] = vias.get(via, 0) + 1
+    print(
+        f"  {len(result.handles)} handlers and {len(result.publishes)} publishers over "
+        f"{len({r['message'] for r in result.handles + result.publishes})} messages, "
+        f"{len(result.uses_operation)} operation uses, {len(result.calls_endpoint)} route calls; "
+        f"service links by kind: {vias or 'none'}"
+    )
+    if result.unresolved_topics:
+        print(f"  [UNRESOLVED TOPICS] {sorted(set(result.unresolved_topics))[:10]}")
+
+
+def _report_coverage(service: str, graph: RepoGraph, linked: links.ServiceLinks | None) -> None:
+    """Stage 5: how much of the service the graph holds, printed and kept."""
+    code = sum(c for c, _ in graph.file_coverage.values())
+    covered = sum(v for _, v in graph.file_coverage.values())
+    failed = sorted(p for p, r in graph.files.items() if r.parse_status == "failed")
+    coverage = {
+        "files": len(graph.files),
+        "code_lines": code,
+        "covered_lines": covered,
+        "percent": round(100 * covered / code, 1) if code else 100.0,
+        "failed_files": len(failed),
+        "unresolved_imports": (
+            sum(len(v) for v in linked.unresolved_imports.values()) if linked else 0
+        ),
+    }
+    print(
+        f"  [COVERAGE] {service}: {coverage['percent']}% of code lines in a symbol or chunk "
+        f"({covered}/{code}), {coverage['files']} files, {len(failed)} parse failures"
+        + (f" e.g. {failed[:3]}" if failed else "")
+    )
+    try:
+        graph_writer.set_service_coverage(service, coverage)
+    except Exception as e:  # noqa: BLE001 - the report is informational
+        print(f"  [COVERAGE] {service}: could not store ({e})")
+
+
 async def _ingest_full(
     spec: ServiceSpec, github_token: str | None, known_service_names: set[str]
 ) -> tuple[RepoGraph | None, str | None]:
-    """Full clone + parse — used ONLY the first time a service is ingested.
+    """Full clone + parse — used the first time a service is ingested, and
+    whenever the pipeline version moves.
 
-    Writes every File/Class/Function/Chunk node, every file's dependency
-    references, and aggregates them into the service's CALLS edges.
+    Writes every File/Class/Function/Variable/Chunk node, every file's
+    dependency references, every link inside the service, and aggregates
+    the references into the service's CALLS edges.
 
     Returns (RepoGraph | None, new_commit_sha | None): the RepoGraph lets
     the caller build this service's summary digest without a second clone;
@@ -367,85 +605,51 @@ async def _ingest_full(
         print(f"  [SKIP] {spec.name}: unexpected error: {e}")
         return None, None
 
-    if not graph.classes and not graph.functions and not graph.tracked_files:
+    if not graph.files and not graph.symbols and not graph.tracked_files:
         print(
-            f"  [SKIP] {spec.name}: 0 classes/functions parsed and no trackable files "
+            f"  [SKIP] {spec.name}: no files found "
             f"({graph.files_parsed} files parsed, {graph.files_failed} failed)"
         )
         return None, None
 
-    # One File node per distinct file_path seen across classes+functions,
-    # PLUS every tracked-only file (.html/.css/.csv — no symbols, but still
-    # worth a node so a coding agent knows the file exists). Language is
-    # whichever symbol at that path reports it (uniform within a file,
-    # since a file is parsed with a single language's adapter).
-    language_by_file: dict[str, str] = dict(graph.tracked_files)
-    for symbol in (*graph.classes, *graph.functions):
-        language_by_file.setdefault(symbol.file_path, symbol.language)
-    file_paths = list(language_by_file.keys())
-    file_rows = [
-        {
-            "file_path": fp,
-            "language": lang,
-            "blob_sha": blob_shas.get(fp),
-            "references": sorted(references_by_file.get(fp, set())),
-            # "" for a file that imports nothing, so the property always
-            # exists and a reader can tell "no imports" from "never parsed".
-            "imports": graph.file_imports.get(fp, ""),
-            # Only ever non-empty for a test file (see RepoGraph.file_source):
-            # the planner is shown an existing test whole, because a test
-            # file's fixture and render setup are what it cannot guess and
-            # what parse_file() never extracted.
-            "source": graph.file_source.get(fp, ""),
-        }
-        for fp, lang in language_by_file.items()
-    ]
+    file_rows, language_by_file = _file_rows(graph, references_by_file, blob_shas)
+    file_paths = [row["file_path"] for row in file_rows]
 
-    # Files/classes/functions are written BEFORE chunks are embedded, so each
-    # embedded batch can be written (with its HAS_CHUNK edges) the moment it's
-    # ready instead of every embedding being held until the end.
+    # Files/symbols are written BEFORE chunks are embedded, so each embedded
+    # batch can be written (with its HAS_CHUNK edges) the moment it's ready
+    # instead of every embedding being held until the end.
     code_graph_writer.prune_stale_files(spec.name, file_paths)
-    code_graph_writer.upsert_files(spec.name, file_rows)
-    code_graph_writer.upsert_classes(spec.name, [_class_row(c) for c in graph.classes])
-    code_graph_writer.upsert_functions(spec.name, [_function_row(f) for f in graph.functions])
-
-    class_pairs = [(c.file_path, c.qualified_name) for c in graph.classes]
-    top_level_fn_pairs = [
-        (f.file_path, f.qualified_name) for f in graph.functions if not f.is_method
-    ]
-    method_pairs = [
-        (f.parent_class, f.qualified_name)
-        for f in graph.functions
-        if f.is_method and f.parent_class
-    ]
-
-    code_graph_writer.create_has_file_edges(spec.name, file_paths)
-    code_graph_writer.create_defines_edges(spec.name, class_pairs, "Class")
-    code_graph_writer.create_defines_edges(spec.name, top_level_fn_pairs, "Function")
-    code_graph_writer.create_declares_edges(spec.name, method_pairs)
+    _write_symbols(spec.name, graph, file_rows)
 
     def write_chunk_batch(rows: list[dict], pairs: list[tuple[str, str]]) -> None:
         code_graph_writer.upsert_chunks(spec.name, rows)
         code_graph_writer.create_has_chunk_edges(spec.name, pairs)
 
-    total_chunks = sum(len(f.chunks) for f in graph.functions)
+    def cache_lookup(hashes: list[str]) -> dict[str, list[float]]:
+        return code_graph_writer.load_chunk_embeddings(spec.name, hashes)
+
+    owners = [s for s in graph.symbols if s.chunks]
+    total_chunks = sum(len(s.chunks) for s in owners)
     print(f"  [FULL INGEST] {spec.name}: embedding {total_chunks} chunk(s)...")
     _, chunk_edge_pairs = await _embed_chunks(
-        spec.name, graph.functions, write_batch=write_chunk_batch
+        spec.name, owners, write_batch=write_chunk_batch, cache_lookup=cache_lookup
     )
-    file_chunk_edges = await _embed_file_chunks(spec.name, graph.file_chunks, language_by_file)
+    file_chunk_edges = await _embed_file_chunks(
+        spec.name, graph.file_chunks, language_by_file, cache_lookup=cache_lookup
+    )
     code_graph_writer.create_file_has_chunk_edges(spec.name, file_chunk_edges)
 
     # Runs last, once every current node is written: anything of this
     # service's not in the latest parse (or a chunk that failed to embed)
     # is stale and removed.
     all_qualified_names = (
-        [c.qualified_name for c in graph.classes]
-        + [f.qualified_name for f in graph.functions]
+        [s.qualified_name for s in graph.symbols]
         + [chunk_qname for _, chunk_qname in chunk_edge_pairs]
         + [chunk_qname for _, chunk_qname in file_chunk_edges]
     )
     code_graph_writer.prune_stale_code_nodes(spec.name, all_qualified_names)
+
+    linked = _link_service(spec.name, links.index_from_repo_graph(spec.name, graph))
 
     targets = code_graph_writer.get_aggregated_file_references(spec.name)
     graph_writer.set_service_dependencies(spec.name, sorted(targets))
@@ -454,10 +658,14 @@ async def _ingest_full(
 
     print(
         f"  [FULL INGEST] {spec.name}: {len(graph.classes)} classes, "
-        f"{len(graph.functions)} functions, {len(chunk_edge_pairs)}/{total_chunks} chunks embedded "
-        f"({graph.files_parsed} files parsed, {graph.files_skipped_oversized} oversized-skipped, "
+        f"{len(graph.functions)} functions, {len(graph.variables)} variables, "
+        f"{len(chunk_edge_pairs) + len(file_chunk_edges)}/"
+        f"{total_chunks + sum(len(c) for c in graph.file_chunks.values())} chunks embedded "
+        f"({graph.files_parsed} files parsed, {graph.files_skipped_oversized} oversized, "
         f"{graph.files_failed} failed)"
     )
+    if graph.files:
+        _report_coverage(spec.name, graph, linked)
     return graph, commit_sha
 
 
@@ -472,8 +680,10 @@ async def _ingest_incremental(
     NO clone here, ever. Fetches the changed-files list from GitHub's
     Compare API, and for each entry: deletes a removed file's nodes,
     relabels a pure rename (content unchanged, confirmed via blob sha), or
-    fetches+reparses ONLY that one file's new content. Every untouched
-    file's nodes are left completely alone — no reparse, no rewrite.
+    fetches+reparses ONLY that one file's new content — every kind of file,
+    exactly as a full ingest would. Every untouched file's nodes are left
+    completely alone — no reparse, no rewrite. The service's links are then
+    rebuilt from the graph, since one file's change can move another's.
     """
     try:
         changed = await asyncio.to_thread(
@@ -490,6 +700,10 @@ async def _ingest_incremental(
     existing_blob_shas = code_graph_writer.load_file_blob_shas(spec.name)
     candidates = {name for name in known_service_names if name.lower() != spec.name.lower()}
 
+    def cache_lookup(hashes: list[str]) -> dict[str, list[float]]:
+        return code_graph_writer.load_chunk_embeddings(spec.name, hashes)
+
+    any_written = False
     for entry in changed:
         path, status, sha, previous_path = (
             entry["path"],
@@ -501,6 +715,7 @@ async def _ingest_incremental(
         if status == "removed":
             code_graph_writer.delete_file_and_descendants(spec.name, path)
             print(f"  [INCREMENTAL] {spec.name}: removed {path}")
+            any_written = True
             continue
 
         if (
@@ -513,6 +728,7 @@ async def _ingest_incremental(
             print(
                 f"  [INCREMENTAL] {spec.name}: renamed {previous_path} -> {path} (content unchanged)"
             )
+            any_written = True
             continue
 
         if sha and sha == existing_blob_shas.get(path):
@@ -529,83 +745,53 @@ async def _ingest_incremental(
         except github_api.GitHubApiError as e:
             print(f"  [INCREMENTAL SKIP] {spec.name}: {path}: {e}")
             continue
+        except UnicodeDecodeError:
+            # A binary file: still a node, with no text.
+            text = None
 
-        references = find_service_references_in_text(text, candidates)
-        language = _language_for(path)
+        references = find_service_references_in_text(text or "", candidates)
+        raw = (text or "").encode("utf-8") if text is not None else b"\x00"
+        record = build_record(path, raw, language_of(path))
+        mini = RepoGraph(classes=[], functions=[])
+        add_file(mini, record, raw)
+        rows, language_by_file = _file_rows(mini, {path: references}, {path: sha})
 
-        if language is None:
-            # Not a tree-sitter-parseable file — still worth a dependency
-            # rescan (e.g. a changed gateway/federation config), but there
-            # are no Class/Function/Chunk nodes to reparse. TRACKED_ONLY_
-            # EXTENSIONS (.html/.css/.csv) get their real language label
-            # here; anything else just gets None.
-            display_language = TRACKED_ONLY_EXTENSIONS.get(PurePosixPath(path).suffix.lower())
-            code_graph_writer.upsert_files(
-                spec.name,
-                [
-                    {
-                        "file_path": path,
-                        "language": display_language,
-                        "blob_sha": sha,
-                        "references": sorted(references),
-                    }
-                ],
-            )
-            code_graph_writer.create_has_file_edges(spec.name, [path])
-            print(f"  [INCREMENTAL] {spec.name}: rescanned {path} (not source, no reparse)")
-            continue
-
-        try:
-            symbols = parse_source(text.encode("utf-8"), path, language)
-        except Exception as e:  # noqa: BLE001 - a parse bug must never abort ingestion
-            print(f"  [INCREMENTAL SKIP] {spec.name}: {path}: parse failed: {e}")
-            continue
-
-        classes = [s for s in symbols if s.kind == "class"]
-        functions = [s for s in symbols if s.kind == "function"]
-        class_rows = [_class_row(c) for c in classes]
-        function_rows = [_function_row(f) for f in functions]
-        chunk_rows, chunk_edge_pairs = await _embed_chunks(spec.name, functions)
+        _write_symbols(spec.name, mini, rows)
+        chunk_rows, chunk_edge_pairs = await _embed_chunks(
+            spec.name, [s for s in mini.symbols if s.chunks], cache_lookup=cache_lookup
+        )
+        code_graph_writer.upsert_chunks(spec.name, chunk_rows)
+        code_graph_writer.create_has_chunk_edges(spec.name, chunk_edge_pairs)
+        file_chunk_edges = await _embed_file_chunks(
+            spec.name, mini.file_chunks, language_by_file, cache_lookup=cache_lookup
+        )
+        code_graph_writer.create_file_has_chunk_edges(spec.name, file_chunk_edges)
 
         current_qnames = (
-            [c.qualified_name for c in classes]
-            + [f.qualified_name for f in functions]
+            [s.qualified_name for s in mini.symbols]
             + [row["qualified_name"] for row in chunk_rows]
+            + [qname for _, qname in file_chunk_edges]
         )
         code_graph_writer.prune_stale_code_nodes_for_file(spec.name, path, current_qnames)
-
-        code_graph_writer.upsert_files(
-            spec.name,
-            [
-                {
-                    "file_path": path,
-                    "language": language,
-                    "blob_sha": sha,
-                    "references": sorted(references),
-                    "imports": extract_imports(text),
-                }
-            ],
-        )
-        code_graph_writer.upsert_classes(spec.name, class_rows)
-        code_graph_writer.upsert_functions(spec.name, function_rows)
-        code_graph_writer.upsert_chunks(spec.name, chunk_rows)
-
-        class_pairs = [(c.file_path, c.qualified_name) for c in classes]
-        top_level_fn_pairs = [(f.file_path, f.qualified_name) for f in functions if not f.is_method]
-        method_pairs = [
-            (f.parent_class, f.qualified_name) for f in functions if f.is_method and f.parent_class
-        ]
-
-        code_graph_writer.create_has_file_edges(spec.name, [path])
-        code_graph_writer.create_defines_edges(spec.name, class_pairs, "Class")
-        code_graph_writer.create_defines_edges(spec.name, top_level_fn_pairs, "Function")
-        code_graph_writer.create_declares_edges(spec.name, method_pairs)
-        code_graph_writer.create_has_chunk_edges(spec.name, chunk_edge_pairs)
-
+        any_written = True
         print(
             f"  [INCREMENTAL] {spec.name}: reparsed {path} "
-            f"({len(classes)} classes, {len(functions)} functions)"
+            f"({len(mini.classes)} classes, {len(mini.functions)} functions, "
+            f"{len(mini.variables)} variables)"
         )
+
+    if any_written:
+        try:
+            file_rows, symbol_rows = await asyncio.to_thread(
+                code_graph_writer.load_service_index_rows, spec.name
+            )
+            index = links.index_from_rows(
+                spec.name, file_rows, symbol_rows,
+                lambda paths: code_graph_writer.load_sources(spec.name, paths),
+            )
+            await asyncio.to_thread(_link_service, spec.name, index)
+        except Exception as e:  # noqa: BLE001 - links are rebuilt next run
+            print(f"  [LINKS SKIP] {spec.name}: {e}")
 
     targets = code_graph_writer.get_aggregated_file_references(spec.name)
     graph_writer.set_service_dependencies(spec.name, sorted(targets))
@@ -814,6 +1000,11 @@ async def run(
             return spec.name, graph
 
     results = await asyncio.gather(*(_one(spec) for spec in specs))
+
+    # Across the FULL manifest, not only this run's services: a link from an
+    # unchanged service to one that just changed must be rebuilt too.
+    print("\n=== Linking services to each other (Kafka, GraphQL, REST) ===")
+    await asyncio.to_thread(_link_services, sorted(all_names))
 
     print("\n=== Reading each service's SERVICE.md ===")
     await _sync_service_docs(specs, github_token)

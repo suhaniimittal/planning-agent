@@ -510,29 +510,30 @@ async def test_both_llm_paths_use_a_low_temperature(monkeypatch):
 
 
 def test_models_get_the_api_parameters_they_actually_accept():
-    """Three families, verified against the live API: gpt-5.5/5.6 refuse
-    `temperature` outright, other gpt-5 models accept it but still need
-    `max_completion_tokens`, and pre-5 models take the plain parameters."""
+    """Three families, verified against the live API: gpt-5 models think only
+    when asked and then refuse `temperature`, gpt-5.5/5.6 also refuse `seed`,
+    and pre-5 models take the plain parameters."""
     from src.query import planner
 
-    refuses_temp = planner._openai_params("gpt-5.5")
-    assert "temperature" not in refuses_temp and "seed" not in refuses_temp
-    assert refuses_temp["max_completion_tokens"] >= 12000
+    refuses_seed = planner._openai_params("gpt-5.5")
+    assert "temperature" not in refuses_seed and "seed" not in refuses_seed
+    assert refuses_seed["reasoning_effort"] == "high"
+    assert refuses_seed["max_completion_tokens"] >= 12000
 
     thinking = planner._openai_params("gpt-5.4")
-    assert thinking["temperature"] == 0 and thinking["seed"] == planner._SEED
+    assert "temperature" not in thinking and thinking["seed"] == planner._SEED
+    assert thinking["reasoning_effort"] == "high"
     assert thinking["max_completion_tokens"] >= 12000
 
     plain = planner._openai_params("gpt-4.1")
     assert plain == {"max_tokens": 12000, "temperature": 0, "seed": planner._SEED}
 
 
-def test_tdd_model_is_deterministic_by_default():
-    """The same ticket must not produce a visibly different TDD run to run."""
+def test_tdd_model_thinks_before_writing():
+    """With only temperature=0 the model spent zero reasoning tokens."""
     from src.query import planner
 
-    assert planner._TEMPERATURE == 0
-    assert "temperature" in planner._openai_params(planner._OPENAI_MODEL)
+    assert planner._openai_params(planner._OPENAI_MODEL)["reasoning_effort"] == "high"
 
 
 

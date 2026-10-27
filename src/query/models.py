@@ -19,6 +19,12 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class EdgeCase(BaseModel):
+    case: str = Field(description="The state: empty input, first load, after a reset, a boundary.")
+    today: str = Field(description="What the code does in that state today, read from its lines.")
+    after: str = Field(description="What it does in that state after this change.")
+
+
 class FileChange(BaseModel):
     file_path: str | None = None
     # None for a change to a file that HAS no symbols — a message catalogue,
@@ -38,6 +44,12 @@ class FileChange(BaseModel):
     # the sketch may track the real signature/body rather than being purely
     # speculative. Still never a claim of verified, tested code either way.
     pseudocode_sketch: str
+    # The states the change could behave differently in, each traced through
+    # the real lines: writing "nothing selected -> today: ..." is what makes
+    # the model look. A TDD once reserved a hidden button's width from its
+    # label with nothing selected — which `[].every()` had made "Unarchive",
+    # not the widest label — and the coding agent shipped it.
+    edge_cases: list[EdgeCase] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
     reasoning: str
     # "reference" is NOT an edit: it marks a symbol the proposed design
@@ -118,6 +130,34 @@ class SequenceStep(BaseModel):
     direction: Literal["call", "response"] = "call"
 
 
+class ChangeRef(BaseModel):
+    file_path: str
+    function_or_symbol: str | None = None
+
+
+class PointCoverage(BaseModel):
+    point: int = Field(description="The point's number under \"Ticket points\".")
+    # No default: an entry that does not say how far it answers the point is
+    # sent back, rather than read as "fixed".
+    status: Literal["fixed", "partly", "needs_decision", "no_change"] | None = Field(
+        default=None,
+        description="fixed: the changes resolve it in every case the ticket describes. "
+        "partly: they resolve part of it. needs_decision: resolving it needs a product or "
+        "design choice the ticket does not make. no_change: no code change is needed.",
+    )
+    how: str | None = Field(
+        default=None,
+        description="One or two sentences: how the changes resolve it; for partly, what "
+        "remains; for needs_decision, the choice and its options, each with the file it would "
+        "change; for no_change, why.",
+    )
+    addressed_by: list[ChangeRef] = Field(
+        default_factory=list,
+        description="The entries in `changes` that fix or deliver it (or the part of it that "
+        "is fixed), by their file_path and function_or_symbol.",
+    )
+
+
 class TechnicalDesignDoc(BaseModel):
     # A short, specific title for THIS issue/fix — e.g. "Propagate shipment
     # creation failures in the orders service" — never the schema/class
@@ -171,3 +211,9 @@ class TechnicalDesignDoc(BaseModel):
     risks: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
     overall_reasoning: str
+
+    # The ticket's points, listed by code before planning (ticket_points.py)
+    # rather than by the model, so it cannot leave out one it skipped; and,
+    # from the model, how each is answered.
+    ticket_points: list[str] = Field(default_factory=list)
+    ticket_coverage: list[PointCoverage] = Field(default_factory=list)

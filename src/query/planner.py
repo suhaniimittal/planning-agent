@@ -26,21 +26,24 @@ from typing import get_origin
 
 from pydantic import BaseModel, ValidationError
 
+from .images import around_slot
 from .models import FileChange, ServicePlan, TechnicalDesignDoc
 
 _GATEWAY_PROVIDER, _GATEWAY_MODEL = "anthropic", "claude-sonnet-4-6"
-# gpt-5.4, not 5.5: the newer model refuses `temperature` outright ("does not
-# support 0 with this model"), leaving the API default of 1.0, and the same
-# ticket then produced visibly different TDDs run to run. 5.4 is one
-# generation back but accepts both temperature and a seed.
+# gpt-5.4 accepts a seed; gpt-5.5 refuses it as well as `temperature`.
 _OPENAI_MODEL = "gpt-5.4"
-# Models that spend part of the output budget thinking before writing, and
-# whose API takes `max_completion_tokens` rather than `max_tokens`.
+# Models that can think before writing, and whose API takes
+# `max_completion_tokens` rather than `max_tokens`.
 _OPENAI_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
-# Models in that family that additionally REFUSE `temperature` (only the
-# default is allowed). Checked before the prefix list above, which they also
-# match. Verified against the API, not assumed.
+# Models in that family that additionally REFUSE `seed`. Checked before the
+# prefix list above, which they also match. Verified against the API.
 _OPENAI_NO_TEMPERATURE_PREFIXES = ("gpt-5.5", "gpt-5.6", "o1", "o3", "o4")
+# Thinking is off unless asked for: gpt-5.4 with only temperature=0 spent zero
+# reasoning tokens, and the TDDs showed it — no-op changes, contradictions,
+# missed edge states. Asking for it means giving up temperature=0 ("only the
+# default (1) is supported" once reasoning is on); a model that works the
+# problem through first beats a model that is merely repeatable.
+_OPENAI_REASONING_EFFORT = "high"
 _OPENAI_REASONING_MAX_TOKENS = 40000
 
 # 0, not the API default of 1.0: the same ticket and the same code must give
@@ -1105,30 +1108,38 @@ async def _plan_via_gateway(system_prompt: str, user_prompt: str) -> str:
 def _openai_params(model: str) -> dict:
     """Output-length and sampling settings for `model`.
 
-    Three shapes, because the families differ: a thinking model needs
-    `max_completion_tokens` and room to think on top of the TDD itself, and
-    some of those also refuse `temperature`/`seed` entirely.
+    Three shapes, because the families differ: a thinking model is asked to
+    think, needs `max_completion_tokens` with room for that on top of the TDD
+    itself, and cannot take `temperature`; some also refuse `seed`.
     """
+    thinking = {
+        "max_completion_tokens": _OPENAI_REASONING_MAX_TOKENS,
+        "reasoning_effort": _OPENAI_REASONING_EFFORT,
+    }
     if model.startswith(_OPENAI_NO_TEMPERATURE_PREFIXES):
-        return {"max_completion_tokens": _OPENAI_REASONING_MAX_TOKENS}
+        return thinking
     if model.startswith(_OPENAI_REASONING_PREFIXES):
-        return {
-            "max_completion_tokens": _OPENAI_REASONING_MAX_TOKENS,
-            "temperature": _TEMPERATURE,
-            "seed": _SEED,
-        }
+        return {**thinking, "seed": _SEED}
     return {"max_tokens": 12000, "temperature": _TEMPERATURE, "seed": _SEED}
 
 
-async def _plan_via_openai(system_prompt: str, user_prompt: str) -> str:
+async def _plan_via_openai(system_prompt: str, user_prompt: str, images=None) -> str:
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI()  # reads OPENAI_API_KEY from the environment
+    # Screenshots from the ticket (images.TicketImage) go at images.SLOT.
+    user_content = user_prompt
+    if images:
+        head, tail = around_slot(user_prompt)
+        user_content = [{"type": "text", "text": head}] + [
+            {"type": "image_url", "image_url": {"url": image.data_url(), "detail": "high"}}
+            for image in images
+        ] + ([{"type": "text", "text": tail}] if tail else [])
     resp = await client.chat.completions.create(
         model=_OPENAI_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_content},
         ],
         response_format={"type": "json_object"},
         **_openai_params(_OPENAI_MODEL),
@@ -1136,10 +1147,13 @@ async def _plan_via_openai(system_prompt: str, user_prompt: str) -> str:
     return resp.choices[0].message.content
 
 
-async def call_llm(system_prompt: str, user_prompt: str) -> str:
+async def call_llm(system_prompt: str, user_prompt: str, images=None) -> str:
     if _use_gateway():
+        if images:
+            # The gateway's chat() takes text only.
+            print(f"  [TDD] images: the gateway path cannot send images; {len(images)} left out")
         return await _plan_via_gateway(system_prompt, user_prompt)
-    return await _plan_via_openai(system_prompt, user_prompt)
+    return await _plan_via_openai(system_prompt, user_prompt, images)
 
 
 def _model_for_loc(loc: tuple) -> type[BaseModel] | None:

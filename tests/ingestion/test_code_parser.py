@@ -156,19 +156,23 @@ def test_parse_repo_continues_after_one_file_fails(tmp_path, monkeypatch):
 
     import src.ingestion.code_parser as code_parser_module
 
-    real_parse_file = code_parser_module.parse_file
+    real_parse = code_parser_module.parse_source_full
 
-    def flaky_parse_file(path, repo_root, language):
-        if path.name == "bad.py":
+    def flaky_parse(source, file_path, language, searchable=True):
+        if file_path == "bad.py":
             raise ValueError("boom")
-        return real_parse_file(path, repo_root, language)
+        return real_parse(source, file_path, language, searchable)
 
-    monkeypatch.setattr(code_parser_module, "parse_file", flaky_parse_file)
+    monkeypatch.setattr(code_parser_module, "parse_source_full", flaky_parse)
     graph = code_parser_module.parse_repo(tmp_path, "orders")
 
     assert graph.files_failed == 1
     assert graph.files_parsed == 1
     assert any(f.name == "good_fn" for f in graph.functions)
+    # A failed parse no longer costs the file its node or its text.
+    assert graph.files["bad.py"].parse_status == "failed"
+    assert "boom" in graph.files["bad.py"].parse_error
+    assert graph.file_source["bad.py"] == "def bad_fn():\n    pass\n"
 
 
 def test_language_by_extension_covers_python_and_java():
@@ -313,36 +317,39 @@ def test_parse_file_small_function_has_exactly_one_chunk_covering_whole_body(tmp
     assert chunk.text == fn.source_snippet
 
 
-def test_parse_file_oversized_function_splits_into_multiple_anchored_chunks(tmp_path):
+def test_parse_file_oversized_function_splits_into_exact_line_chunks(tmp_path):
     src = tmp_path / "big.py"
     body_lines = "\n".join(f"    x{i} = {i} + total" for i in range(80))
-    src.write_text(f"def process_huge_order(total):\n{body_lines}\n    return total\n")
+    text = f"def process_huge_order(total):\n{body_lines}\n    return total\n"
+    src.write_text(text)
 
     fn = parse_file(src, tmp_path, "python")[0]
     assert len(fn.source_snippet) > _CHUNK_TARGET_CHARS
     assert len(fn.chunks) > 1
 
-    # chunks are in order, non-overlapping, and cover the whole function body
-    # (the def line itself is part of every multi-chunk's anchor TEXT, but
-    # not part of any chunk's own line range — only body statements are)
-    assert fn.chunks[0].line_start == fn.line_start + 1
+    # In order, non-overlapping, and together exactly the function's lines.
+    assert fn.chunks[0].line_start == fn.line_start
     assert fn.chunks[-1].line_end == fn.line_end
     for a, b in zip(fn.chunks, fn.chunks[1:]):
         assert a.index < b.index
-        assert a.line_end < b.line_start
+        assert a.line_end + 1 == b.line_start
 
-    # every chunk is anchored with the function's own signature, since a
-    # body-interior slice alone has no indication of which function it's from
+    # A chunk's text is exactly its lines: no signature prefix repeated in
+    # every chunk (embedding_text adds the name instead), and a header says
+    # where it sits.
+    lines = text.split("\n")
     for chunk in fn.chunks:
-        assert chunk.text.startswith(fn.signature)
+        assert chunk.text == "\n".join(lines[chunk.line_start - 1 : chunk.line_end])
+        assert "process_huge_order" in chunk.header
+    assert sum(c.text.count("def process_huge_order") for c in fn.chunks) == 1
 
-    # no chunk is wildly over target (a single oversized statement could
-    # still exceed it, but these are small single-line statements)
     for chunk in fn.chunks:
         assert len(chunk.text) <= _CHUNK_TARGET_CHARS * 1.5
 
 
-def test_parse_file_class_has_no_chunks(tmp_path):
+def test_parse_file_class_scaffolding_is_not_chunked(tmp_path):
+    """Once its methods take their own lines, what is left of this class is
+    `class OrderController:` — scaffolding, not a search target."""
     src = tmp_path / "controller.py"
     src.write_text(
         "class OrderController:\n"
@@ -585,18 +592,19 @@ def test_parse_repo_gives_every_file_a_node_whatever_its_extension(tmp_path):
     assert graph.file_chunks == {}
 
 
-def test_parse_repo_chunks_a_file_that_has_no_symbols(tmp_path):
+def test_parse_repo_chunks_a_constants_file(tmp_path):
     """Measured on ui: 3,369 of 10,285 parseable files produced no class and
     no function, every messages*.ts among them, and none of them existed in
-    the graph at all. A ticket quoting a label could match nothing."""
+    the graph at all. A ticket quoting a label could match nothing. The
+    exported object is now a symbol of its own, and owns its chunks."""
     body = "".join(f'  key{i}: "Comma-separated value {i}",\n' for i in range(200))
     (tmp_path / "messages.ts").write_text("export const messages = {\n" + body + "};\n")
 
     graph = parse_repo(tmp_path, "ui")
 
-    assert graph.tracked_files == {"messages.ts": "typescript"}
-    assert len(graph.file_chunks["messages.ts"]) > 1
-    assert "Comma-separated value 7" in "".join(c.text for c in graph.file_chunks["messages.ts"])
+    messages = next(v for v in graph.variables if v.name == "messages")
+    assert len(messages.chunks) > 1
+    assert "Comma-separated value 7" in "".join(c.text for c in messages.chunks)
 
 
 def test_parse_repo_does_not_chunk_a_tiny_barrel_file(tmp_path):
@@ -707,22 +715,30 @@ def test_parse_repo_stores_a_test_file_whole(tmp_path):
     )
 
 
-def test_parse_repo_stores_no_source_for_production_files(tmp_path):
-    """Their symbols are already extracted; storing both would double the
-    graph for nothing."""
+def test_parse_repo_stores_every_file_whole(tmp_path):
+    """Symbols alone left a fifth of all code lines out of the graph — the
+    imports, types and constants between them. Every text file is now
+    stored whole, whether a parser reads it or not."""
     (tmp_path / "view.tsx").write_text("export const view = () => null;\n")
+    (tmp_path / "V1__init.sql").write_text("create table orders (id uuid);\n")
 
     graph = parse_repo(tmp_path, "ui")
 
-    assert "view.tsx" not in graph.file_source
+    assert graph.file_source["view.tsx"] == "export const view = () => null;\n"
+    assert graph.file_source["V1__init.sql"] == "create table orders (id uuid);\n"
+    assert graph.files["V1__init.sql"].kind == "migration"
 
 
-def test_parse_repo_caps_a_long_test_file(tmp_path):
-    """One real suite covering a whole settings tab is 29,652 characters;
-    its first 6,000 are its imports and first fixture, the part worth
-    copying."""
-    (tmp_path / "big.test.tsx").write_text("x" * (code_parser.MAX_TEST_SOURCE_CHARS + 500))
+def test_parse_repo_stores_a_long_test_file_whole_and_does_not_embed_it(tmp_path):
+    """The 6,000-character cap is applied where the planner READS a test
+    (graph_reader.load_test_sources), not where it is stored. Test files
+    are never embedded: the planner's search excludes test code by design,
+    so their vectors were paid for and never read."""
+    text = 'it("works", () => {\n' + "  expect(1);\n" * 1000 + "});\n"
+    (tmp_path / "big.test.tsx").write_text(text)
 
     graph = parse_repo(tmp_path, "ui")
 
-    assert len(graph.file_source["big.test.tsx"]) == code_parser.MAX_TEST_SOURCE_CHARS
+    assert graph.file_source["big.test.tsx"] == text
+    assert all(not s.chunks for s in graph.symbols)
+    assert "big.test.tsx" not in graph.file_chunks

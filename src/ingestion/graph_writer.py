@@ -176,6 +176,43 @@ def set_service_dependencies(source: str, targets: list[str]) -> None:
         )
 
 
+def set_service_links(source: str, links: list[dict]) -> None:
+    """Replaces every outgoing CALLS edge from `source` with `links`:
+    [{"target", "via": ["kafka", "graphql", ...], "evidence": [...]}].
+
+    Same reconciliation as set_service_dependencies, but each edge now says
+    HOW the two services talk and names what proves it (a message type, an
+    operation, a route), so a reader can tell a real Kafka contract from a
+    service name that merely appears near the word "url"."""
+    with get_driver().session() as session:
+        session.run(
+            """
+            MATCH (a:Service {name: $source})
+            OPTIONAL MATCH (a)-[r:CALLS]->(:Service)
+            DELETE r
+            WITH DISTINCT a
+            UNWIND $links AS link
+            MATCH (b:Service {name: link.target})
+            MERGE (a)-[r:CALLS]->(b)
+            SET r.via = link.via, r.evidence = link.evidence
+            """,
+            source=source,
+            links=links,
+        )
+
+
+def set_service_coverage(name: str, coverage: dict) -> None:
+    """Records how completely the last full ingest captured this service —
+    files, code lines covered, unresolved imports — so a gap is visible on
+    the graph itself, not only in one run's log."""
+    with get_driver().session() as session:
+        session.run(
+            "MATCH (s:Service {name: $name}) SET s += $coverage",
+            name=name,
+            coverage={f"coverage_{k}": v for k, v in coverage.items()},
+        )
+
+
 def update_service_doc(name: str, doc: str, embedding: list[float], doc_hash: str) -> None:
     """Overwrite a Service node's committed description and its embedding.
 

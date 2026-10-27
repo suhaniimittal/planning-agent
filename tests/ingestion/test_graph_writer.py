@@ -194,3 +194,15 @@ def test_set_service_commit_writes_commit_sha_and_timestamp(monkeypatch):
     assert params["commit_sha"] == "abc123"
     assert params["name"] == "orders"
     assert isinstance(params["last_ingested_at"], str) and params["last_ingested_at"]
+
+
+def test_set_service_links_replaces_calls_with_how_services_talk(monkeypatch):
+    driver = _patch_driver(monkeypatch)
+    links = [{"target": "rhino-service", "via": ["kafka"], "evidence": ["UpdateHighRisk"]}]
+
+    graph_writer.set_service_links("orders-service", links)
+
+    query, params = driver._session.queries[0]
+    assert "OPTIONAL MATCH (a)-[r:CALLS]->(:Service)" in query
+    assert "SET r.via = link.via, r.evidence = link.evidence" in query
+    assert params == {"source": "orders-service", "links": links}

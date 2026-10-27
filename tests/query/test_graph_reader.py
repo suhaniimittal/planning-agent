@@ -410,8 +410,10 @@ def test_load_test_sources_returns_the_stored_text_per_file(monkeypatch):
 
     assert found == {("ui", "a/view.test.tsx"): "const settings = {...}"}
     query = driver._session.last_query
-    # only files that actually carry text — production files never do
     assert "f.source IS NOT NULL AND f.source <> ''" in query
+    # Every file is stored whole since pipeline version 4; the planner is
+    # still shown at most the first MAX_TEST_SOURCE_CHARS of a test.
+    assert "substring(f.source, 0, $cap)" in query
 
 
 def test_load_test_sources_asks_nothing_for_an_empty_list(monkeypatch):
@@ -429,3 +431,12 @@ def test_tests_naming_drops_a_term_that_matches_too_many_specs(monkeypatch):
     query = driver._session.last_query
     assert "WHERE size(paths) <= $max_files" in query
     assert driver._session.last_params["max_files"] == 10
+
+
+def test_find_symbol_files_also_finds_top_level_constants(monkeypatch):
+    """A styled component is a Variable node since pipeline version 4; the
+    verify step once called an existing one "new"."""
+    driver = _patch_driver(monkeypatch, [{"file_path": "grid/styles.ts"}])
+
+    assert graph_reader.find_symbol_files("ui", "SearchAndButtonWrap") == ["grid/styles.ts"]
+    assert "MATCH (n:Variable {service: $service})" in driver._session.last_query

@@ -628,3 +628,21 @@ def test_a_change_with_no_symbol_renders_as_the_file_itself():
 
     assert "the file itself" in text
     assert "None" not in text.split("SERVICES AND CHANGES")[1].split("FILES TO CHANGE")[0]
+
+
+def test_the_architecture_lists_only_calls_of_a_changing_service():
+    from src.query.render import _architecture_parts
+
+    parts = _architecture_parts(
+        [ArchComponent(name="ui", depends_on=["reports-api"]),
+         ArchComponent(name="accounts-service", depends_on=["models"]),
+         ArchComponent(name="postgres")],
+        [ServiceDependency(source="ui", target="reports-api"),
+         ServiceDependency(source="accounts-service", target="models")],
+        changed={"ui"},
+        services={"ui", "reports-api", "accounts-service", "models"},
+    )
+
+    assert parts[0] == "Components:\n  ui, postgres, reports-api"
+    assert "accounts-service" not in parts[1] and "proposed" not in parts[1]
+    assert parts[1] == "Calls:\n  ui --> reports-api   (verified in the code graph)"

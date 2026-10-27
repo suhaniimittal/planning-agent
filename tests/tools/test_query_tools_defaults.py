@@ -34,4 +34,34 @@ def test_the_form_does_not_offer_top_k_or_hops():
     triggers = json.loads((_ROOT / "src" / "agent" / "metadata.json").read_text())["config"][
         "triggers"
     ]
-    assert [t["name"] for t in triggers] == ["issue_text", "repos"]
+    assert [t["name"] for t in triggers] == ["issue_text", "repos", "uploaded_files"]
+
+
+def test_screenshots_are_an_optional_upload_of_several_images():
+    triggers = json.loads((_ROOT / "src" / "agent" / "metadata.json").read_text())["config"][
+        "triggers"
+    ]
+    shots = next(t for t in triggers if t["name"] == "uploaded_files")
+    assert shots["type"] == "file" and shots["required"] is False and shots["multiple"] is True
+    assert ".png" in shots["accepts"]
+
+
+def test_running_locally_a_screenshot_can_be_a_path_on_this_machine(tmp_path, monkeypatch):
+    from src.tools import query_tools
+
+    def missing(bucket, key, mode):
+        raise KeyError("NoSuchKey")
+
+    monkeypatch.setattr(query_tools.storage, "retrieve", missing)
+    shot = tmp_path / "ss1.png"
+    shot.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    monkeypatch.setenv("APP_ENV", "local")
+    assert query_tools._read_upload("docs", str(shot)) == b"\x89PNG\r\n\x1a\n"
+
+    monkeypatch.setenv("APP_ENV", "production")
+    try:
+        query_tools._read_upload("docs", str(shot))
+        raise AssertionError("a local path was read outside local mode")
+    except KeyError:
+        pass

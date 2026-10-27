@@ -541,3 +541,32 @@ def test_lookup_terms_keep_the_longest_when_a_symbol_names_many():
     assert len(terms) == query_flow._MAX_TEST_LOOKUP_TERMS
     assert f"name{'x' * 29}Thing" in terms
     assert "namexThing" not in terms
+
+
+def test_the_architecture_lists_only_the_links_of_services_that_change():
+    from src.query.models import TechnicalDesignDoc
+
+    tdd = TechnicalDesignDoc.model_validate({
+        "title": "t", "issue_summary": "s", "overall_reasoning": "r",
+        "services": [
+            {"service": "ui", "complexity": "low", "reasoning": "r", "changes": [
+                {"file_path": "a.tsx", "change_description": "c", "implementation_notes": "n",
+                 "pseudocode_sketch": "p", "reasoning": "r"}]},
+            {"service": "reports-api", "complexity": "low", "reasoning": "no change"},
+            {"service": "models", "complexity": "low", "reasoning": "no change"},
+        ],
+    })
+    edges = [{"source": "ui", "target": "reports-api"},
+             {"source": "reports-api", "target": "ui"},
+             {"source": "reports-api", "target": "models"}]
+
+    links = query_flow._links_of_changed_services(tdd, edges)
+
+    assert [(d.source, d.target) for d in links] == [("ui", "reports-api"), ("reports-api", "ui")]
+
+
+def test_new_tests_are_off_unless_asked_for(monkeypatch):
+    monkeypatch.delenv("PLANNER_NEW_TESTS", raising=False)
+    assert query_flow._new_tests() is False
+    monkeypatch.setenv("PLANNER_NEW_TESTS", "on")
+    assert query_flow._new_tests() is True

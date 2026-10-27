@@ -6,6 +6,7 @@ kept separate since the two paths have different callers and failure modes
 
 from __future__ import annotations
 
+from src.ingestion.code_parser import MAX_TEST_SOURCE_CHARS
 from src.ingestion.graph_writer import get_driver
 from src.ingestion.test_paths import CYPHER_SPEC_FILE_RE, CYPHER_TEST_PATH_RE, is_test_path
 
@@ -109,14 +110,14 @@ def load_code_symbols_for_services(names: list[str]) -> list[dict]:
         result = session.run(
             """
             MATCH (n)
-            WHERE (n:Class OR n:Function) AND n.service IN $names
+            WHERE (n:Class OR n:Function OR n:Variable) AND n.service IN $names
             RETURN n.service AS service, n.qualified_name AS qualified_name,
                    n.name AS name, n.file_path AS file_path,
                    n.line_start AS line_start, n.line_end AS line_end,
                    n.signature AS signature, n.docstring AS docstring,
                    n.language AS language,
                    n.is_method AS is_method, n.parent_class AS parent_class,
-                   labels(n)[0] AS kind
+                   [l IN labels(n) WHERE l <> 'Symbol'][0] AS kind
             """,
             names=names,
         )
@@ -179,7 +180,7 @@ def load_source_snippets(
             """
             UNWIND $rows AS row
             MATCH (n)
-            WHERE (n:Class OR n:Function)
+            WHERE (n:Class OR n:Function OR n:Variable)
               AND n.service = row.service AND n.qualified_name = row.qualified_name
             RETURN n.service AS service, n.qualified_name AS qualified_name,
                    n.source_snippet AS source_snippet
@@ -217,9 +218,13 @@ def folder_exists(service: str, folder: str) -> bool:
 
 
 def find_symbol_files(service: str, symbol: str) -> list[str]:
-    """Every file in `service` defining a Class/Function named `symbol` —
-    matched by plain name ("view") or by its qualified_name's tail
-    ("PreAdverseActionModal.view"), the two forms the LLM is shown."""
+    """Every file in `service` defining a Class/Function/Variable named
+    `symbol` — matched by plain name ("view") or by its qualified_name's tail
+    ("PreAdverseActionModal.view"), the two forms the LLM is shown.
+
+    Variable is included because since pipeline version 4 a top-level
+    constant is its own node: a styled component like `SearchAndButtonWrap`
+    was otherwise reported as "not in the file today" while it was."""
     with get_driver().session() as session:
         result = session.run(
             """
@@ -229,6 +234,11 @@ def find_symbol_files(service: str, symbol: str) -> list[str]:
             RETURN n.file_path AS file_path
             UNION
             MATCH (n:Function {service: $service})
+            WHERE n.name = $symbol OR n.qualified_name ENDS WITH $by_file
+               OR n.qualified_name ENDS WITH $by_class
+            RETURN n.file_path AS file_path
+            UNION
+            MATCH (n:Variable {service: $service})
             WHERE n.name = $symbol OR n.qualified_name ENDS WITH $by_file
                OR n.qualified_name ENDS WITH $by_class
             RETURN n.file_path AS file_path
@@ -295,11 +305,11 @@ def search_service_chunks(
     code_search.rank_functions' cap, which decides how much source reaches
     the prompt.
 
-    A chunk of a file that holds no class and no function has no Function
-    parent, so the join is OPTIONAL and such a chunk reports its FILE PATH
-    where a function's chunk reports its qualified name. Without that, a
-    third of ui — every messages.ts among them — would score and then be
-    silently dropped from the results.
+    A chunk reports the symbol that owns its lines (stored on the chunk as
+    `function_qualified_name` — a function, or since pipeline version 4 any
+    symbol that owns lines), and a chunk of lines no symbol owns reports its
+    FILE PATH instead. Without that, a third of ui — every messages.ts among
+    them — would score and then be silently dropped from the results.
 
     Returns [{"function_qualified_name", "text", "score", "identifiers"}].
     """
@@ -316,8 +326,7 @@ def search_service_chunks(
             WHERE {_NOT_TEST}
             WITH c, {score} AS score
             ORDER BY score DESC LIMIT $k
-            OPTIONAL MATCH (f:Function)-[:HAS_CHUNK]->(c)
-            RETURN coalesce(f.qualified_name, c.file_path) AS function_qualified_name,
+            RETURN coalesce(c.function_qualified_name, c.file_path) AS function_qualified_name,
                    c.text AS text, score, [] AS identifiers
             """,
             k=k,
@@ -330,8 +339,7 @@ def search_service_chunks(
                 MATCH (c:Chunk {{service: $service}})
                 WHERE any(w IN $identifiers WHERE c.text CONTAINS w) AND {_NOT_TEST}
                 WITH c, {score} AS score
-                OPTIONAL MATCH (f:Function)-[:HAS_CHUNK]->(c)
-                RETURN coalesce(f.qualified_name, c.file_path) AS function_qualified_name,
+                RETURN coalesce(c.function_qualified_name, c.file_path) AS function_qualified_name,
                        c.text AS text, score,
                        [w IN $identifiers WHERE c.text CONTAINS w] AS identifiers
                 LIMIT 200
@@ -361,7 +369,7 @@ def load_symbols(service_qualified_name_pairs: list[tuple[str, str]]) -> list[di
             """
             UNWIND $rows AS row
             MATCH (n)
-            WHERE (n:Class OR n:Function)
+            WHERE (n:Class OR n:Function OR n:Variable)
               AND n.service = row.service AND n.qualified_name = row.qualified_name
             RETURN n.service AS service, n.qualified_name AS qualified_name,
                    n.name AS name, n.file_path AS file_path,
@@ -369,7 +377,7 @@ def load_symbols(service_qualified_name_pairs: list[tuple[str, str]]) -> list[di
                    n.signature AS signature, n.docstring AS docstring,
                    n.language AS language, n.source_snippet AS source_snippet,
                    n.is_method AS is_method, n.parent_class AS parent_class,
-                   labels(n)[0] AS kind
+                   [l IN labels(n) WHERE l <> 'Symbol'][0] AS kind
             """,
             rows=rows,
         )
@@ -623,7 +631,8 @@ def load_test_sources(
 ) -> dict[tuple[str, str], str]:
     """{(service, file_path): that test file's stored text}, empty dropped.
 
-    Only test files carry `source` (see RepoGraph.file_source). Everything a
+    Capped at MAX_TEST_SOURCE_CHARS here, at read time: since pipeline
+    version 4 every file's text is stored whole. Everything a
     planner gets wrong when writing a test lives here and nowhere else: the
     complete fixture object, which props must be set for the component to
     render at all, the shape of the payload a callback receives, and whether
@@ -640,9 +649,11 @@ def load_test_sources(
             UNWIND $rows AS row
             MATCH (f:File {service: row.service, file_path: row.file_path})
             WHERE f.source IS NOT NULL AND f.source <> ''
-            RETURN row.service AS service, row.file_path AS file_path, f.source AS source
+            RETURN row.service AS service, row.file_path AS file_path,
+                   substring(f.source, 0, $cap) AS source
             """,
             rows=rows,
+            cap=MAX_TEST_SOURCE_CHARS,
         )
         return {(r["service"], r["file_path"]): r["source"] for r in result}
 
@@ -761,3 +772,408 @@ def load_sibling_tests(
         for path in paths:
             siblings[(service, path)] = [t for t in tests if t != path]
     return siblings
+
+
+# --- planner v2: whole files and the links between them -----------------------
+#
+# Everything below reads what ingestion pipeline version 4 writes: File.source,
+# the IMPORTS/REFERENCES/TESTS edges, tables, operations, routes and Kafka
+# messages. On an older graph these return nothing, which is why
+# query_flow checks pipeline_versions() before taking the v2 path.
+
+
+def _pair_rows(pairs: list[tuple[str, str]]) -> list[dict]:
+    return [{"service": s, "file_path": p} for s, p in pairs]
+
+
+def pipeline_versions(names: list[str]) -> dict[str, int | None]:
+    with get_driver().session() as session:
+        result = session.run(
+            "MATCH (s:Service) WHERE s.name IN $names "
+            "RETURN s.name AS name, s.pipeline_version AS version",
+            names=names,
+        )
+        return {r["name"]: r["version"] for r in result}
+
+
+def load_file_sources(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+    """{(service, path): {"source", "line_count", "kind", "truncated"}}."""
+    if not pairs:
+        return {}
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (f:File {service: row.service, file_path: row.file_path})
+            RETURN row.service AS service, row.file_path AS file_path,
+                   coalesce(f.source, '') AS source, f.line_count AS line_count,
+                   f.kind AS kind, coalesce(f.truncated, false) AS truncated
+            """,
+            rows=_pair_rows(pairs),
+        )
+        return {(r["service"], r["file_path"]): dict(r) for r in result}
+
+
+def load_file_symbols(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], list[dict]]:
+    """Every symbol declared in each file, in line order — the outline the
+    planner picks `function_or_symbol` from."""
+    if not pairs:
+        return {}
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (n:Symbol)
+            WHERE n.service = row.service AND n.file_path = row.file_path
+            RETURN row.service AS service, row.file_path AS file_path,
+                   n.name AS name, n.qualified_name AS qualified_name,
+                   [l IN labels(n) WHERE l <> 'Symbol'][0] AS label,
+                   n.symbol_kind AS symbol_kind, n.line_start AS line_start,
+                   n.line_end AS line_end, n.parent_symbol AS parent_symbol
+            ORDER BY n.line_start
+            """,
+            rows=_pair_rows(pairs),
+        )
+        found: dict[tuple[str, str], list[dict]] = {}
+        for r in result:
+            found.setdefault((r["service"], r["file_path"]), []).append(dict(r))
+        return found
+
+
+def imports_of(pairs: list[tuple[str, str]]) -> list[dict]:
+    """The local files each file imports, with the names it takes."""
+    if not pairs:
+        return []
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (a:File {service: row.service, file_path: row.file_path})-[r:IMPORTS]->(b:File)
+            RETURN row.service AS service, a.file_path AS source, b.file_path AS target,
+                   coalesce(r.names, []) AS names, b.kind AS kind
+            """,
+            rows=_pair_rows(pairs),
+        )
+        return [dict(r) for r in result]
+
+
+def tests_of(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], list[str]]:
+    """{(service, path): test files with a TESTS edge to it}."""
+    if not pairs:
+        return {}
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (t:File)-[:TESTS]->(f:File {service: row.service, file_path: row.file_path})
+            RETURN row.service AS service, row.file_path AS file_path,
+                   collect(t.file_path) AS tests
+            """,
+            rows=_pair_rows(pairs),
+        )
+        return {(r["service"], r["file_path"]): sorted(r["tests"]) for r in result}
+
+
+def references_from(pairs: list[tuple[str, str]]) -> list[dict]:
+    """Other files of the same service whose symbols these files' symbols
+    reference, most-referenced first. Reaches what an import cannot: a
+    Kotlin class used from the same package needs no import at all."""
+    if not pairs:
+        return []
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (a:Symbol)-[:REFERENCES]->(b:Symbol)
+            WHERE a.service = row.service AND a.file_path = row.file_path
+              AND b.file_path <> row.file_path
+            RETURN row.service AS service, row.file_path AS source, b.file_path AS target,
+                   count(*) AS refs, collect(DISTINCT b.name)[..8] AS names
+            ORDER BY refs DESC
+            """,
+            rows=_pair_rows(pairs),
+        )
+        return [dict(r) for r in result]
+
+
+def cross_service_links(pairs: list[tuple[str, str]]) -> list[dict]:
+    """The files at the other end of every concrete link out of these files:
+    the handlers and publishers of the Kafka messages their classes send or
+    receive (and the message's Avro schema), the resolver of a GraphQL
+    operation they use (or the clients of one they resolve), and the
+    controller of a route they call.
+
+    Returns [{"from_service", "from_file", "service", "file_path", "reason"}]."""
+    if not pairs:
+        return []
+    rows = _pair_rows(pairs)
+    queries = [
+        # Kafka: the other side of every message, and its schema.
+        """
+        UNWIND $rows AS row
+        MATCH (c:Class {service: row.service, file_path: row.file_path})-[r1:HANDLES|PUBLISHES]->(m:Message)
+        MATCH (o:Class)-[r2:HANDLES|PUBLISHES]->(m)
+        WHERE NOT (o.service = c.service AND o.file_path = c.file_path)
+        RETURN row.service AS from_service, row.file_path AS from_file,
+               o.service AS service, o.file_path AS file_path,
+               toLower(type(r2)) + ' ' + coalesce(m.short_name, m.name) + ' (' + c.name + ' ' +
+               toLower(type(r1)) + ' it)' AS reason
+        """,
+        """
+        UNWIND $rows AS row
+        MATCH (c:Class {service: row.service, file_path: row.file_path})-[:HANDLES|PUBLISHES]->(m:Message)
+        WHERE m.defined_in IS NOT NULL
+        RETURN row.service AS from_service, row.file_path AS from_file,
+               m.defined_in_service AS service, m.defined_in AS file_path,
+               'Avro schema of ' + coalesce(m.short_name, m.name) AS reason
+        """,
+        # GraphQL: client file -> the resolver and the schema of what it uses.
+        """
+        UNWIND $rows AS row
+        MATCH (f:File {service: row.service, file_path: row.file_path})-[:USES_OPERATION]->(o:Operation)
+        OPTIONAL MATCH (r:Symbol)-[:RESOLVES]->(o)
+        WITH row, o, collect(DISTINCT r.file_path) AS resolvers
+        UNWIND (resolvers + [o.file_path]) AS target
+        WITH row, o, target WHERE target IS NOT NULL
+        RETURN row.service AS from_service, row.file_path AS from_file,
+               o.service AS service, target AS file_path,
+               'serves ' + o.type + '.' + o.name + ' used here' AS reason
+        """,
+        # GraphQL: resolver -> the client files that use what it serves.
+        """
+        UNWIND $rows AS row
+        MATCH (s:Symbol)-[:RESOLVES]->(o:Operation)<-[:USES_OPERATION]-(f:File)
+        WHERE s.service = row.service AND s.file_path = row.file_path
+        WITH row, o, collect(DISTINCT f)[..3] AS clients
+        UNWIND clients AS f
+        RETURN row.service AS from_service, row.file_path AS from_file,
+               f.service AS service, f.file_path AS file_path,
+               'uses ' + o.type + '.' + o.name + ' resolved here' AS reason
+        """,
+        # REST: caller -> controller.
+        """
+        UNWIND $rows AS row
+        MATCH (f:File {service: row.service, file_path: row.file_path})-[:CALLS_ENDPOINT]->(e:Endpoint)<-[:SERVES]-(m:Symbol)
+        RETURN row.service AS from_service, row.file_path AS from_file,
+               m.service AS service, m.file_path AS file_path,
+               'serves ' + e.method + ' ' + e.path + ' called here' AS reason
+        """,
+    ]
+    found: list[dict] = []
+    with get_driver().session() as session:
+        for query in queries:
+            found += [dict(r) for r in session.run(query, rows=rows)]
+    return found
+
+
+def tables_for(pairs: list[tuple[str, str]]) -> list[dict]:
+    """Tables the symbols in these files map to, read or write, with the
+    entity classes mapped to them (whose files show the column mapping)."""
+    if not pairs:
+        return []
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (s:Symbol)-[r:READS|WRITES|MAPS_TO]->(t:Table)
+            WHERE s.service = row.service AND s.file_path = row.file_path
+            WITH t, collect(DISTINCT row.file_path + ' ' + toLower(type(r))) AS used_by
+            OPTIONAL MATCH (e:Class)-[:MAPS_TO]->(t)
+            RETURN t.service AS service, t.name AS name, t.columns AS columns,
+                   t.foreign_keys AS foreign_keys, t.defined_in AS defined_in, used_by,
+                   collect(DISTINCT e.file_path) AS entity_files
+            """,
+            rows=_pair_rows(pairs),
+        )
+        return [dict(r) for r in result]
+
+
+def get_edges_with_evidence(names: list[str]) -> list[dict]:
+    """CALLS edges among `names`, with how the services talk (`via`) and
+    what proves it (`evidence`) where pipeline version 4 recorded it."""
+    if not names:
+        return []
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            MATCH (a:Service)-[r:CALLS]->(b:Service)
+            WHERE a.name IN $names AND b.name IN $names
+            RETURN a.name AS source, b.name AS target,
+                   coalesce(r.via, []) AS via, coalesce(r.evidence, []) AS evidence
+            ORDER BY source, target
+            """,
+            names=names,
+        )
+        return [dict(r) for r in result]
+
+
+def file_relevance(
+    pairs: list[tuple[str, str]], vectors: list[list[float]]
+) -> dict[tuple[str, str], float]:
+    """{(service, path): how closely the file's best chunk matches the
+    ticket} — the same best-cosine score search_service_chunks uses. Ranks
+    the files a focus file imports, so the one that matters to this ticket
+    (the grid rendering the button) is not cut behind thirty utilities."""
+    if not pairs or not vectors:
+        return {}
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (c:Chunk)
+            WHERE c.service = row.service AND c.qualified_name STARTS WITH row.file_path + '::'
+            WITH row, max(reduce(best = 0.0, v IN $vectors |
+                 CASE WHEN vector.similarity.cosine(c.embedding, v) > best
+                 THEN vector.similarity.cosine(c.embedding, v) ELSE best END)) AS score
+            RETURN row.service AS service, row.file_path AS file_path, score
+            """,
+            rows=_pair_rows(pairs),
+            vectors=vectors,
+        )
+        return {(r["service"], r["file_path"]): r["score"] or 0.0 for r in result}
+
+
+def file_relevance_by_vector(
+    pairs: list[tuple[str, str]], vectors: list[list[float]]
+) -> dict[tuple[str, str], list[float]]:
+    """{(service, path): [best chunk cosine against each vector]} — one score
+    per part of the ticket, so each part can find its own best file. A file
+    with no chunks (a test, a tiny barrel, generated code) is absent."""
+    if not pairs or not vectors:
+        return {}
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (c:Chunk)
+            WHERE c.service = row.service AND c.qualified_name STARTS WITH row.file_path + '::'
+            WITH row, [v IN $vectors | vector.similarity.cosine(c.embedding, v)] AS sims
+            WITH row, collect(sims) AS all_sims
+            RETURN row.service AS service, row.file_path AS file_path,
+                   [i IN range(0, size($vectors) - 1) |
+                    reduce(best = 0.0, s IN all_sims | CASE WHEN s[i] > best THEN s[i] ELSE best END)
+                   ] AS scores
+            """,
+            rows=_pair_rows(pairs),
+            vectors=vectors,
+        )
+        return {(r["service"], r["file_path"]): list(r["scores"]) for r in result}
+
+
+def importers_of(pairs: list[tuple[str, str]], limit: int = 10) -> dict[tuple[str, str], dict]:
+    """{(service, path): {"count", "files"}} — every file that imports each
+    one, so the planner can see who a change to a shared file reaches
+    instead of guessing (a TDD once warned that other screens pass a prop
+    to a grid component, when none did)."""
+    if not pairs:
+        return {}
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (a:File)-[:IMPORTS]->(b:File {service: row.service, file_path: row.file_path})
+            WITH row, collect(DISTINCT a.file_path) AS importers
+            RETURN row.service AS service, row.file_path AS file_path,
+                   size(importers) AS count, importers[..$limit] AS files
+            """,
+            rows=_pair_rows(pairs),
+            limit=limit,
+        )
+        return {
+            (r["service"], r["file_path"]): {"count": r["count"], "files": sorted(r["files"])}
+            for r in result
+        }
+
+
+# --- reads behind the planner's lookup tools (tool_loop.py) -------------------
+
+
+def find_files(service: str, fragment: str, limit: int = 10) -> list[str]:
+    """Files of `service` whose path contains `fragment`, shortest first —
+    what a lookup of a path that does not exist (an import alias such as
+    "@client/components/InfiniteScrollGrid") is answered with."""
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            MATCH (f:File {service: $service}) WHERE f.file_path CONTAINS $fragment
+            RETURN f.file_path AS file_path ORDER BY size(f.file_path), f.file_path LIMIT $limit
+            """,
+            service=service, fragment=fragment, limit=limit,
+        )
+        return [r["file_path"] for r in result]
+
+
+def usages_of(service: str, symbol: str, limit: int = 30) -> list[dict]:
+    """Where `symbol` of `service` is used: symbols that reference it, and
+    files that import it by name. [{"service", "file_path", "by"}]."""
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            MATCH (a:Symbol)-[:REFERENCES]->(b:Symbol {service: $service})
+            WHERE b.name = $symbol OR b.qualified_name ENDS WITH '::' + $symbol
+               OR b.qualified_name ENDS WITH '.' + $symbol
+            RETURN DISTINCT a.service AS service, a.file_path AS file_path, a.name AS by
+            UNION
+            MATCH (a:File)-[r:IMPORTS]->(:File {service: $service})
+            WHERE $symbol IN coalesce(r.names, [])
+            RETURN DISTINCT a.service AS service, a.file_path AS file_path, 'import' AS by
+            """,
+            service=service, symbol=symbol,
+        )
+        return [dict(r) for r in result][:limit]
+
+
+def tables_named(name: str, services: list[str]) -> list[dict]:
+    """Tables of `services` whose name is `name` or ends with ".name", with
+    the symbols that read, write or map to them."""
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            MATCH (t:Table) WHERE t.service IN $services
+              AND (toLower(t.name) = toLower($name) OR toLower(t.name) ENDS WITH '.' + toLower($name))
+            OPTIONAL MATCH (s:Symbol)-[r:READS|WRITES|MAPS_TO]->(t)
+            RETURN t.service AS service, t.name AS name, t.columns AS columns,
+                   t.foreign_keys AS foreign_keys, t.defined_in AS defined_in,
+                   collect(DISTINCT s.file_path + ' ' + toLower(type(r)))[..20] AS used_by
+            """,
+            name=name, services=services,
+        )
+        return [dict(r) for r in result]
+
+
+def messages_named(name: str) -> list[dict]:
+    """Kafka messages named `name` (full or short name): their schema, topic,
+    and the classes that publish or handle them."""
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            MATCH (m:Message) WHERE m.name = $name OR m.short_name = $name
+            OPTIONAL MATCH (m)-[:ON_TOPIC]->(t:Topic)
+            OPTIONAL MATCH (c:Class)-[r:HANDLES|PUBLISHES]->(m)
+            RETURN m.name AS name, m.defined_in_service AS schema_service,
+                   m.defined_in AS schema_file, collect(DISTINCT t.name) AS topics,
+                   collect(DISTINCT {service: c.service, file_path: c.file_path,
+                                     class: c.name, how: toLower(type(r))}) AS users
+            """,
+            name=name,
+        )
+        return [dict(r) for r in result]
+
+
+def find_text(services: list[str], text: str, limit: int = 20) -> list[dict]:
+    """Files of `services` whose source contains `text` exactly, with up to
+    five of the lines it is on. [{"service", "file_path", "hits": [{"line",
+    "text"}]}]."""
+    with get_driver().session() as session:
+        result = session.run(
+            """
+            MATCH (f:File) WHERE f.service IN $services AND f.source CONTAINS $text
+            WITH f, split(f.source, '\n') AS lines
+            ORDER BY f.service, f.file_path LIMIT $limit
+            RETURN f.service AS service, f.file_path AS file_path,
+                   [i IN range(0, size(lines) - 1) WHERE lines[i] CONTAINS $text |
+                    {line: i + 1, text: lines[i]}][..5] AS hits
+            """,
+            services=services, text=text, limit=limit,
+        )
+        return [dict(r) for r in result]

@@ -9,13 +9,167 @@ Mirrors how ingest.py orchestrates over embedder.py/graph_writer.py.
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import UTC, datetime
 
 from src.ingestion.embedder import embed_many
 
-from . import code_search, graph_reader, issue_split, planner
+from . import (
+    answer_checks,
+    code_search,
+    context_v2,
+    graph_reader,
+    issue_split,
+    planner,
+    prompt_v2,
+    ticket_points,
+    tool_loop,
+)
 from .models import ServiceDependency, TechnicalDesignDoc
 from .verify import verify_tdd
+
+# The planner v2 path (whole files, one budget, the sectioned prompt) runs
+# only when PLANNER_MODE=v2, so both can be compared on the same tickets
+# before v2 becomes the default. It reads what ingestion pipeline version 4
+# writes, so it needs every selected service ingested at that version.
+_V2_MIN_PIPELINE_VERSION = 4
+
+
+def _use_v2(selected: list[str]) -> bool:
+    if os.environ.get("PLANNER_MODE", "v1").strip().lower() != "v2":
+        return False
+    versions = graph_reader.pipeline_versions(selected)
+    stale = sorted(s for s in selected if (versions.get(s) or 0) < _V2_MIN_PIPELINE_VERSION)
+    if stale:
+        print(
+            f"  [TDD] PLANNER_MODE=v2 needs every selected service ingested at pipeline "
+            f"version {_V2_MIN_PIPELINE_VERSION}; not yet: {stale}. Using v1."
+        )
+        return False
+    return True
+
+
+def _new_tests() -> bool:
+    """Whether the TDD may ask for new tests (PLANNER_NEW_TESTS, off unless
+    set). Off until the coding agent can run a test before pushing it: its
+    copy of a repo has no dependencies installed, so a new test's first run
+    was CI, where it failed. Existing tests a change breaks are updated
+    either way."""
+    return os.environ.get("PLANNER_NEW_TESTS", "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def _print_context_debug(context: context_v2.Context) -> None:
+    print(f"  [TDD v2] {len(context.files)} files, {context.used:,}/{context.budget:,} chars:")
+    for f in context.files:
+        print(f"    [{f.tier:9}] {f.status:7} {len(f.text):>7,}  {f.service}/{f.path}  — {f.reason}")
+    for t in context.tables:
+        print(f"    [table    ] {t['service']}.{t['name']}")
+    if context.left_out:
+        print(f"    left out ({len(context.left_out)}), best first:")
+        for service, path, tier, score in context.left_out[:15]:
+            print(f"      {score:.3f} [{tier}] {service}/{path}")
+
+
+async def _build_tdd_v2(
+    issue_text: str,
+    mode: str,
+    identifiers: list[str],
+    selected: list[str],
+    candidate_docs: list[dict],
+    ranked_by_service: dict[str, list[dict]],
+    service_names: list[str] | None,
+    debug_dump_prompts: bool,
+    vectors: list[list[float]] | None = None,
+    images: list | None = None,
+) -> TechnicalDesignDoc:
+    """The v2 planner: whole files chosen by context_v2, the sectioned
+    prompt from prompt_v2, then the same verification as v1."""
+    # Listed while the context is chosen: neither needs the other.
+    points_task = asyncio.create_task(ticket_points.extract(issue_text))
+    context = await asyncio.to_thread(
+        context_v2.build_context,
+        {s: ranked_by_service[s] for s in selected},
+        service_names,
+        vectors=vectors,
+    )
+    # A service reached only through a link (a Kafka handler, a resolver)
+    # gets its summary too, and a verdict.
+    involved = list(dict.fromkeys(selected + context.services()))
+    docs = list(candidate_docs)
+    missing = [s for s in involved if s not in {d["name"] for d in docs}]
+    if missing:
+        docs += graph_reader.load_candidate_docs(missing)
+    known_dependencies = graph_reader.get_edges_with_evidence(involved)
+
+    new_tests = _new_tests()
+    use_loop = tool_loop.enabled()
+    if use_loop and planner._use_gateway():
+        print("  [loop] PLANNER_LOOP is on, but the gateway path has no loop yet: one call")
+        use_loop = False
+    system_prompt = prompt_v2.build_system_prompt(
+        mode,
+        value_trace=context_v2.names_a_value(issue_text, identifiers),
+        stored_data=bool(context.tables),
+        test_writing=context.has_tests,
+        lookups=(tool_loop.MAX_ROUNDS, tool_loop.MAX_LOOKUPS) if use_loop else None,
+        new_tests=new_tests,
+    )
+    points = await points_task
+    if points:
+        print(f"  [TDD] ticket points ({len(points)}): " + " | ".join(points))
+    user_prompt = prompt_v2.build_user_prompt(
+        issue_text, docs, context, known_dependencies, points,
+        # The gateway takes text only: no images, so no note that they follow.
+        image_names=None if planner._use_gateway() else [image.name for image in images or []],
+    )
+    _print_context_debug(context)
+    print(f"  [TDD v2] prompt: {len(system_prompt):,} + {len(user_prompt):,} chars")
+    if debug_dump_prompts:
+        with open("llm_system_prompt.txt", "w") as f:
+            f.write(system_prompt)
+        with open("llm_user_prompt.txt", "w") as f:
+            f.write(user_prompt)
+
+    raw = None
+    if use_loop:
+        lookups = tool_loop.Lookups(services=service_names or involved, context=context)
+        try:
+            result = await tool_loop.run(
+                system_prompt, user_prompt, lookups,
+                check=answer_checks.check_for(points, new_tests=new_tests),
+                recheck=prompt_v2.RECHECK, images=images,
+            )
+            raw = result.raw
+            # What it read counts as shown, for verification.
+            context.files += lookups.files
+            print(f"  [loop] answered in round {result.rounds} after {lookups.count} lookups "
+                  f"({lookups.chars:,} chars), {result.send_backs} sent back, "
+                  f"re-checked: {'yes' if result.rechecked else 'no'}")
+        except Exception as error:  # the single call is always there to fall back on
+            print(f"  [loop] failed ({error!r}); falling back to one call")
+            system_prompt = prompt_v2.build_system_prompt(
+                mode,
+                value_trace=context_v2.names_a_value(issue_text, identifiers),
+                stored_data=bool(context.tables),
+                test_writing=context.has_tests,
+                new_tests=new_tests,
+            )
+    if raw is None:
+        raw = await planner.call_llm(system_prompt, user_prompt, images)
+    tdd = planner.parse_tdd(raw)
+    tdd.generated_at = datetime.now(UTC).isoformat()
+    if missing := ticket_points.note_uncovered(tdd, points):
+        print(f"  [TDD] ticket points still unanswered: {missing} (added to open questions)")
+    tdd.service_dependencies = _links_of_changed_services(
+        tdd, graph_reader.get_edges_among(_referenced_service_names(tdd))
+    )
+    citable = context.symbol_names_by_service()
+    for service_plan in tdd.services:
+        names = citable.get(service_plan.service, set())
+        for change in service_plan.changes:
+            change.has_real_source = change.function_or_symbol in names
+    verify_tdd(tdd, context.shown_files_by_service())
+    return tdd
 
 # A service's rank = this weight x summary match + the rest x best code match.
 _SUMMARY_WEIGHT = 0.5
@@ -98,6 +252,18 @@ def _test_lookup_terms(source: str, issue_identifiers: list[str]) -> list[str]:
     return sorted(sorted(terms, key=len, reverse=True)[:_MAX_TEST_LOOKUP_TERMS])
 
 
+def _links_of_changed_services(
+    tdd: TechnicalDesignDoc, edges: list[dict]
+) -> list[ServiceDependency]:
+    """The links with a changing service at one end. A UI-only fix listed
+    all 32 links among the eight services it gave a verdict on, none of
+    which it touched."""
+    changed = {s.service for s in tdd.services if s.changes}
+    return [
+        ServiceDependency(**e) for e in edges if e["source"] in changed or e["target"] in changed
+    ]
+
+
 def _referenced_service_names(tdd: TechnicalDesignDoc) -> list[str]:
     """Every service name the LLM actually touched: services it proposed
     changes for, plus anything it named as a dependency source/target in
@@ -176,8 +342,12 @@ async def build_tdd(
     debug_dump_prompts: bool = False,
     service_names: list[str] | None = None,
     mode: str | None = None,
+    images: list | None = None,
 ) -> TechnicalDesignDoc:
-    """`service_names`: the services this run covers (the Repositories the
+    """`images`: screenshots from the ticket (images.TicketImage), shown to
+    the planner with its first call. Only the v2 planner uses them.
+
+    `service_names`: the services this run covers (the Repositories the
     user listed) — only those are ever considered. None considers every
     service in the graph.
 
@@ -277,6 +447,14 @@ async def build_tdd(
     # Only links between the chosen services: a link to a background
     # service is shown nowhere else, and only cluttered the diagrams.
     known_dependencies = graph_reader.get_edges_among(selected)
+
+    if _use_v2(selected):
+        return await _build_tdd_v2(
+            issue_text, mode, identifiers, selected, candidate_docs, ranked_by_service,
+            service_names, debug_dump_prompts, vectors, images,
+        )
+    if images:
+        print(f"  [TDD] images: the v1 planner does not use images; {len(images)} left out")
 
     symbols = graph_reader.load_symbols(
         [(s, hit["function_qualified_name"]) for s in selected for hit in ranked_by_service[s]]

@@ -174,7 +174,9 @@ def test_create_has_chunk_edges_builds_pair_rows(monkeypatch):
     )
 
     query, params = driver._session.queries[0]
-    assert "MATCH (f:Function {service: $service, qualified_name: row.function_qname})" in query
+    # Any symbol that owns lines owns chunks: a function, a class's fields,
+    # a large constant.
+    assert "MATCH (f:Symbol {service: $service, qualified_name: row.function_qname})" in query
     assert "MERGE (f)-[:HAS_CHUNK]->(c)" in query
     assert params["rows"] == [
         {"function_qname": "a.py::fn", "chunk_qname": "a.py::fn::chunk0"},
@@ -243,7 +245,7 @@ def test_delete_file_and_descendants_scopes_by_service_and_file_path(monkeypatch
 
     query, params = driver._session.queries[0]
     assert "DETACH DELETE n" in query
-    assert "n:File OR n:Class OR n:Function OR n:Chunk" in query
+    assert "n:File OR n:Class OR n:Function OR n:Variable OR n:Chunk" in query
     assert params == {"service": "orders", "file_path": "a.py"}
 
 
@@ -282,3 +284,97 @@ def test_create_has_file_edges_writes_in_slices(monkeypatch):
     code_graph_writer.create_has_file_edges("orders", ["a.py", "b.py", "c.py"])
 
     assert [p["file_paths"] for _, p in driver._session.queries] == [["a.py", "b.py"], ["c.py"]]
+
+
+# --- pipeline version 4 ------------------------------------------------------
+
+
+def test_every_symbol_upsert_adds_the_symbol_label(monkeypatch):
+    driver = _patch_driver(monkeypatch)
+    code_graph_writer.upsert_classes("orders", [{"qualified_name": "a.py::A"}])
+    code_graph_writer.upsert_functions("orders", [{"qualified_name": "a.py::f"}])
+    code_graph_writer.upsert_variables("orders", [{"qualified_name": "a.py::X"}])
+
+    queries = [q for q, _ in driver._session.queries]
+    assert "SET c += row, c:Symbol" in queries[0]
+    assert "SET f += row, f:Symbol" in queries[1]
+    assert "MERGE (v:Variable {service: $service, qualified_name: row.qualified_name})" in queries[2]
+    assert "v:Symbol" in queries[2]
+
+
+def test_create_contains_edges_links_any_two_symbols(monkeypatch):
+    driver = _patch_driver(monkeypatch)
+    code_graph_writer.create_contains_edges("ui", [("v.tsx::Screen", "v.tsx::Screen.save")])
+
+    query, params = driver._session.queries[0]
+    assert "MERGE (p)-[:CONTAINS]->(c)" in query
+    assert params["rows"] == [{"parent": "v.tsx::Screen", "child": "v.tsx::Screen.save"}]
+
+
+def test_load_chunk_embeddings_looks_up_by_text_hash(monkeypatch):
+    driver = _patch_driver(monkeypatch, rows=[{"text_hash": "h1", "embedding": [0.5]}])
+
+    found = code_graph_writer.load_chunk_embeddings("ui", ["h1", "h2", "h1"])
+
+    query, params = driver._session.queries[0]
+    assert "MATCH (c:Chunk {service: $service, text_hash: h})" in query
+    assert params == {"service": "ui", "hashes": ["h1", "h2"]}
+    assert found == {"h1": [0.5]}
+
+
+def test_load_chunk_embeddings_asks_nothing_for_no_hashes(monkeypatch):
+    driver = _patch_driver(monkeypatch)
+    assert code_graph_writer.load_chunk_embeddings("ui", []) == {}
+    assert driver._session.queries == []
+
+
+def test_write_service_links_clears_then_writes_each_kind(monkeypatch):
+    from src.ingestion.db_schema import Column, Table
+    from src.ingestion.import_resolver import ResolvedImport
+    from src.ingestion.links import Operation, ServiceLinks
+
+    driver = _patch_driver(monkeypatch)
+    links = ServiceLinks(
+        imports=[ResolvedImport("a.tsx", "b.tsx", ["B"], ["index.ts"])],
+        unresolved_imports={"a.tsx": ["./gone"]},
+        references=[("a.tsx::A", "b.tsx::B")],
+        tests=[("a.test.tsx", "a.tsx")],
+        tables=[Table("rhino.reports", {"id": Column("id", "uuid", False)}, ["001.sql"], ["rhino.clients"])],
+        maps_to=[("E.kt::E", "rhino.reports")],
+        operations=[Operation("Query", "reports", "s.graphqls")],
+        resolves=[("R.kt::R.reports", "Query", "reports")],
+        endpoints=[("C.kt::C.get", "GET", "/x")],
+        kafka={"H.kt::H": {"handles": ["com.a.M"], "input_topics": ["Topics.domain.orders"]}},
+    )
+
+    code_graph_writer.write_service_links("rhino-service", links)
+
+    queries = [q for q, _ in driver._session.queries]
+    joined = "\n".join(queries)
+    # Old links go first, so a removed import or route does not linger.
+    assert queries[0].strip().startswith("MATCH (:File {service: $service})-[r:IMPORTS|TESTS]->()")
+    assert "DETACH DELETE n" in queries[2]
+    for fragment in (
+        "MERGE (a)-[r:IMPORTS]->(b)", "SET f.unresolved_imports", "MERGE (a)-[:TESTS]->(b)",
+        "MERGE (a)-[:REFERENCES]->(b)", "CREATE (t:Table", "MERGE (a)-[:FOREIGN_KEY]->(b)",
+        "MERGE (a)-[:MAPS_TO]->(t)", "MERGE (o:Operation", "MERGE (a)-[:RESOLVES]->(o)",
+        "MERGE (a)-[:SERVES]->(e)", "SET c.kafka_handles",
+    ):
+        assert fragment in joined, fragment
+    table_params = next(p for q, p in driver._session.queries if "CREATE (t:Table" in q)
+    assert table_params["rows"][0]["columns"] == ["id uuid not null"]
+
+
+def test_write_cross_service_links_clears_only_the_given_services_topic_links(monkeypatch):
+    from src.ingestion.service_links import CrossServiceLinks
+
+    driver = _patch_driver(monkeypatch)
+    code_graph_writer.write_cross_service_links(["rhino-service"], CrossServiceLinks())
+
+    first, params = driver._session.queries[0]
+    assert "-[r:ON_TOPIC]->" in first and "WHERE c.service IN $services" in first
+    assert params == {"services": ["rhino-service"]}
+    assert not any(
+        q.strip() == "MATCH (:Message)-[r:ON_TOPIC]->(:Topic) DELETE r"
+        for q, _ in driver._session.queries
+    )
