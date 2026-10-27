@@ -25,6 +25,7 @@ _SPACE = re.compile(r"\s+")
 _QUOTES = re.compile(r"[\"'“”‘’`]+")
 # Thousands separators inside numbers: 2,00,000 and 200,000 and 200000 agree.
 _NUMBER_SEPARATORS = re.compile(r"(?<=\d)[,\s](?=\d)")
+_RUPEES = re.compile(r"\brs\b\.?")
 
 
 def normalise_text(text: str) -> str:
@@ -37,13 +38,26 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(normalise_text(text).encode("utf-8")).hexdigest()
 
 
-def normalise_value(value: str) -> str:
+def _value_words(value: str) -> list[str]:
     value = _NUMBER_SEPARATORS.sub("", str(value or "").lower())
-    value = value.replace("rs.", "inr").replace("rs ", "inr ").replace("₹", "inr ")
+    # "Rs" and "Rs." as a word only: "characters " is not "characteinr" (2026-10-27).
+    value = _RUPEES.sub("inr ", value).replace("₹", "inr ")
     # Quotes and end punctuation around a message are not part of it.
     value = _QUOTES.sub(" ", value)
+    return [w.strip(" .!?,;:") for w in value.split() if w.strip(" .!?,;:")]
+
+
+def normalise_value(value: str) -> str:
     # "₹2,00,000" and "2,00,000 INR" name the same amount: word order is ignored.
-    return " ".join(sorted(_SPACE.sub(" ", value).strip(" .!?,;:").split()))
+    return " ".join(sorted(_value_words(value)))
+
+
+def written_in(value: str, text: str) -> bool:
+    """Is ``value`` still written in ``text``? Every word of it appears there
+    (2026-10-27): a value the extraction missed on one run is not a removed
+    value when the story still states it."""
+    words = set(_value_words(text))
+    return bool(words) and all(w in words for w in _value_words(value))
 
 
 def canonical(facts: list[dict]) -> list[dict]:

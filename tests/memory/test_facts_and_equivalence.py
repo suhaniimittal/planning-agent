@@ -169,3 +169,69 @@ async def test_a_changed_limit_shows_its_old_value_even_when_it_appears_elsewher
 def test_quotes_around_a_message_are_not_part_of_it():
     message = "Daily transfer limit of ₹2,00,000 reached. Try again tomorrow."
     assert facts.normalise_value(f'"{message}"') == facts.normalise_value(message)
+
+
+# --- 2026-10-27: a light rewording was called "changed" (one run's facts left
+# out "is not recorded"); the judge now reads the texts, not the new facts.
+
+REMARK = {
+    "slot": "remark_max_length",
+    "kind": "limit",
+    "statement": "A remark is at most 50 characters",
+    "values": ["50 characters"],
+}
+OLD_TEXT = "A remark is at most 50 characters. A rejected transfer is not recorded."
+NEW_TEXT = "A remark can have no more than 50 characters. A rejected transfer is not saved."
+
+
+def test_rs_is_rupees_only_as_a_word():
+    assert facts.normalise_value("Rs. 500") == facts.normalise_value("500 INR")
+    assert "characters" in facts.normalise_value("50 characters")
+
+
+def test_a_value_is_written_in_a_text_in_any_spelling():
+    assert facts.written_in("50,000 INR", "up to ₹50000 per transfer")
+    assert not facts.written_in("40 characters", OLD_TEXT)
+
+
+@pytest.mark.asyncio
+async def test_a_value_the_new_facts_missed_but_the_text_states_is_not_removed():
+    found = await equivalence.compare(
+        [REMARK], [], judge=judge_says("same"), new_text=NEW_TEXT, old_text=OLD_TEXT
+    )
+    assert found["verdict"] == "reworded"
+
+
+@pytest.mark.asyncio
+async def test_a_new_value_the_old_text_never_stated_is_still_a_change():
+    forty = {**REMARK, "statement": "at most 40 characters", "values": ["40 characters"]}
+    found = await equivalence.compare(
+        [REMARK], [forty], new_text=NEW_TEXT.replace("50", "40"), old_text=OLD_TEXT
+    )
+    assert found["verdict"] == "changed"
+    assert [(c["old"], c["new"]) for c in found["changes"]] == [("50 characters", "40 characters")]
+
+
+@pytest.mark.asyncio
+async def test_the_judge_compares_the_two_texts_not_the_new_facts():
+    calls = []
+    other = {**REMARK, "slot": "remark_limit", "statement": "Remark has a limit"}
+    await equivalence.compare(
+        [REMARK],
+        [other],
+        judge=judge_says("same", calls=calls),
+        new_text=NEW_TEXT,
+        old_text=OLD_TEXT,
+    )
+    assert "OLD STORY TEXT" in calls[0] and "NEW STORY TEXT" in calls[0]
+    assert "version (facts)" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_without_the_old_text_the_judge_reads_the_old_facts():
+    calls = []
+    other = {**REMARK, "slot": "remark_limit", "statement": "Remark has a limit"}
+    await equivalence.compare(
+        [REMARK], [other], judge=judge_says("same", calls=calls), new_text=NEW_TEXT
+    )
+    assert "OLD version (facts)" in calls[0] and "NEW STORY TEXT" in calls[0]

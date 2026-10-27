@@ -19,7 +19,7 @@ which Memsy returns unchanged (``payload.source_metadata``):
   merges similar events of one session and keeps only one of them;
 - a save waits until Memsy has processed it, so the next request reads it.
 
-Snapshot (decrypted): {"facts", "facts_hash", "story_text_hash",
+Snapshot (decrypted): {"facts", "facts_hash", "story_text_hash", "story_text",
 "versions": [{"version", "page_id", "facts_hash", "created"}],
 "decisions": [{"uid", "id", "story_key", "title", "choice", "reason", "status",
 "override_by", "source", "applies_to"}]}
@@ -217,12 +217,17 @@ def current_version(story_key: str, snapshot: dict | None = None) -> dict | None
     return {"tdd_version": versions[-1]["version"], "page_id": versions[-1].get("page_id", "")}
 
 
-def with_facts(snapshot: dict, facts: list[dict], facts_hash: str, story_text_hash: str) -> dict:
+def with_facts(
+    snapshot: dict, facts: list[dict], facts_hash: str, story_text_hash: str, story_text: str = ""
+) -> dict:
+    """The requirement the TDD answers; ``story_text`` is what the next check
+    compares the story with (2026-10-27)."""
     return {
         **snapshot,
         "facts": facts,
         "facts_hash": facts_hash,
         "story_text_hash": story_text_hash,
+        "story_text": story_text or snapshot.get("story_text") or "",
     }
 
 

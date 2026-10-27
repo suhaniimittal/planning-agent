@@ -119,3 +119,23 @@ async def test_a_story_with_no_memory_is_new(memsy):
 
     found = await operations.check_story("BTS-25", "anything", extract=extract)
     assert found["verdict"] == "new" and found["facts"][0]["slot"] == "daily_limit"
+
+
+@pytest.mark.asyncio
+async def test_the_story_text_is_remembered_and_compared_next_time(memsy):
+    text = "BTS-25: transfers are limited to 2,00,000 INR a day."
+    _record(tdd_version="v1.0", page_id="9", facts=[LIMIT], facts_hash="fh", story_text=text)
+    assert record.load_snapshot("BTS-25")[1]["story_text"] == text
+    prompts = []
+
+    async def judge(system, prompt):
+        prompts.append(prompt)
+        return '{"verdict": "same", "confidence": 0.9, "changes": [], "reason": "r"}'
+
+    async def extract(_):
+        return [{**LIMIT, "slot": "per_day_cap", "statement": "a daily cap of 2,00,000 INR"}]
+
+    found = await operations.check_story(
+        "BTS-25", "BTS-25: a daily cap of 2,00,000 INR.", judge=judge, extract=extract
+    )
+    assert found["verdict"] == "reworded" and text in prompts[0]

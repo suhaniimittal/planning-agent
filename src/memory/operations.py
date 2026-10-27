@@ -45,7 +45,13 @@ async def check_story(issue_key: str, story_text: str, judge=None, extract=None)
             "changes": [],
             "reason": "No requirement is remembered for this story yet.",
         }
-    found = await equivalence.compare(stored["facts"], new_facts, judge=judge, new_text=story_text)
+    found = await equivalence.compare(
+        stored["facts"],
+        new_facts,
+        judge=judge,
+        new_text=story_text,
+        old_text=str(snapshot.get("story_text") or ""),
+    )
     return {
         "verdict": found["verdict"],
         "facts": new_facts,
@@ -75,7 +81,11 @@ def remember(payload: dict) -> dict:
         story_text = str(payload.get("story_text") or "")
         text_hash = facts.text_hash(story_text) if story_text else ""
         snapshot = record.with_facts(
-            snapshot, canonical, facts_hash, text_hash or str(payload.get("story_text_hash") or "")
+            snapshot,
+            canonical,
+            facts_hash,
+            text_hash or str(payload.get("story_text_hash") or ""),
+            story_text,
         )
         stored_facts = len(canonical)
     elif not facts_hash:
