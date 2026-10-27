@@ -19,7 +19,7 @@ from src.memory.facts import parse_json
 from . import code_search, graph_reader, planner
 
 _MAX_FUNCTIONS = 8
-_MAX_REPORT_CHARS = 12_000
+_MAX_REPORT_CHARS = 30_000  # the report with its files read (2026-10-27)
 _MAX_SOURCE_CHARS = 4_000
 
 SYSTEM_PROMPT = """You investigate a bug report against the code shown, as a senior engineer.
