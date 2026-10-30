@@ -79,7 +79,16 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
     # Optional override. Left unset (the normal case), the ticket is
     # classified from its own text during the issue split.
     mode = payload.get("mode") or None
+    issue_key = str(payload.get("issue_key") or (payload.get("card") or {}).get("key") or "")
     try:
+        if payload.get("card") and not str(issue_text or "").strip():
+            # The agreed input (2026-10-29): the card, its ranked services and
+            # the review's questions with their answers.
+            built = await toolExecutor.execute(
+                "handoff_text", dict(payload), start_to_close_timeout=timedelta(minutes=1)
+            )
+            issue_text = built["issue_text"]
+            repos_text = repos_text or built["repos"]
         ingestion = await toolExecutor.execute(
             "run_ingestion", repos_text, start_to_close_timeout=_INGESTION_TIMEOUT
         )
@@ -108,7 +117,7 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
             dict(ingestion.get("repos") or {}),
             mode,
             # Its decisions in force, and its project's, are kept (2026-10-26).
-            str(payload.get("issue_key") or "") or None,
+            issue_key or None,
             start_to_close_timeout=_TDD_TIMEOUT,
         )
 

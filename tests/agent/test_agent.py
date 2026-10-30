@@ -146,8 +146,14 @@ async def test_an_investigation_reads_the_graph_only(tools):
 async def test_a_discussion_carries_the_story_and_the_kind(tools):
     recorder = tools(answer_design_question={"answer": "No", "verdict": "refuse"})
     await agent_module.planning_agent.fn(
-        {"mode": "discuss", "question": "use double", "tdd_text": "TDD", "issue_key": "BTS-25",
-         "kind": "update", "page_id": "28180482"}
+        {
+            "mode": "discuss",
+            "question": "use double",
+            "tdd_text": "TDD",
+            "issue_key": "BTS-25",
+            "kind": "update",
+            "page_id": "28180482",
+        }
     )
     # the page is the conversation's Memsy session (2026-10-26)
     assert recorder.calls[0][1] == ("use double", "TDD", [], "BTS-25", "update", "28180482")
@@ -158,3 +164,30 @@ async def test_missing_input_is_an_error_not_a_crash(tools):
     tools()
     out = await agent_module.planning_agent.fn({"mode": "facts", "issue_key": "BTS-25"})
     assert out["status"] == "error" and out["error"] == "MissingInput"
+
+
+# --- the agreed TDD input (2026-10-29) -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_agreed_input_becomes_the_text_and_repositories(tools):
+    recorder = tools(
+        handoff_text={"issue_text": "BTS-60 (Story): Add a remark", "repos": "bank: o/bank@main"},
+        run_ingestion={"services": ["bank"], "repos": {"bank": "o/bank@main"}},
+        generate_technical_design={"s3_key": "technical_designs/x.pdf"},
+    )
+    payload = {
+        "card": {"key": "BTS-60", "title": "Add a remark"},
+        "services": [{"service": "bank", "repo": "o/bank", "branch": "main", "rank": 9}],
+        "questions": [],
+    }
+    out = await agent_module.planning_agent.fn(payload)
+    assert [name for name, _ in recorder.calls] == [
+        "handoff_text",
+        "run_ingestion",
+        "generate_technical_design",
+    ]
+    assert recorder.calls[1] == ("run_ingestion", ("bank: o/bank@main",))
+    design = recorder.calls[2][1]
+    assert design[0] == "BTS-60 (Story): Add a remark" and design[-1] == "BTS-60"
+    assert out["status"] == "success"

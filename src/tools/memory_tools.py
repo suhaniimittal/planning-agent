@@ -1,7 +1,8 @@
 """Tool entrypoints for Planning's memory and bug investigation (2026-10-26).
 
 All the I/O of the agent's "facts", "record" and "investigate" modes: Neo4j
-reads and writes, and the model calls. The agent only routes to these.
+reads and writes, and the model calls. The agent only routes to these. And
+the agreed TDD input as the planner's text (``handoff_text``).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import asyncio
 from aetherion_sdk import tool
 
 from src.memory import conversation, legacy, operations
+from src.query import handoff
 from src.query.investigate import investigate
 
 
@@ -42,6 +44,13 @@ async def investigate_bug(report_text: str, repos: str = "") -> dict:
     """A bug's likely root cause, affected files and fix, from the code graph —
     only the services named in ``repos`` ("name: org/repo" lines) when given."""
     return await investigate(report_text, service_names(repos))
+
+
+@tool()
+async def handoff_text(payload: dict) -> dict:
+    """The agreed TDD input (card, services, questions) as the planner's text,
+    and the ranked services' repositories (2026-10-29)."""
+    return {"issue_text": handoff.issue_text(payload), "repos": handoff.repos_text(payload)}
 
 
 def service_names(repos: str) -> list[str]:
