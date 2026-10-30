@@ -116,8 +116,10 @@ async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
             # Their repositories: the build files give the design its versions.
             dict(ingestion.get("repos") or {}),
             mode,
-            # Its decisions in force, and its project's, are kept (2026-10-26).
             issue_key or None,
+            # Its decisions in force, and its project's, given by
+            # Orchestration, which keeps the memory (2026-10-30).
+            list(payload.get("decisions") or []),
             start_to_close_timeout=_TDD_TIMEOUT,
         )
 
@@ -162,16 +164,19 @@ async def _discuss(payload: dict[str, Any], workflow_id: str | None) -> dict[str
             "message": "A design question needs both the question and the TDD's text.",
         }
     try:
+        memory = payload.get("memory") or {}
         answer = await toolExecutor.execute(
             "answer_design_question",
             question,
             tdd_text,
             list(payload.get("discussion") or []),
-            str(payload.get("issue_key") or "") or None,
             # No kind = memory off: answered exactly as before 2026-10-26.
             str(payload.get("kind") or "") or None,
-            # The TDD page the question was asked on: its Memsy session.
-            str(payload.get("page_id") or ""),
+            # The story's facts, decisions in force and earlier conversation,
+            # given by Orchestration (2026-10-30).
+            list(memory.get("facts") or []),
+            list(memory.get("decisions") or []),
+            list(memory.get("earlier") or []),
             start_to_close_timeout=_TDD_TIMEOUT,
         )
     except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
@@ -210,7 +215,11 @@ async def _facts(payload: dict[str, Any], workflow_id: str | None) -> dict[str, 
         }
     try:
         found = await toolExecutor.execute(
-            "story_facts", issue_key, story_text, start_to_close_timeout=_TDD_TIMEOUT
+            "story_facts",
+            story_text,
+            # The story's TDD memory, given by Orchestration (2026-10-30).
+            dict((payload.get("memory") or {}).get("snapshot") or {}),
+            start_to_close_timeout=_TDD_TIMEOUT,
         )
     except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
         return _failed("The facts check", error, workflow_id)
@@ -218,7 +227,8 @@ async def _facts(payload: dict[str, Any], workflow_id: str | None) -> dict[str, 
 
 
 async def _record(payload: dict[str, Any], workflow_id: str | None) -> dict[str, Any]:
-    """A published TDD version, remembered (contract mode "record")."""
+    """A published TDD version (contract mode "record"): the story's new
+    snapshot in ``stored.snapshot``, for Orchestration to keep."""
     if not str(payload.get("issue_key") or "").strip():
         return {
             "status": "error",

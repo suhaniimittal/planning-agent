@@ -1,7 +1,10 @@
 """What the agent's memory modes do (2026-10-26) — called from src/tools/memory_tools.py.
 
 ``check_story``  mode "facts": is this story the requirement its TDD answered?
-``record``       mode "record": a TDD version was published — remember it.
+``remember``     mode "record": a TDD version was published — the new snapshot.
+
+Both work on the snapshot Orchestration gives (``memory.snapshot``); Planning
+stores nothing, and hands the new snapshot back to be kept (2026-10-30).
 """
 
 from __future__ import annotations
@@ -9,9 +12,9 @@ from __future__ import annotations
 from src.memory import equivalence, facts, record
 
 
-async def check_story(issue_key: str, story_text: str, judge=None, extract=None) -> dict:
-    """The contract's mode "facts" response, without status/mode. Stores nothing."""
-    seq, snapshot = record.load_snapshot(issue_key)
+async def check_story(story_text: str, snapshot: dict, judge=None, extract=None) -> dict:
+    """The contract's mode "facts" response, without status/mode, against the
+    story's ``snapshot``."""
     stored = (
         {
             "facts": list(snapshot.get("facts") or []),
@@ -21,7 +24,7 @@ async def check_story(issue_key: str, story_text: str, judge=None, extract=None)
         if snapshot.get("facts") or snapshot.get("facts_hash")
         else None
     )
-    current = record.current_version(issue_key, snapshot)
+    current = record.current_version(snapshot)
     text_hash = facts.text_hash(story_text)
     if stored and stored["story_text_hash"] == text_hash:
         return {
@@ -65,11 +68,11 @@ async def check_story(issue_key: str, story_text: str, judge=None, extract=None)
 
 def remember(payload: dict) -> dict:
     """The contract's mode "record": the published version, its facts, its decisions —
-    one new memory snapshot in Memsy holding all of it (2026-10-26)."""
+    the story's new snapshot, made from the one given (``memory.snapshot``)."""
     issue_key = str(payload.get("issue_key") or "").upper()
     if not issue_key:
         raise ValueError("record needs the issue_key")
-    seq, snapshot = record.load_snapshot(issue_key)
+    snapshot = dict((payload.get("memory") or {}).get("snapshot") or {})
     stored_facts = 0
     story_facts = payload.get("facts")
     facts_hash = str(payload.get("facts_hash") or "")
@@ -104,5 +107,4 @@ def remember(payload: dict) -> dict:
         superseded=[str(s) for s in payload.get("superseded") or []],
         source=str(payload.get("source") or ""),
     )
-    record.save_snapshot(issue_key, seq + 1, snapshot)
-    return {"facts": stored_facts, "decisions": stored_decisions}
+    return {"facts": stored_facts, "decisions": stored_decisions, "snapshot": snapshot}

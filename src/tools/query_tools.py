@@ -11,7 +11,6 @@ from common_lib.storage.storage_client import storage
 
 from src.ingestion import github_api
 from src.ingestion.confluence_api import ConfluenceApiError, create_page
-from src.memory import conversation
 from src.memory import record
 from src.query import contracts, stack
 from src.query.design_qa import answer_question, legacy_answer
@@ -83,35 +82,27 @@ async def answer_design_question(
     question: str,
     tdd_text: str,
     discussion: list[str] | None = None,
-    issue_key: str | None = None,
     kind: str | None = None,
-    page_id: str = "",
+    facts: list[dict] | None = None,
+    decisions: list[dict] | None = None,
+    earlier: list[str] | None = None,
 ) -> dict:
     """A comment on a TDD ("why this approach?", "why not X?", "update the TDD: X"),
     answered from the TDD, the story's facts, the decisions in force, the
     discussion and the related code — and judged: a change is applied only when
     it is valid (2026-10-26). Changes nothing itself; the caller revises.
-    With no ``kind`` (a caller with memory off) it answers exactly as before."""
+    The facts, decisions and earlier conversation are given by Orchestration,
+    which keeps the memory (2026-10-30). With no ``kind`` (a caller with memory
+    off) it answers exactly as before."""
     if not kind:
         return await legacy_answer(question, tdd_text, discussion)
-    facts, decisions = [], []
-    if issue_key:
-        stored = record.load_requirement(issue_key)
-        facts = (stored or {}).get("facts") or []
-        decisions = record.decisions_in_force(issue_key)
-    # What was said before about this TDD, from Memsy (2026-10-26): earlier
-    # questions and answers, even from other days or another page's thread.
-    earlier = await conversation.recall(issue_key or "", question) if issue_key else []
-    context = list(discussion or []) + [f"(remembered) {line}" for line in earlier]
+    # What was said before about this TDD: earlier questions and answers, even
+    # from other days or another page's thread.
+    context = list(discussion or []) + [f"(remembered) {line}" for line in earlier or []]
     answer = await answer_question(
-        question, tdd_text, context, kind or "question", facts, decisions
+        question, tdd_text, context, kind, list(facts or []), list(decisions or [])
     )
-    out = answer.to_dict()
-    if issue_key:
-        await conversation.remember_exchange(
-            issue_key, page_id, question, out.get("answer") or "", kind, out.get("verdict") or ""
-        )
-    return out
+    return answer.to_dict()
 
 
 def repository_facts(service_repos: dict[str, str]) -> tuple[list[str], str]:
@@ -159,6 +150,7 @@ async def generate_technical_design(
     service_repos: dict[str, str] | None = None,
     mode: str | None = None,
     issue_key: str | None = None,
+    decisions: list[dict] | None = None,
 ) -> dict:
     """Search the service graph for services relevant to a requirement/bug
     report and produce a technical design doc: structured data plus a real
@@ -177,14 +169,13 @@ async def generate_technical_design(
     constraints. `return_document`: also return the title, the
     Confluence HTML and the plain text, for the orchestrator. `mode`:
     "bug" or "feature" to override how the ticket is classified. `issue_key`:
-    the story, whose decisions in force — and its project's, on the same
-    services — the design must keep (2026-10-26)."""
+    the story. `decisions`: its decisions in force and its project's on the
+    same services, given by Orchestration — the design must keep them
+    (2026-10-26; given since 2026-10-30)."""
     constraints, api_contracts = repository_facts(service_repos or {})
     decisions_text = ""
-    if issue_key:
-        decisions_text = record.decisions_block(
-            record.decisions_in_force(issue_key, service_names), issue_key
-        )
+    if issue_key and decisions:
+        decisions_text = record.decisions_block(list(decisions), issue_key)
     # Only what the caller actually chose is forwarded, so build_tdd's own
     # signature stays the single definition of what top_k and hops default
     # to — nothing here restates the numbers.

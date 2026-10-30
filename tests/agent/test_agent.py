@@ -68,7 +68,7 @@ async def test_the_orchestrator_can_ask_for_the_document_itself(tools):
         "generate_technical_design",
         # top_k/hops left as None: generate_technical_design owns their defaults;
         # then the optional bug/feature mode, then the story whose decisions are kept.
-        ("Add a daily limit", None, None, ["bank"], True, {"bank": "o/bank"}, None, None),
+        ("Add a daily limit", None, None, ["bank"], True, {"bank": "o/bank"}, None, None, []),
     )
     assert out["document"] == {
         "title": "Daily limit",
@@ -111,9 +111,15 @@ async def test_a_design_question_needs_the_tdd(tools):
 async def test_a_facts_check_runs_no_ingestion_and_no_design(tools):
     recorder = tools(story_facts={"verdict": "reworded", "facts": [], "changes": []})
     out = await agent_module.planning_agent.fn(
-        {"mode": "facts", "issue_key": "BTS-25", "story_text": "Daily cap of 2,00,000 INR"}
+        {
+            "mode": "facts",
+            "issue_key": "BTS-25",
+            "story_text": "Daily cap of 2,00,000 INR",
+            "memory": {"snapshot": {"facts_hash": "fh"}},
+        }
     )
-    assert recorder.calls == [("story_facts", ("BTS-25", "Daily cap of 2,00,000 INR"))]
+    # The story's TDD memory is given by Orchestration (2026-10-30).
+    assert recorder.calls == [("story_facts", ("Daily cap of 2,00,000 INR", {"facts_hash": "fh"}))]
     assert out == {
         "status": "success",
         "mode": "facts",
@@ -152,11 +158,11 @@ async def test_a_discussion_carries_the_story_and_the_kind(tools):
             "tdd_text": "TDD",
             "issue_key": "BTS-25",
             "kind": "update",
-            "page_id": "28180482",
+            "memory": {"facts": ["f"], "decisions": ["d"], "earlier": ["said"]},
         }
     )
-    # the page is the conversation's Memsy session (2026-10-26)
-    assert recorder.calls[0][1] == ("use double", "TDD", [], "BTS-25", "update", "28180482")
+    # the facts, decisions and earlier conversation are given by Orchestration (2026-10-30)
+    assert recorder.calls[0][1] == ("use double", "TDD", [], "update", ["f"], ["d"], ["said"])
 
 
 @pytest.mark.asyncio
@@ -189,5 +195,5 @@ async def test_the_agreed_input_becomes_the_text_and_repositories(tools):
     ]
     assert recorder.calls[1] == ("run_ingestion", ("bank: o/bank@main",))
     design = recorder.calls[2][1]
-    assert design[0] == "BTS-60 (Story): Add a remark" and design[-1] == "BTS-60"
+    assert design[0] == "BTS-60 (Story): Add a remark" and design[-2:] == ("BTS-60", [])
     assert out["status"] == "success"
