@@ -28,6 +28,8 @@ from pathlib import Path
 from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
+from .test_paths import is_test_path
+
 __all__ = [
     "CodeChunk",
     "LanguageAdapter",
@@ -85,8 +87,23 @@ class RepoGraph:
     # the file exists and can be told to edit it as a whole, and so it's
     # still covered by the cross-service dependency scan).
     tracked_files: dict[str, str] = field(default_factory=dict)
+    # file_path -> its import lines, verbatim. Nothing else in the pipeline
+    # records them: parse_file() extracts only classes and functions, so the
+    # lines above them are lost. That gap is why generated code invents
+    # module paths — a new test file importing a props type that is not
+    # exported, a component importing "@client/hooks" which does not exist.
+    file_imports: dict[str, str] = field(default_factory=dict)
+    # file_path -> its whole text, TEST FILES ONLY, capped. A test file is
+    # mostly top-level describe()/it() calls and object literals, none of
+    # which parse_file() extracts, so a 3,920-char test file reached the
+    # graph as 192 characters — under 10% of itself, and never the part
+    # that matters. What the planner needs from a test is precisely what is
+    # missing: the fixture, which props must be set for the component to
+    # render at all, and the shape of the payload its callbacks receive.
+    # Production files are not stored this way; their symbols are already
+    # extracted, and storing both would double the graph for nothing.
+    file_source: dict[str, str] = field(default_factory=dict)
     files_parsed: int = 0
-    files_skipped_unsupported: int = 0
     files_skipped_oversized: int = 0
     files_failed: int = 0
 
@@ -401,6 +418,32 @@ ADAPTERS: dict[str, LanguageAdapter] = {
 # The ~500-800 char chunk-size target agreed in design: small enough to keep
 # one embedding focused on one idea, large enough not to be pointlessly tiny.
 _CHUNK_TARGET_CHARS = 700
+
+
+def embedding_text(file_path: str, name: str, parent_class: str | None, chunk_text: str) -> str:
+    """What a chunk is embedded AS — its path and symbol name, then its code.
+
+    Not what is stored or shown: `Chunk.text` stays the code alone, so the
+    planner still reads exactly what is in the file.
+
+    Measured on this graph, 22% of single-chunk functions do not contain
+    their own name anywhere in their text — an arrow function's chunk
+    begins at its parameter list, so the name it was assigned to is lost.
+    Only multi-chunk functions were anchored, and 93% of functions are a
+    single chunk. So for roughly a fifth of the graph the most descriptive
+    thing about a symbol was never embedded.
+
+    That matters because a ticket is written in words and code is written
+    in symbols. `multipleEmailFieldValidation` contains the semicolon-to-
+    comma conversion a real ticket was about, as `.replace(/;/g, ",")` —
+    characters, not the words "semicolon" and "comma" — and scored 0.292
+    against that ticket while unrelated code scored 0.78. Its NAME holds
+    "email" and "validation", both of which the ticket says, and its path
+    holds more. Embedding those costs nothing and is often the only English
+    a chunk has.
+    """
+    head = file_path if not parent_class else f"{file_path}\n{parent_class}"
+    return f"{head}\n{name}\n{chunk_text}"
 
 
 def chunk_function(node: Node, body: Node | None, signature: str, source: bytes) -> list[CodeChunk]:
@@ -720,6 +763,47 @@ DEFAULT_DENYLIST: set[str] = {
 
 DEFAULT_MAX_FILE_SIZE_BYTES = 2_000_000
 
+# An import line in every language this parser handles: Python's `import x`
+# and `from x import y`, JS/TS's `import ... from "..."` and re-exports,
+# Kotlin/Java's `import x.y.Z`. Matched as text rather than through
+# tree-sitter because it is the same shape everywhere and needs no grammar.
+_IMPORT_LINE = re.compile(r"^\s*(?:import\b|from\s+\S+\s+import\b|export\s.*\bfrom\b)")
+# Imports live at the top of a file; reading further is wasted work and
+# risks picking up a dynamic import() buried in a function body.
+_IMPORT_SCAN_LINES = 120
+# Enough for a long import block, short enough that several files' worth
+# still leaves room for the code itself in a prompt.
+MAX_IMPORT_CHARS = 1200
+
+# How much of a test file is kept. Measured against the tests that cover the
+# ATS settings form: 1,605 / 2,235 / 3,920 characters, so a focused unit test
+# fits whole. The one file this truncates is a 29,652-char suite covering a
+# whole settings tab, and its first 6,000 characters are its imports and
+# first fixture — the part worth copying. Raising it further buys more of
+# the files that teach least.
+MAX_TEST_SOURCE_CHARS = 6000
+
+
+def extract_imports(source: str) -> str:
+    """The import lines at the top of `source`, in order, as one block.
+
+    Blank lines and comments between imports are dropped; the first run of
+    real code ends the scan. Returns "" when a file imports nothing.
+    """
+    kept: list[str] = []
+    for line in source.splitlines()[:_IMPORT_SCAN_LINES]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("//", "#", "/*", "*", "*/")):
+            continue
+        if _IMPORT_LINE.match(line):
+            kept.append(line.rstrip())
+            continue
+        if kept:
+            break  # past the import block
+    block = "\n".join(kept)
+    return block[:MAX_IMPORT_CHARS]
+
+
 LANGUAGE_BY_EXTENSION: dict[str, str] = {
     ".py": "python",
     ".java": "java",
@@ -912,8 +996,6 @@ def parse_repo(
                 if tracked_language is not None:
                     rel_path = str(path.relative_to(repo_root).as_posix())
                     graph.tracked_files[rel_path] = tracked_language
-                else:
-                    graph.files_skipped_unsupported += 1
                 continue
             try:
                 if path.stat().st_size > max_file_size_bytes:
@@ -928,6 +1010,17 @@ def parse_repo(
                 graph.files_failed += 1
                 continue
             graph.files_parsed += 1
+            rel_path = str(path.relative_to(repo_root).as_posix())
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            imports = extract_imports(text) if text else ""
+            if imports:
+                graph.file_imports[rel_path] = imports
+            # Read once, used twice — the import scan already has the text.
+            if text and is_test_path(rel_path):
+                graph.file_source[rel_path] = text[:MAX_TEST_SOURCE_CHARS]
             for symbol in symbols:
                 if symbol.kind == "class":
                     graph.classes.append(symbol)

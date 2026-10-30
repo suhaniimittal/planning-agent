@@ -274,10 +274,14 @@ def test_build_system_prompt_instructs_facts_not_hand_drawn_diagrams():
     assert "current_flow_steps" in prompt
 
 
-def test_build_system_prompt_asks_for_reasoning_depth_now_that_diagrams_are_offloaded():
+def test_build_system_prompt_asks_for_short_specific_writing():
+    """The TDDs had become 15-page walls of text that repeated themselves;
+    the prompt must ask for brevity, one fact per field, one symbol per change."""
     prompt = build_system_prompt()
-    assert "freed-up effort" in prompt.lower() or "freed up effort" in prompt.lower()
-    assert "reasoning chain" in prompt.lower()
+    assert "WRITE FOR A BUSY DEVELOPER" in prompt
+    assert "multiple sentences" not in prompt
+    assert "exactly ONE symbol name" in prompt
+    assert "Leave `sequence_steps` empty" in prompt
 
 
 def test_build_system_prompt_forbids_generic_domain_knowledge_as_fact():
@@ -292,12 +296,14 @@ def test_build_system_prompt_forbids_generic_domain_knowledge_as_fact():
 
 def test_build_system_prompt_requires_tracing_real_code_before_root_cause():
     """Regression test: root cause analysis was describing functions
-    generically ("processes the request") instead of what the actual
-    retrieved snippet does — the prompt must force a literal trace first."""
+    generically instead of what the real code does — the model must still
+    trace the real lines first, but write only the conclusions, each marked
+    with its certainty and evidence."""
     prompt = build_system_prompt()
-    assert "trace" in prompt.lower()
-    assert "quoting or closely paraphrasing" in prompt.lower()
-    assert "processes the request" in prompt.lower()  # the explicit bad example
+    assert "TRACE the real" in prompt
+    assert "grounded in its actual lines" in prompt
+    assert "never the walk-through itself" in prompt
+    assert "Confirmed: <cause>" in prompt and "Not the cause:" in prompt
 
 
 def test_build_system_prompt_requires_impact_analysis_to_name_specific_evidence():
@@ -474,6 +480,10 @@ async def test_both_llm_paths_use_a_low_temperature(monkeypatch):
             self.chat = types.SimpleNamespace(completions=Completions())
 
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    # The laptop launcher installs the client class (src/ingestion/local_client.py).
+    from src.ingestion import local_client
+
+    monkeypatch.setattr(local_client, "_factory", FakeOpenAI)
 
     class FakeGateway:
         def __init__(self, **kwargs):
@@ -494,9 +504,596 @@ async def test_both_llm_paths_use_a_low_temperature(monkeypatch):
     monkeypatch.setenv("AGENTS_GATEWAY_KEY", "k")
     monkeypatch.setenv("AI_GATEWAY_URL", "https://gateway.example")
 
+    monkeypatch.setattr(planner, "_OPENAI_MODEL", "gpt-4o")
     await planner._plan_via_openai("system", "user")
     await planner._plan_via_gateway("system", "user")
 
     assert sent["openai"]["temperature"] == planner._TEMPERATURE
     assert sent["gateway"]["temperature"] == planner._TEMPERATURE
     assert planner._TEMPERATURE <= 0.3
+
+
+def test_models_get_the_api_parameters_they_actually_accept():
+    """Three families, verified against the live API: gpt-5.5/5.6 refuse
+    `temperature` outright, other gpt-5 models accept it but still need
+    `max_completion_tokens`, and pre-5 models take the plain parameters."""
+    from src.query import planner
+
+    refuses_temp = planner._openai_params("gpt-5.5")
+    assert "temperature" not in refuses_temp and "seed" not in refuses_temp
+    assert refuses_temp["max_completion_tokens"] >= 12000
+
+    thinking = planner._openai_params("gpt-5.4")
+    assert thinking["temperature"] == 0 and thinking["seed"] == planner._SEED
+    assert thinking["max_completion_tokens"] >= 12000
+
+    plain = planner._openai_params("gpt-4.1")
+    assert plain == {"max_tokens": 12000, "temperature": 0, "seed": planner._SEED}
+
+
+def test_tdd_model_is_deterministic_by_default():
+    """The same ticket must not produce a visibly different TDD run to run."""
+    from src.query import planner
+
+    assert planner._TEMPERATURE == 0
+    assert "temperature" in planner._openai_params(planner._OPENAI_MODEL)
+
+
+
+def test_user_prompt_lists_what_else_is_defined_in_each_file():
+    symbol = {
+        "file_path": "a.ts", "line_start": 1, "line_end": 3, "qualified_name": "a.ts::validate",
+        "name": "validate", "signature": "validate()", "docstring": None, "language": "typescript",
+    }
+    prompt = build_user_prompt(
+        "issue",
+        [{"name": "ui", "summary": "s"}],
+        {"ui": [symbol]},
+        {("ui", "a.ts::validate"): "code"},
+        file_context={("ui", "a.ts"): ["validate", "submit", "Form.render"]},
+    )
+    assert "Also defined in this file: submit, Form.render" in prompt
+
+
+def test_system_prompt_requires_an_answer_for_every_chosen_service():
+    prompt = build_system_prompt()
+    assert "Never silently leave one out" in prompt
+
+
+def test_user_prompt_says_which_issue_names_a_symbol_contains():
+    symbol = {
+        "file_path": "a.ts", "line_start": 1, "line_end": 3, "qualified_name": "a.ts::schema",
+        "name": "schema", "signature": "schema", "docstring": None, "language": "typescript",
+        "matched_identifiers": ["internationalPhoneNumber"],
+    }
+    prompt = build_user_prompt("issue", [{"name": "ui", "summary": "s"}], {"ui": [symbol]}, {})
+    assert "Contains `internationalPhoneNumber`, named in the issue itself." in prompt
+
+
+def test_system_prompt_restricts_scope_to_what_the_ticket_reports():
+    """Regression test: the prompt once told the model to fix every copy of a
+    pattern and "where the bad input ENTERS and where the failure SURFACES".
+    It obeyed — and produced a UI alert box nobody asked for, which a human
+    reviewer rejected with "does anyone told you to add alert popup... this is
+    not mentioned in the ticket description"."""
+    prompt = build_system_prompt()
+    assert "ONLY FIX WHAT THE TICKET REPORTS" in prompt
+    assert "not an improvement you noticed along the way" in prompt
+    assert "propose a change for EACH of them" not in prompt
+    assert "where the bad input ENTERS" not in prompt
+
+
+def test_system_prompt_allows_no_change_as_a_real_answer():
+    """A service the report does not touch should get "no change needed",
+    not invented work to look thorough."""
+    prompt = build_system_prompt()
+    assert '"no change needed" IS the correct answer' in prompt
+
+
+def test_system_prompt_separates_analysis_scope_from_change_scope():
+    """A service on the reproduction path must be EXAMINED and appear with a
+    verdict, which is not the same as being changed. Conflating the two is
+    how candidate-service first vanished from the document entirely, and
+    then — once it was included — how it was waved through."""
+    prompt = build_system_prompt()
+    assert "ANALYSIS SCOPE" in prompt and "CHANGE SCOPE" in prompt
+    assert "must be EXAMINED and must APPEAR" in prompt
+    assert "Sitting on the data path is NOT by itself a reason to change" in prompt
+
+
+def test_system_prompt_treats_where_a_bad_value_is_stored_as_a_root_cause():
+    """Regression test: candidate-service persists the reported phone value
+    untrimmed (EmploymentVerificationInput.toAvro -> .setPhone(phone)), and
+    the client form later rejects it. The TDD cleared candidate-service
+    anyway. Storing a value a consumer then rejects is a cause, not an
+    adjacency.
+
+    Phrased deliberately without "where the bad input ENTERS" — that older
+    wording over-scoped into changes nobody asked for."""
+    prompt = build_system_prompt()
+    assert "ROOT CAUSE LOCATION, NOT A " in prompt
+    assert "first accepted and written down" in prompt
+    assert "where the bad input ENTERS" not in prompt
+    # both fix sites must be surfaced rather than one silently chosen
+    assert "entry-side fix and a consumer-side fix" in prompt
+    assert "Never present one as settled" in prompt
+
+
+def test_system_prompt_separates_verified_from_reported_and_inferred():
+    prompt = build_system_prompt()
+    for kind in ("VERIFIED", "REPORTED", "INFERRED", "UNKNOWN"):
+        assert kind in prompt
+    assert "merely EXISTING is not evidence" in prompt
+
+
+def test_system_prompt_forbids_clearing_a_service_using_another_services_code():
+    """Regression test: the TDD cleared candidate-service (Kotlin backend) by
+    citing a trim in ui/src/apps/candidate/... — a different service's
+    source for the same feature."""
+    prompt = build_system_prompt()
+    assert "only evidence about that service" in prompt
+    assert "Never clear a service of needing a change" in prompt
+
+
+def test_system_prompt_root_cause_format_has_hypothesis_and_unknown():
+    prompt = build_system_prompt()
+    assert "Hypothesis: <cause>" in prompt
+    assert "Unknown: <what you could not determine>" in prompt
+    assert "never establishes a cause on its own" in prompt
+
+
+def test_system_prompt_requires_every_service_in_the_component_diagram():
+    """Regression test: the rendered architecture showed three components and
+    one edge, with two dead ends — the "half-finished" diagram. Every service
+    in `services` must be a component, including no-change ones."""
+    prompt = build_system_prompt()
+    assert "EVERY service you listed in `services` MUST appear here" in prompt
+    assert "half-finished diagram" in prompt
+    assert "Appearing here is NOT a claim that a service changes" in prompt
+
+
+def test_system_prompt_requires_the_two_flow_lists_to_be_comparable():
+    prompt = build_system_prompt()
+    assert "rendered side by\nside" in prompt or "rendered side by " in prompt
+    assert "same journey at the same" in prompt
+    assert "the rendered flow looks truncated" in prompt
+
+
+def test_system_prompt_requires_a_failing_then_passing_regression_test():
+    prompt = build_system_prompt()
+    assert "FAILS" in prompt and "PASSES after your change" in prompt
+    assert "TO ADD or an EXISTING test" in prompt
+
+
+def test_system_prompt_forbids_claiming_tests_were_executed():
+    """Nothing in this pipeline runs tests, so any claim that one passed is
+    fabricated by construction."""
+    prompt = build_system_prompt()
+    assert "you have run nothing" in prompt
+    assert "never write" in prompt.lower() and "passed, failed, ran or was verified" in prompt
+
+
+def test_system_prompt_requires_each_implementation_step_to_name_a_location():
+    prompt = build_system_prompt()
+    assert "<service> <file_path> <symbol>" in prompt
+    assert "is not an implementation step" in prompt
+    assert "which `testing_plan` scenario" in prompt
+
+
+def test_system_prompt_requires_reusing_what_already_exists():
+    prompt = build_system_prompt()
+    assert "EXISTING function, component" in prompt
+    assert "adds a second mechanism beside one that already exists" in prompt
+
+
+def test_system_prompt_ends_with_a_cross_section_self_check():
+    """Sections that contradict each other cost the reader trust in all of
+    them, so consistency is checked explicitly rather than hoped for."""
+    prompt = build_system_prompt()
+    assert "SELF-CHECK BEFORE YOU RESPOND" in prompt
+    assert "no service you called \"no change needed\" also carries changes" in prompt
+    assert "nothing claims a test was run" in prompt
+
+
+def test_system_prompt_leaves_unrendered_diagram_fields_empty():
+    """current_architecture_components is never read by the renderer, and the
+    prompt used to demand it in detail while also saying sequence_steps was
+    both required and to-be-left-empty. One instruction each now."""
+    prompt = build_system_prompt()
+    assert "Leave `sequence_steps` empty" in prompt
+    assert "leave `current_architecture_" in prompt
+    assert "whenever more than one component is involved" not in prompt
+
+
+def test_system_prompt_requires_a_written_trace_of_the_reported_value():
+    """Regression test: candidate-service persists the reported phone value
+    untrimmed at EmploymentVerificationInput.toAvro -> .setPhone(phone). That
+    whole class WAS in the prompt (7.6KB, under the class-widening
+    threshold), but the model read isPhoneValid, saw non-US bypasses
+    validation, wrote "Not the cause", and never looked at the builder four
+    lines below.
+
+    An in-your-head trace can be skipped silently. Four named output lines
+    cannot: writing `Stored at:` forces the model to go find the write."""
+    prompt = build_system_prompt()
+    assert "TRACE THE REPORTED VALUE THROUGH ITS WHOLE LIFE" in prompt
+    for stage in ("Accepted at:", "Validated at:", "Stored at:", "Consumed at:"):
+        assert stage in prompt
+    assert "never leave a stage out" in prompt
+
+
+def test_system_prompt_says_a_passing_validation_is_not_exoneration():
+    """The exact reasoning that cleared candidate-service — "validation does
+    not reject it, so this service is not the cause" — must instead become a
+    reason to keep tracing to the write."""
+    prompt = build_system_prompt()
+    assert "is not exoneration" in prompt
+    assert "keep tracing to where it is written" in prompt
+    assert "still gets its `Stored at:` line" in prompt
+
+
+def test_system_prompt_defines_smallest_change_set_as_end_to_end():
+    """Regression test: with "smallest set that fully addresses the reported
+    problem", the model read "reported problem" as the SYMPTOM and proposed a
+    ui-only fix, leaving candidate-service writing untrimmed phone values via
+    EmploymentVerificationInput.toAvro -> .setPhone(phone). Redefining
+    "smallest" as end-to-end is what puts the source fix back in scope."""
+    prompt = build_system_prompt()
+    assert "SMALLEST SET THAT CORRECTLY ADDRESSES THE ISSUE END TO END" in prompt
+    assert "not the fewest files" in prompt
+    assert "frontend-only or backend-only fix by default" in prompt
+    assert "whether data is already persisted in an invalid or unnormalised state" in prompt
+
+
+def test_system_prompt_puts_the_persisting_service_in_change_scope():
+    prompt = build_system_prompt()
+    assert "needs its own change, even when fixing the consumer alone" in prompt
+    assert "Propose the normalisation " in prompt
+    # the over-scoping guard must survive the widening
+    assert "Sitting on the data path is NOT by itself a reason to change" in prompt
+    assert "merely because its file or service is part of the same data flow" in prompt
+
+
+# ---------- bug / feature modes ----------
+
+
+def test_bug_mode_carries_the_value_trace_and_feature_mode_does_not():
+    """The trace is what located EmploymentVerificationInput.toAvro on a bug
+    ticket. It has nothing to trace on a feature request, where no reported
+    value exists."""
+    bug = build_system_prompt("bug")
+    feature = build_system_prompt("feature")
+    for probe in ("TRACE THE REPORTED VALUE", "Transformed at:", "Stored at:", "Not the cause:"):
+        assert probe in bug
+        assert probe not in feature
+
+
+def test_feature_mode_replaces_root_cause_with_gap_analysis():
+    """Regression test: the bulk-print feature ticket ran through the bug
+    prompt and had to express "compliance-service already merges PDFs" as a
+    `Not the cause:` line. Exists/Missing/Extend is the shape that fits."""
+    feature = build_system_prompt("feature")
+    bug = build_system_prompt("bug")
+    assert "GAP ANALYSIS" in feature
+    for probe in ("Exists: <capability>", "Missing: <capability", "Extend: <service>"):
+        assert probe in feature
+        assert probe not in bug
+
+
+def test_bug_mode_asks_whether_the_invalid_state_can_recur():
+    bug = build_system_prompt("bug")
+    assert "can the same invalid state be produced again" in bug
+    assert "UPSTREAM correction" in bug and "DOWNSTREAM correction" in bug
+
+
+def test_bug_mode_addresses_already_stored_data():
+    """Fixing the entry point does not clean rows already written. A bug TDD
+    has to say which change handles those."""
+    bug = build_system_prompt("bug")
+    assert "PERSISTED DATA" in bug
+    assert "whether existing records still fail after the change" in bug
+    assert "Do not recommend a data repair or migration unless" in bug
+
+
+def test_feature_mode_separates_stated_requirements_from_assumptions():
+    feature = build_system_prompt("feature")
+    assert "REQUIREMENTS BEFORE DESIGN" in feature
+    assert "Never invent a business rule" in feature
+    assert "acceptance criterion" in feature
+
+
+def test_feature_mode_requires_building_on_existing_mechanisms():
+    feature = build_system_prompt("feature")
+    assert "BUILD ON WHAT IS ALREADY THERE" in feature
+    assert "A second mechanism standing beside one that already works is wrong" in feature
+
+
+def test_both_modes_share_the_create_and_no_change_rules():
+    """These fix defects measured on the bulk-print run — a `(modify)` on a
+    symbol the text said not to change, and two no-change files listed under
+    FILES TO CHANGE. Neither is mode-specific."""
+    for mode in ("bug", "feature"):
+        prompt = build_system_prompt(mode)
+        assert "WHEN A CHANGE ADDS SOMETHING THAT DOES NOT EXIST YET" in prompt
+        assert "A CHANGE THAT CHANGES NOTHING IS NOT A CHANGE" in prompt
+
+
+def test_both_modes_share_the_whole_base():
+    """The base must not be duplicated per mode, or the two copies drift."""
+    for mode in ("bug", "feature"):
+        prompt = build_system_prompt(mode)
+        for probe in (
+            "FOUR KINDS OF KNOWING",
+            "SELF-CHECK BEFORE YOU RESPOND",
+            "WRITE FOR A BUSY DEVELOPER",
+            "only evidence about that service",
+            "EVERY service you listed in `services` MUST appear here",
+            "you have run nothing",
+            "<service> <file_path> <symbol>",
+        ):
+            assert probe in prompt, f"{probe!r} missing from {mode} mode"
+
+
+def test_an_unknown_mode_falls_back_to_bug():
+    """A malformed mode must never produce a prompt with neither block."""
+    assert build_system_prompt("refactor") == build_system_prompt("bug")
+    assert build_system_prompt("") == build_system_prompt("bug")
+
+
+# ---------- test work as implementation work ----------
+
+
+def test_prompt_requires_a_step_that_writes_the_tests():
+    """Regression test: the implementation plans of four real TDDs listed only
+    production edits. The coding agent worked through the plan, wrote no
+    tests, and CI went red. A scenario in `testing_plan` instructs nobody."""
+    for mode in ("bug", "feature"):
+        prompt = build_system_prompt(mode)
+        assert "TEST WORK IS PART OF THE CHANGE" in prompt
+        assert "must ALSO appear as its own step in `implementation_plan`" in prompt
+
+
+def test_prompt_lets_a_test_step_name_an_unverified_location():
+    """The verified-location rule is what deleted the test step: test files are
+    never in the evidence, so a step that writes one cannot name a location the
+    model saw. Without this exception the new rule and the old one contradict."""
+    prompt = build_system_prompt("bug")
+    assert "The single exception is a step that writes or updates tests" in prompt
+    assert "marked as proposed rather than existing" in prompt
+
+
+def test_prompt_treats_a_sibling_test_file_as_a_contradiction_risk():
+    """Regression test: a TDD told the coding agent to replace ReportForm's
+    console logging. ReportForm/view.test.tsx asserted that logging. One test
+    of 17,737 failed and blocked the merge."""
+    prompt = build_system_prompt("bug")
+    assert '"Tested by" LINE NAMES A TEST THAT ALREADY ASSERTS' in prompt
+    assert "propose updating it in the same implementation step" in prompt
+    assert "never quote a test, name a test function" in prompt
+
+
+def test_prompt_does_not_read_absence_of_a_test_as_untested():
+    """Two lookups can miss a test — the same-folder one and the by-name one
+    — so silence from both still is not proof that nothing covers it."""
+    prompt = build_system_prompt("bug")
+    assert "no test file sits beside it AND names no test" in prompt
+    assert "do not conclude it is untested" in prompt
+    assert "a test may still exist that never names it directly" in prompt
+
+
+def test_prompt_prefers_an_existing_test_over_a_new_one():
+    """A new test file is written from nothing, imports included — and the
+    existing one very likely asserts the behaviour being changed."""
+    prompt = build_system_prompt("bug")
+    assert "AN EXISTING TEST IS ALWAYS PREFERRED OVER A NEW ONE" in prompt
+    assert "Existing test files that cover this symbol" in prompt
+    assert "code that did not exist cannot already be tested" in prompt
+
+
+def test_prompt_tells_the_model_to_copy_the_setup_it_was_shown():
+    """Shown only a test's name, the model invented a fixture that was too
+    short to render and drove the component the wrong way."""
+    prompt = build_system_prompt("bug")
+    assert "TAKE A TEST'S SETUP FROM THE TEST YOU WERE SHOWN" in prompt
+    assert "HOW THE VALUE REACHES THE CODE" in prompt
+    assert "passes before your fix and fails after it" in prompt
+
+
+def test_self_check_covers_test_work():
+    prompt = build_system_prompt("bug")
+    assert "every change has test work in `implementation_plan`" in prompt
+
+
+def test_user_prompt_names_a_test_file_sitting_beside_a_symbol():
+    symbol = {
+        "file_path": "src/apps/client/modules/Reports/components/ReportForm/view.tsx",
+        "line_start": 1, "line_end": 9, "qualified_name": "ReportForm/view.tsx::ReportForm",
+        "name": "ReportForm", "signature": "ReportForm", "docstring": None,
+        "language": "typescript", "matched_identifiers": [],
+    }
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [symbol]}, {},
+        sibling_tests={
+            ("ui", symbol["file_path"]): [
+                "src/apps/client/modules/Reports/components/ReportForm/view.test.tsx"
+            ]
+        },
+    )
+    assert "Tested by (existing test file beside it)" in prompt
+    assert "ReportForm/view.test.tsx" in prompt
+
+
+def test_user_prompt_says_so_when_no_test_sits_beside_a_symbol():
+    symbol = {
+        "file_path": "a/b/view.tsx", "line_start": 1, "line_end": 2,
+        "qualified_name": "a/b/view.tsx::X", "name": "X", "signature": "X",
+        "docstring": None, "language": "typescript", "matched_identifiers": [],
+    }
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [symbol]}, {},
+        sibling_tests={("ui", "a/b/view.tsx"): []},
+    )
+    assert "No test file sits beside this one in its folder." in prompt
+
+
+def _ui_symbol(file_path: str) -> dict:
+    return {
+        "file_path": file_path, "line_start": 1, "line_end": 9,
+        "qualified_name": f"{file_path}::X", "name": "X", "signature": "X",
+        "docstring": None, "language": "typescript", "matched_identifiers": [],
+    }
+
+
+def test_a_symbol_with_no_sibling_test_is_told_where_a_new_one_belongs():
+    """Without a path the model can only ask where tests live, and the test
+    never gets written — a coding agent acts on file changes, not questions."""
+    path = "src/forms/employmentVerificationForm.ts"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        sibling_tests={("ui", path): []},
+        new_test_paths={("ui", path): "src/forms/employmentVerificationForm.test.ts"},
+    )
+    assert "No test file sits beside this one." in prompt
+    assert "belongs at `src/forms/employmentVerificationForm.test.ts`" in prompt
+
+
+def test_an_existing_sibling_test_wins_over_a_suggested_path():
+    path = "src/forms/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        sibling_tests={("ui", path): ["src/forms/view.test.tsx"]},
+        new_test_paths={("ui", path): "src/forms/view.test.tsx"},
+    )
+    assert "Tested by (existing test file beside it): `src/forms/view.test.tsx`" in prompt
+    assert "belongs at" not in prompt
+
+
+def test_a_service_with_no_measured_convention_still_just_says_there_is_no_test():
+    """A mirrored test tree (src/test/kotlin) yields no convention, and the
+    model is asked where tests live rather than handed a made-up path."""
+    path = "src/main/kotlin/Foo.kt"
+    prompt = build_user_prompt(
+        "issue", [{"name": "reports-api", "summary": "s"}],
+        {"reports-api": [_ui_symbol(path)]}, {},
+        sibling_tests={("reports-api", path): []},
+        new_test_paths={},
+    )
+    assert "No test file sits beside this one in its folder." in prompt
+    assert "belongs at" not in prompt
+
+
+def test_a_symbol_lists_the_tests_that_name_it_wherever_they_live():
+    """Five test files covered a real component from another tree; the
+    same-folder lookup found none, so the design had a new test written
+    from scratch instead of the real one edited."""
+    path = "src/common/.../AtsIntegrationSection/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        sibling_tests={("ui", path): []},
+        tests_by_symbol={("ui", "X"): ["src/apps/internal/.../view.data.test.tsx"]},
+    )
+    assert "Existing test files that cover this symbol:" in prompt
+    assert "src/apps/internal/.../view.data.test.tsx" in prompt
+
+
+def test_an_existing_test_is_shown_whole_not_only_named():
+    """A path taught the planner nothing about the fixture. Shown only the
+    name, it wrote a test that typed into an input and asserted on a
+    callback — for a component whose handler reads its value from its
+    parent's settings, so the test passed before the fix and failed after."""
+    path = "src/common/.../AtsIntegrationSection/view.tsx"
+    test_path = "src/apps/client/.../AtsIntegrationSettings/view.test.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        sibling_tests={("ui", path): []},
+        tests_by_symbol={("ui", "X"): [test_path]},
+        test_sources={("ui", test_path): "const settings = { canEdit: true };"},
+    )
+    assert "const settings = { canEdit: true };" in prompt
+    assert "copy this fixture and render, do not invent one" in prompt
+
+
+def test_the_smallest_tests_are_the_ones_shown():
+    """A focused unit test is both shorter and a better model of the setup
+    than a 29,652-char suite covering a whole settings tab."""
+    path = "a/b/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        tests_by_symbol={("ui", "X"): ["huge.test.tsx", "small.test.tsx", "mid.test.tsx"]},
+        test_sources={
+            ("ui", "huge.test.tsx"): "H" * 3000,
+            ("ui", "mid.test.tsx"): "M" * 200,
+            ("ui", "small.test.tsx"): "S" * 50,
+        },
+    )
+    assert "S" * 50 in prompt
+    assert "M" * 200 in prompt
+    assert "H" * 3000 not in prompt
+
+
+def test_a_test_too_large_for_the_budget_is_named_but_not_quoted():
+    path = "a/b/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        tests_by_symbol={("ui", "X"): ["huge.test.tsx"]},
+        test_sources={("ui", "huge.test.tsx"): "H" * 9000},
+    )
+    assert "huge.test.tsx" in prompt
+    assert "H" * 9000 not in prompt
+
+
+def test_nothing_is_quoted_when_a_test_has_no_stored_source():
+    """Only test files carry source; a path with none must not produce an
+    empty code fence that reads as "this test is empty"."""
+    path = "a/b/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        tests_by_symbol={("ui", "X"): ["a/b/view.test.tsx"]},
+        test_sources={},
+    )
+    assert "a/b/view.test.tsx" in prompt
+    assert "copy this fixture" not in prompt
+
+
+def test_nothing_is_claimed_when_no_test_names_the_symbol():
+    path = "a/b/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        sibling_tests={("ui", path): []},
+        tests_by_symbol={},
+    )
+    assert "Existing test files that cover this symbol" not in prompt
+
+
+def test_a_symbol_shows_its_file_imports_verbatim():
+    """Paraphrasing them would be no better than guessing — the point is the
+    exact module paths, which is what generated code gets wrong."""
+    path = "src/forms/view.tsx"
+    prompt = build_user_prompt(
+        "issue", [{"name": "ui", "summary": "s"}], {"ui": [_ui_symbol(path)]}, {},
+        file_imports={("ui", path): 'import React from "react";\nimport stubs from "../../stubs";'},
+    )
+    assert "This file imports:" in prompt
+    assert 'import stubs from "../../stubs";' in prompt
+
+
+def test_prompt_forbids_inventing_module_paths():
+    prompt = build_system_prompt("bug")
+    assert "DO NOT INVENT MODULE PATHS" in prompt
+    assert "fails as a build error before any test runs" in prompt
+
+
+def test_prompt_forbids_an_undeclared_second_edit():
+    """A one-line fix's sketch also narrowed the regex feeding it, from both
+    separators to one. The join was the fix; the narrowing was collateral and
+    broke validation for input the old code had cleaned — and the design read
+    as correct because it was never mentioned."""
+    prompt = build_system_prompt("bug")
+    assert "A SKETCH CHANGES WHAT ITS `change_description` SAYS, AND NOTHING ELSE" in prompt
+    assert "undeclared second change" in prompt
+    assert "A condition you did not have to touch is a condition you do not get to simplify" in prompt
+
+
+def test_self_check_covers_undeclared_edits():
+    prompt = build_system_prompt("bug")
+    assert "nothing narrowed, dropped or tidied along the way" in prompt

@@ -1,4 +1,4 @@
-from src.ingestion import graph_writer
+from src.ingestion import code_crypto, graph_writer
 
 
 class FakeResult(list):
@@ -65,20 +65,39 @@ def test_upsert_service_node_removes_stale_md_derived_properties(monkeypatch):
     assert "s.summary_is_fallback" in query
 
 
-def test_update_service_summary_sets_summary_and_embedding(monkeypatch):
+def test_upsert_service_node_removes_the_generated_summary_it_replaced(monkeypatch):
+    """A service matched against its committed SERVICE.md must not keep the
+    LLM-written summary that preceded it: the two describe the same service
+    differently, and only `doc` is read. Eleven nodes still carried one."""
     driver = _patch_driver(monkeypatch)
 
-    graph_writer.update_service_summary("orders", "Handles order placement.", [0.1, 0.2])
+    graph_writer.upsert_service_node("orders", "org/orders-service")
+
+    query, _ = driver._session.queries[0]
+    assert "s.summary" in query
+    assert "s.summary_embedding" in query
+
+
+def test_update_service_doc_sets_doc_embedding_and_hash(monkeypatch):
+    driver = _patch_driver(monkeypatch)
+
+    graph_writer.update_service_doc("orders", "# orders\n\nPlacing orders.", [0.1, 0.2], "abc123")
 
     query, params = driver._session.queries[0]
     assert "MATCH (s:Service {name: $name})" in query
-    assert "s.summary = $summary" in query
-    assert "s.summary_embedding = $embedding" in query
-    assert params == {
-        "name": "orders",
-        "summary": "Handles order placement.",
-        "embedding": [0.1, 0.2],
-    }
+    assert "s.doc = $doc" in query
+    assert "s.doc_embedding = $embedding" in query
+    # stored so the next run can tell an edited SERVICE.md from an unchanged
+    # one — the file, not the commit, decides whether this moves.
+    assert "s.doc_hash = $doc_hash" in query
+    assert params["name"] == "orders" and params["embedding"] == [0.1, 0.2]
+    assert params["doc_hash"] == "abc123"
+    # SERVICE.md describes the code, so it is stored encrypted
+    assert code_crypto.is_encrypted(params["doc"])
+    opened = code_crypto.decrypt(
+        params["doc"], label="Service", service="orders", qualified_name="orders", field="doc"
+    )
+    assert opened == "# orders\n\nPlacing orders."
 
 
 def test_set_service_dependencies_passes_source_and_targets(monkeypatch):
@@ -108,16 +127,33 @@ def test_create_vector_index_passes_dimensions(monkeypatch):
     graph_writer.create_vector_index(dimensions=1536)
 
     query, params = driver._session.queries[0]
-    assert "CREATE VECTOR INDEX service_summary_index" in query
+    assert "CREATE VECTOR INDEX service_doc_index" in query
     assert params == {"dimensions": 1536}
 
 
 def test_load_service_state_returns_commit_sha_when_node_exists(monkeypatch):
-    _patch_driver(monkeypatch, [{"commit_sha": "abc123", "local_fingerprint": "fp1"}])
+    _patch_driver(
+        monkeypatch,
+        [
+            {
+                "commit_sha": "abc123",
+                "local_fingerprint": "fp1",
+                "services_fingerprint": "sf1",
+                "pipeline_version": 1,
+            }
+        ],
+    )
 
     state = graph_writer.load_service_state("orders")
 
-    assert state == {"commit_sha": "abc123", "local_fingerprint": "fp1"}
+    assert state == {
+        "commit_sha": "abc123",
+        "local_fingerprint": "fp1",
+        "services_fingerprint": "sf1",
+        # which version of the parsing/embedding code built this graph —
+        # a mismatch forces a rebuild from the same unchanged source
+        "pipeline_version": 1,
+    }
 
 
 def test_load_service_state_returns_none_when_service_never_ingested(monkeypatch):
@@ -127,11 +163,25 @@ def test_load_service_state_returns_none_when_service_never_ingested(monkeypatch
 
 
 def test_load_service_state_handles_node_with_no_commit_sha_yet(monkeypatch):
-    _patch_driver(monkeypatch, [{"commit_sha": None, "local_fingerprint": None}])
+    _patch_driver(
+        monkeypatch,
+        [
+            {
+                "commit_sha": None,
+                "local_fingerprint": None,
+                "services_fingerprint": None,
+                "pipeline_version": None,
+            }
+        ],
+    )
 
     assert graph_writer.load_service_state("orders") == {
         "commit_sha": None,
         "local_fingerprint": None,
+        "services_fingerprint": None,
+        # None for a service ingested before this was recorded — unequal to
+        # any version, so it rebuilds rather than being trusted
+        "pipeline_version": None,
     }
 
 

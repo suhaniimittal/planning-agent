@@ -102,7 +102,6 @@ narrower service list than planning_agent does).
 | `src/coding/repo_ops.py` | this repo | no changes |
 | `src/coding/test_runner.py` | this repo | no changes |
 | `src/ingestion/repo_fetcher.py` | this repo | no changes — `cloned_repo()`, `current_branch_of()` |
-| `src/ingestion/github_api.py` | this repo | no changes — only `create_pull_request()` is actually used here |
 | `src/ingestion/manifest.py` | this repo | no changes — `load_services()` |
 | `services.yaml` | this repo | copy as a starting point; may diverge over time |
 

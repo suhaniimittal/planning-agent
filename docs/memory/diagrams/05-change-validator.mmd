@@ -1,0 +1,17 @@
+flowchart TD
+    Q[Comment on the TDD page] --> K{What kind?}
+    K -- question: why this? --> ANS[Answer from decisions + code<br/>no change]
+    K -- proposal: why not X? / update: X --> VAL[Change validator]
+    VAL --> C1{Consistent with the<br/>story's facts?}
+    C1 -- no --> NO[Refuse, explain which fact it breaks]
+    C1 -- yes --> C2{Technically sound<br/>for this code?}
+    C2 -- no --> NO2[Refuse, explain with the code]
+    C2 -- yes --> C3{Conflicts with an<br/>agreed decision?}
+    C3 -- yes --> C4{Clearly better than<br/>that decision?}
+    C4 -- no --> NO3[Refuse, cite the decision]
+    C4 -- yes --> SUP[Supersede the decision]
+    C3 -- no --> NEW{Already in the TDD?}
+    NEW -- yes --> NOOP[No new version: say where it is]
+    NEW -- no --> APPLY[Revise the TDD]
+    SUP --> APPLY
+    APPLY --> REC[Record: new version, decision, reason<br/>in the system of record and Memsy]

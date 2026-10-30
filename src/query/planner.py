@@ -26,16 +26,43 @@ from typing import get_origin
 
 from pydantic import BaseModel, ValidationError
 
+from src.ingestion import gateway_env
+
 from .models import FileChange, ServicePlan, TechnicalDesignDoc
 
-_GATEWAY_PROVIDER, _GATEWAY_MODEL = "anthropic", "claude-sonnet-4-6"
-_OPENAI_MODEL = "gpt-4o"
+_GATEWAY_PROVIDER = "anthropic"
+# The strongest Claude first (2026-10-23), then the next, so a design is never
+# lost to a model the gateway does not offer. PLANNING_LLM_MODEL puts one first.
+_GATEWAY_MODELS = ("claude-opus-5-5", "claude-opus-4-8", "claude-sonnet-4-6")
+# Room for the TDD itself plus the thinking an Opus model does before writing it.
+_GATEWAY_MAX_TOKENS = 32000
+# Words in a gateway error that mean "this model is not available here".
+_MODEL_REJECTED = re.compile(
+    r"model|not found|404|does not exist|unknown|invalid|unsupported|no such", re.IGNORECASE
+)
+_working_model: str | None = None
+# gpt-5.4, not 5.5: the newer model refuses `temperature` outright ("does not
+# support 0 with this model"), leaving the API default of 1.0, and the same
+# ticket then produced visibly different TDDs run to run. 5.4 is one
+# generation back but accepts both temperature and a seed.
+_OPENAI_MODEL = "gpt-5.4"
+# Models that spend part of the output budget thinking before writing, and
+# whose API takes `max_completion_tokens` rather than `max_tokens`.
+_OPENAI_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+# Models in that family that additionally REFUSE `temperature` (only the
+# default is allowed). Checked before the prefix list above, which they also
+# match. Verified against the API, not assumed.
+_OPENAI_NO_TEMPERATURE_PREFIXES = ("gpt-5.5", "gpt-5.6", "o1", "o3", "o4")
+_OPENAI_REASONING_MAX_TOKENS = 40000
 
-# Low, not the API default of 1.0: the same issue and the same code shown to
-# the model should produce nearly the same TDD — at 1.0, one run named three
-# real backend files and the next only a UI folder, from identical input.
-# Not 0, so the model can still word things naturally.
-_TEMPERATURE = 0.2
+# 0, not the API default of 1.0: the same ticket and the same code must give
+# the same TDD. At 1.0 one run named three real backend files and the next
+# only a UI folder, from identical input.
+_TEMPERATURE = 0
+# Any fixed value; it only has to stay the same across runs so the model
+# starts from the same point. Output is still not byte-identical every time
+# (GPU arithmetic is not perfectly reproducible), but the large swings go.
+_SEED = 7
 
 
 class TddParseError(Exception):
@@ -69,7 +96,247 @@ def _strip_schema_titles(node: object) -> object:
     return node
 
 
-def build_system_prompt() -> str:
+# ---------------------------------------------------------------------------
+# Mode-specific prompt blocks.
+#
+# A bug report and a feature request need different thinking, and sending both
+# sets of rules on every ticket is worse than sending the right one: the
+# bulk-print feature ticket ran through the bug prompt and had to strain its
+# gap analysis through "Not the cause:" lines, while every genuinely new symbol
+# came back as a "modify" of the nearest existing one.
+#
+# Everything mode-independent stays in build_system_prompt's own text, so the
+# shared rules cannot drift between two copies — that is the whole reason this
+# is one function with two inserts rather than two prompts.
+# ---------------------------------------------------------------------------
+
+_BUG_SCOPE = (
+    "4. ONLY FIX WHAT THE TICKET REPORTS — BUT FIX IT END TO END, AND "
+    "EXAMINE THE WHOLE PATH IT DESCRIBES. Two different scopes, and "
+    "conflating them is the most common way this document goes wrong.\n"
+    "   ANALYSIS SCOPE: the description AND the reproduction steps "
+    "together. The steps trace a path through the system — where data is "
+    "submitted, where it travels, where it is checked, where the failure "
+    "shows. EVERY service on that path must be EXAMINED and must APPEAR "
+    "in `services` with an explicit verdict. A reproduction step naming a "
+    "submission names the service that accepts it; that service gets "
+    "examined and gets an entry.\n"
+    "   CHANGE SCOPE: every change required to fix the reported problem "
+    "END TO END, and nothing beyond that. Trace the issue across the "
+    "relevant frontend, backend, persistence and downstream-consumer "
+    "code, and include every change needed to resolve it — even when "
+    "that means more than one service or layer. Do not assume fixing "
+    "the first visible symptom is sufficient: check whether the "
+    "underlying cause can recur, whether data is already persisted in "
+    "an invalid or unnormalised state, and whether other entry points "
+    "or consumers are affected. THE SMALLEST SET OF CHANGES MEANS THE "
+    "SMALLEST SET THAT CORRECTLY ADDRESSES THE ISSUE END TO END — not "
+    "the fewest files, and not a frontend-only or backend-only fix by "
+    "default. A service whose stored value is what the consumer later "
+    "rejects needs its own change, even when fixing the consumer alone "
+    "would make the reported symptom disappear; say which failure each "
+    "change prevents. A service enters the change scope only when "
+    "inspected code shows it must change, or a requirement stated in the "
+    "ticket requires it — and its `reasoning` must say which. Sitting on "
+    "the data path is NOT by itself a reason to change a service, and an "
+    "unrelated change does not become in scope merely because its file "
+    "or service is part of the same data flow. Everything else is out: "
+    "not an improvement you noticed along the way, not a related weakness "
+    "in nearby code, not a second place with the same shape of bug the "
+    "ticket never mentions. Nobody asked for those, and a reviewer will "
+    "reject them. If you genuinely spot a related problem outside the "
+    "report, state it in ONE line under `risks` and propose no change "
+    "for it.\n"
+    "5. WHERE A BAD VALUE IS STORED IS A ROOT CAUSE LOCATION, NOT A "
+    "BYSTANDER. When the ticket describes a value that is supplied in one "
+    "place and rejected in another, find where that exact value is first "
+    "accepted and written down — the field assignment, the mapper, the "
+    "builder, the persistence call. A service that saves a value a "
+    "downstream consumer then rejects is part of the cause, and leaving "
+    "it out is not restraint: it keeps the source producing bad data "
+    "while the symptom is patched downstream. Propose the normalisation "
+    "there as well, not only at the consumer. This is narrow — it covers "
+    "the one value the ticket names, never general hardening of an "
+    "upstream service. When an entry-side fix and a consumer-side fix "
+    "would each resolve the reported failure, state both in "
+    "`proposed_solution` and propose both as changes unless the evidence "
+    "shows one of them is unnecessary, saying what failure each one "
+    "prevents. Never present one as settled while the evidence supports "
+    "both.\n"
+)
+
+_FEATURE_SCOPE = (
+    "4. BUILD WHAT THE TICKET SPECIFIES — ALL OF IT, AND NOTHING BESIDE "
+    "IT. Two different scopes, and conflating them is the most common way "
+    "this document goes wrong.\n"
+    "   ANALYSIS SCOPE: the requirements and acceptance criteria define "
+    "what must exist. EVERY service the requirements reach must be "
+    "EXAMINED and must APPEAR in `services` with an explicit verdict, "
+    "including services that already provide part of what is asked for "
+    "and therefore need no change.\n"
+    "   CHANGE SCOPE: every change required to deliver the stated "
+    "requirements, and nothing beyond them. Each acceptance criterion in "
+    "the ticket maps to at least one proposed change, or to one line "
+    "saying why it is out of scope — a criterion that appears nowhere in "
+    "your answer is a gap in the answer, not in the ticket. THE SMALLEST "
+    "SET OF CHANGES MEANS THE SMALLEST SET THAT DELIVERS THE STATED "
+    "REQUIREMENTS — not the fewest files, and not a frontend-only or "
+    "backend-only design by default. A service enters the change scope "
+    "only when inspected code shows it must change, or a stated "
+    "requirement puts it there — and its `reasoning` must say which. "
+    "Everything else is out: no speculative abstraction, no capability "
+    "for a future requirement nobody asked for, no unrelated refactoring, "
+    "and nothing included merely because its file or service sits near "
+    "the feature. If you spot a related problem outside the requirements, "
+    "state it in ONE line under `risks` and propose no change for it.\n"
+    "5. BUILD ON WHAT IS ALREADY THERE. Before proposing anything new, "
+    "look through the evidence for a mechanism that already does this "
+    "kind of work — an existing validation approach, notification path, "
+    "merge or export routine, repository or client. Prefer extending it "
+    "over writing a competing implementation, and say in `reasoning` "
+    "which existing thing you are extending. A second mechanism standing "
+    "beside one that already works is wrong even when it functions. Do "
+    "not claim an API, field, schema or dependency already exists unless "
+    "the evidence confirms it.\n"
+)
+
+_BUG_ANALYSIS = (
+    "BEFORE writing `root_cause_analysis`, actually TRACE the real "
+    "code you were shown, for yourself: what each relevant function "
+    "receives, what it really does with that data, and what it returns "
+    "— grounded in its actual lines, not in how a similar-sounding bug "
+    '"usually" happens. Do this tracing in your head; WRITE only the '
+    "conclusions it supports (see the format below), never the "
+    "walk-through itself. If a symbol you need has NO real source, say "
+    "so rather than describing its internals as if you'd seen them.\n\n"
+    "TRACE THE REPORTED VALUE THROUGH ITS WHOLE LIFE, AND WRITE THAT "
+    "TRACE DOWN. When the ticket names a specific value (a field, a "
+    "parameter, an input the reporter typed), `root_cause_analysis` "
+    "must carry one line for each stage of that value's life, in "
+    "order. These lines are conclusions, not a walk-through:\n"
+    "Accepted at: <service>/<file>:<symbol> — what is done to it on the "
+    "way in.\n"
+    "Validated at: <service>/<file>:<symbol> — what is checked, and "
+    "what is NOT.\n"
+    "Transformed at: <service>/<file>:<symbol> — any mapper, builder or "
+    "converter it passes through, and whether it is normalised there.\n"
+    "Stored at: <service>/<file>:<symbol> — the exact assignment, "
+    "mapper or builder call that writes it, and whether it is "
+    "normalised first.\n"
+    "Consumed at: <service>/<file>:<symbol> — what reads it and what "
+    "that reader expects.\n"
+    'Write "not shown in the evidence" for any stage you cannot '
+    "locate — never leave a stage out. A validation that does NOT "
+    "reject the value is not exoneration: it is the reason the value "
+    "survives unchanged to the next stage, so say that and keep tracing "
+    "to where it is written. A service whose only involvement is "
+    "storing the value as-is still gets its `Stored at:` line, whether "
+    "or not you go on to propose a change there.\n\n"
+    "Then write `root_cause_analysis` as a few short lines, each one "
+    "starting with its certainty and naming its evidence (service, file "
+    "and symbol), e.g.:\n"
+    "Confirmed: <cause> — <service>/<file>:<symbol>: <what that code does>.\n"
+    "Hypothesis: <cause> — <what you observed that suggests it> — <what "
+    "would confirm it>.\n"
+    "Unknown: <what you could not determine> — <the one file, symbol or "
+    "log that would settle it>.\n"
+    "Not the cause: <ruled-out part> — <why>.\n"
+    "A Confirmed line requires VERIFIED evidence — source you were shown "
+    "and traced. A REPORTED symptom plus an INFERRED connection is a "
+    "Hypothesis however convincing it feels, and the ticket's own "
+    "description of a symptom never establishes a cause on its own. "
+    "Never present a guess as confirmed, and never drop the Unknown "
+    "lines to look more certain than you are.\n\n"
+    "FIX THE CAUSE, NOT ONLY THE SYMPTOM. Decide where the defect "
+    "originates — input acceptance, validation, transformation, "
+    "persistence, business logic, integration or consumption — and then "
+    "answer one question explicitly: can the same invalid state be "
+    "produced again after your proposed fix? If it can, the fix is "
+    "incomplete. Include an UPSTREAM correction when the evidence shows "
+    "an upstream component creates or stores the invalid value "
+    "responsible for the defect. Include a DOWNSTREAM correction when "
+    "its behaviour independently contributes to the reported failure. Do "
+    "NOT modify every service on the data path merely because it "
+    "participates in the flow.\n\n"
+    "PERSISTED DATA. When the defect involves an incorrect or "
+    "inconsistent stored value, say what already-stored data means for "
+    "the fix: whether existing records still fail after the change, and "
+    "which proposed change handles them. Do not recommend a data repair "
+    "or migration unless the evidence shows existing data requires it "
+    "and you can specify the operation safely. A local patch that hides "
+    "the symptom while leaving the verified cause intact is "
+    "insufficient; an extensive refactor that fixes the defect but "
+    "introduces unrelated work is also insufficient.\n\n"
+    "Mirror the same evidence discipline for the proposed system: "
+    "`proposed_solution` (what changes, what stays, which components "
+    "participate, how it resolves the issue), `proposed_architecture` "
+    "(prose — the narrative WHY behind the structure, not a restatement "
+    "of the component list) + `proposed_architecture_components`, and "
+    "`proposed_flow_steps`.\n\n"
+)
+
+_FEATURE_ANALYSIS = (
+    "BEFORE writing anything, actually READ the real code you were "
+    "shown, for yourself: what each relevant symbol already does, what "
+    "it receives and what it returns — grounded in its actual lines, "
+    'not in how a feature like this is "usually" built. Do this in '
+    "your head; WRITE only the conclusions it supports. If a symbol you "
+    "need has NO real source, say so rather than describing its "
+    "internals as if you'd seen them.\n\n"
+    "REQUIREMENTS BEFORE DESIGN. Separate three things and never blur "
+    "them: what the ticket explicitly states, what you are assuming, and "
+    "what it leaves unresolved. State assumptions in `risks` and "
+    "unresolved requirements in `open_questions`. Never invent a "
+    "business rule, and never treat your own design decision as "
+    "something the ticket asked for.\n\n"
+    "`root_cause_analysis` IS A GAP ANALYSIS HERE, NOT A DEFECT HUNT. "
+    "There is no failure to diagnose: the question is what already "
+    "exists, what is missing, and what the missing part should be built "
+    "on. Write short lines, each naming its evidence (service, file and "
+    "symbol):\n"
+    "Exists: <capability> — <service>/<file>:<symbol>: <what it already "
+    "does>.\n"
+    "Missing: <capability the ticket requires> — <why no shown code "
+    "provides it>.\n"
+    "Extend: <service>/<file>:<symbol> — <why this is the right thing to "
+    "build on rather than writing a parallel implementation>.\n"
+    "Unknown: <what you could not determine> — <the one file, symbol or "
+    "schema that would settle it>.\n"
+    "Out of scope: <exclusion the ticket names> — <why>.\n"
+    "An `Exists:` line is how you show you are reusing rather than "
+    "reinventing, so write one for every capability the ticket says the "
+    "platform already has. A `Missing:` line must name a requirement, "
+    "not a gap in your own reading: if the evidence simply does not "
+    "cover something, that is an `Unknown:` line.\n\n"
+    "EVALUATE ONLY THE LAYERS THE REQUIREMENTS REACH: entry points and "
+    "request validation; business logic; API contracts and inter-service "
+    "calls; persistence and data models; events and downstream "
+    "consumers; error handling; authorization and sensitive data; "
+    "backward compatibility. Include a layer only when the requirements "
+    "or the evidence actually put it in play — a layer listed for "
+    "completeness, with nothing specific to say about it, is filler.\n\n"
+    "Mirror the same evidence discipline for the proposed system: "
+    "`proposed_solution` (what gets built, what stays, which components "
+    "participate, how it satisfies the requirements), "
+    "`proposed_architecture` (prose — the narrative WHY behind the "
+    "structure, not a restatement of the component list) + "
+    "`proposed_architecture_components`, and `proposed_flow_steps`.\n\n"
+)
+
+
+def build_system_prompt(mode: str = "bug") -> str:
+    """The planning prompt, with the one block that differs by ticket type.
+
+    `mode` is "bug" or "feature"; anything else falls back to "bug",
+    because the bug prompt degrades far better on a feature ticket than
+    the reverse — a feature run through it merely strains its gap
+    analysis through `Not the cause:` lines, whereas a bug run through
+    the feature prompt loses the value trace that finds where a bad
+    value is written.
+    """
+    mode = mode if mode in ("bug", "feature") else "bug"
+    scope = _BUG_SCOPE if mode == "bug" else _FEATURE_SCOPE
+    analysis = _BUG_ANALYSIS if mode == "bug" else _FEATURE_ANALYSIS
     schema = json.dumps(_strip_schema_titles(TechnicalDesignDoc.model_json_schema()), indent=2)
     return (
         "You are a senior software architect analyzing a requirement/bug "
@@ -82,21 +349,39 @@ def build_system_prompt() -> str:
         "final document; your only job is to fill in accurate, "
         "well-evidenced fields.\n\n"
         "GENERAL RULES\n"
-        "1. Base every factual statement about the existing system on the "
-        "provided documentation or real source-code evidence — never on "
-        "assumed common architecture patterns.\n"
+        "1. EVIDENCE FIRST. Base every factual statement about the existing "
+        "system on the provided documentation or real source-code evidence — "
+        "never on assumed common architecture patterns. Name the service, "
+        "file and symbol each statement comes from.\n"
         "2. Do not invent services, files, classes, functions, APIs, "
         "databases, events, queues, configurations, or dependencies.\n"
         "3. If information cannot be determined, leave the field null/empty "
         "(for a list) rather than guessing, and note the gap in "
-        "`open_questions` or `risks` if it could affect implementation.\n"
-        "4. Keep scope limited to what's actually relevant to the "
-        "requirement — do not include a service or file merely because it "
-        "exists or could theoretically be involved.\n"
-        "5. Distinguish clearly between existing behavior, proposed "
+        "`open_questions` or `risks` if it could affect implementation. Each "
+        "open question must be answerable by looking at one named thing.\n"
+        + scope
+        + "6. Distinguish clearly between existing behavior, proposed "
         "behavior, and the reason for the change — never conflate WHAT "
-        "changes with WHY it changes.\n"
-        "6. NEVER introduce generic domain or compliance knowledge that "
+        "changes with WHY it changes. The project already works: extend it, "
+        "never replace it. List under `preserved_behavior` every existing "
+        "behaviour of the code you change that must keep working — each "
+        "validation with its error message, each side effect, each existing "
+        "feature — read from the real code shown; a change to shared code keeps "
+        "all of them. Earlier designs given with the requirement are decisions "
+        "already made: keep them unless the requirement changes one, and say so. "
+        "Every design must fit the `Technology constraints` given: the language "
+        "version, build tool and libraries the repository really uses — no API or "
+        "syntax from a later version, no new or upgraded dependency unless you "
+        "name it as an open question. "
+        "Between services, every API change must be backward-compatible: never "
+        "remove or rename an endpoint, field, message or event another service "
+        "uses, and never make a new field or parameter required for existing "
+        "callers — add it as optional with a safe default, or add a new versioned "
+        "endpoint and say so in `api_changes`. Read the `API contracts` given for "
+        "what exists today. When more than one service changes, fill "
+        "`rollout_order`: the order to merge and deploy them, a provider before "
+        "its consumers, every step safe on its own.\n"
+        "7. NEVER introduce generic domain or compliance knowledge that "
         "isn't actually stated in the evidence you were given — e.g. do "
         "not mention a compliance standard (PCI DSS, GDPR, SOC 2, ...), a "
         "common design pattern, or a 'typical' way payment/shipping/order "
@@ -106,9 +391,20 @@ def build_system_prompt() -> str:
         "address) is not evidence — it's a plausible-sounding guess, and "
         "this document must never present a guess as an established fact. "
         "If something like this genuinely seems relevant but isn't "
-        "evidenced, say so explicitly in `open_questions` (e.g. \"Whether "
+        'evidenced, say so explicitly in `open_questions` (e.g. "Whether '
         "this system has PCI DSS obligations is not addressed by the "
-        "available documentation/code\") rather than asserting it.\n\n"
+        'available documentation/code") rather than asserting it.\n\n'
+        "FOUR KINDS OF KNOWING, KEPT APART EVERYWHERE YOU WRITE:\n"
+        "  VERIFIED — behavior you can read in source you were actually "
+        "shown.\n"
+        "  REPORTED — a symptom the ticket describes. Evidence that "
+        "something is wrong; never evidence of where or why.\n"
+        "  INFERRED — a conclusion connecting the two. Reasonable, not "
+        "proven.\n"
+        "  UNKNOWN — something the evidence does not settle.\n"
+        "A file or symbol merely EXISTING is not evidence that it needs to "
+        "change, and never makes a proposed change verified. Evidence that a "
+        "symbol is relevant is evidence about what its code DOES.\n\n"
         "Some services below also include a '### Real code symbols' section, "
         "parsed directly from that service's actual source code (real file "
         "paths, line numbers, signatures, and — for a shortlisted subset — "
@@ -129,6 +425,11 @@ def build_system_prompt() -> str:
         "some services grounded in real code, others with only a short "
         "summary — so do not assume uniform confidence across all services "
         "in your answer.\n\n"
+        "A service's own code is the only evidence about that service. Code "
+        "belonging to a different service — even one with a similar name, or "
+        "a front end for the same feature — says nothing about what this one "
+        "does. Never clear a service of needing a change on the strength of "
+        "another service's source.\n\n"
         "Some services are marked as included only because they're "
         "graph-connected to a directly relevant service (a real CALLS "
         "relationship), not because their own content matched the issue — "
@@ -141,21 +442,75 @@ def build_system_prompt() -> str:
         "(`reasoning`) — do not conflate them.\n\n"
         "List anything that couldn't be determined from the documentation "
         "alone in `risks` or `open_questions` rather than stating it as fact.\n\n"
+        "DECIDE WHAT THE CODE LETS YOU DECIDE (2026-10-23). An open question is "
+        "for what neither the ticket nor the code can settle. Where a standard, "
+        "safe engineering answer exists, choose it in the design, say why in "
+        "`reasoning`, and give it a test — do not leave it as a risk:\n"
+        "- Money: the NEW calculation sums and compares in integer minor units "
+        "(paise as a `long`; 2,00,000 INR = 20_000_000 paise). This does NOT "
+        "change how the code stores money: if amounts are stored as `double`, "
+        "keep them so and convert each one where it is read (e.g. "
+        "`Math.round(amount * 100)`), so it is no broader than the ticket. If the "
+        "code already uses a decimal money type (e.g. BigDecimal), use that "
+        "instead. Never sum or compare money as floating point.\n"
+        "- Time rules (day boundaries, time zones): read the time from an "
+        "injectable `Clock` (or the code's existing time source) so a test can "
+        "fix it; production keeps the system clock.\n"
+        "- A check followed by the update it guards (a limit or balance check, "
+        "then the debit): make check and update one atomic step (a lock or "
+        "synchronized block around both) when the code can run concurrently.\n"
+        "- Validation order: keep every existing check, its exception type and "
+        "its position; put a new check where the ticket's rules place it, and "
+        "write the full resulting order in `implementation_notes`.\n"
+        "- A rejected operation must leave state unchanged (balances, history); "
+        "say so and test it.\n\n"
+        "Every service that has a 'Real code symbols' section and is NOT "
+        "marked as graph-connected background context was chosen as likely "
+        "involved in this issue. For EACH of those services, either propose "
+        "at least one concrete change in a file listed in its 'Real code "
+        "symbols' section, or still include it in `services` with an empty "
+        "`changes` list and explain in its `reasoning` exactly what you "
+        "examined and why it needs no change. Never silently leave one out. "
+        "For a service the reported "
+        'problem does not touch, "no change needed" IS the correct answer — '
+        "do not invent work for it to look thorough.\n\n"
         "Leave `service_dependencies` as an empty list — it is filled in "
         "automatically afterward from the real service graph, not by you. "
         "Likewise, leave `has_real_source` on every change as false, and "
         "`verification`/`verification_note` as null — they are also filled "
         "in afterward, from the real code graph, not by you.\n\n"
+        "THE CHAIN MUST BE VISIBLE. A reader follows every change as: "
+        "reported requirement or failure -> what the code does today -> what "
+        "it will do after -> the specific edit that causes that -> the test "
+        "that proves it. If you cannot name the line of the ticket a change "
+        "answers to, you have no basis for that change; drop it or move it "
+        "to `open_questions`.\n\n"
         "For each change, also provide `implementation_notes` — a concrete, "
         "step-by-step description of the approach (not just what and why, "
-        "but roughly how) — `current_behavior` describing what the symbol "
-        "does today (null if genuinely unknown, e.g. a documentation-only "
+        "but roughly how), naming the EXISTING function, component, "
+        "validation pattern or notification mechanism you are reusing. This "
+        "codebase's own conventions come first: a fix that adds a second "
+        "mechanism beside one that already exists is wrong even when it "
+        "works. If the right location or API for the change cannot be "
+        "determined from the evidence, say exactly what must be inspected "
+        "before coding rather than guessing. Also provide "
+        "`current_behavior` describing what the named symbol does today, "
+        "grounded in the lines you were shown and not in the feature "
+        "generally (null if genuinely unknown, e.g. a documentation-only "
         "symbol with no description) — and `acceptance_criteria`: specific, "
-        "testable conditions that would confirm the change is correct. Set "
-        "`change_type` to \"create\" only for a symbol that doesn't exist "
-        "yet, \"delete\" only if it should be removed, and \"modify\" "
-        "otherwise (the default). Estimate `complexity` for each service's "
-        "overall change (\"low\", \"medium\", or \"high\"), describe "
+        "testable conditions that would confirm the change is correct, each "
+        "matching a scenario in `testing_plan`. Set "
+        "`change_type` by what happens to the FILE, not to the symbol: "
+        '"create" ONLY when the file itself does not exist yet, "modify" '
+        "when the file already exists — including when the code you are "
+        'adding to it is brand new — "delete" only if it should be '
+        'removed, and "reference" for a symbol your design only reads, '
+        "calls, or depends on without editing it. New code going into an "
+        'existing file is a "modify": whoever implements a "create" does '
+        "not read the file first, so labelling it that way replaces the "
+        "file's existing contents with only your new code. Estimate "
+        "`complexity` for each service's "
+        'overall change ("low", "medium", or "high"), describe '
         "`responsibility_change` (what that service's responsibilities "
         "become vs. what stays the same), list any `api_changes` (new/"
         "modified/removed endpoints, or an empty list if none), and "
@@ -171,7 +526,60 @@ def build_system_prompt() -> str:
         "given documentation for, this must stay generic, illustrative "
         "pseudocode — you have not seen its actual source, so do not write "
         "language-specific syntax that could be mistaken for verified code, "
-        "or claim exact current implementation details you were not shown.\n\n"
+        "or claim exact current implementation details you were not shown. "
+        "Every identifier a sketch references — a message key, a constant, a "
+        "helper, a component — must be one you actually saw in the evidence. "
+        "If the fix needs something that does not exist yet, write it in the "
+        "sketch AND say in `implementation_notes` that it must be created. "
+        "Presenting a hypothetical helper as an existing repository API is a "
+        "failure, not a shortcut.\n\n"
+        "A SKETCH CHANGES WHAT ITS `change_description` SAYS, AND NOTHING "
+        "ELSE. Diff your sketch against the real source line by line. Every "
+        "line that differs must be one your `change_description` already "
+        "announced. A line you altered in passing — a regular expression you "
+        "narrowed, a guard you dropped, an argument you reordered, a default "
+        "you changed — is an undeclared second change, and nobody reviewing "
+        "this design will be looking for it.\n\n"
+        "Observed, on a one-line fix. The description said to rejoin "
+        "addresses with semicolons instead of commas. The sketch did that "
+        "AND narrowed the split that feeds it from both separators to one. "
+        "The join was the fix; the split was collateral, and it stopped "
+        "comma-separated input being trimmed, so a value that validated "
+        "before the change failed validation after it. The design read as "
+        "correct because the narrowing was never mentioned.\n\n"
+        "So: if a second edit is genuinely needed, SAY SO in "
+        "`change_description` and give it its own line in "
+        "`implementation_notes`, explaining what depends on it. If it is not "
+        "needed, leave that line exactly as the source has it — including "
+        "the parts that look redundant. A condition you did not have to "
+        "touch is a condition you do not get to simplify.\n\n"
+        "WHEN A CHANGE ADDS SOMETHING THAT DOES NOT EXIST YET, NAME THE NEW "
+        "THING. Put the name of the symbol to be CREATED in "
+        "`function_or_symbol`, and name the file it belongs in as "
+        "`file_path`. The nearest existing symbol goes in `reasoning` as "
+        "the anchor you are building beside — never in `function_or_symbol`, "
+        "which misdirects whoever implements it onto a symbol you did not "
+        "intend to touch. Say in `change_description` that the symbol is "
+        "new. The `change_type` still follows the file, so a new symbol "
+        'going into a file that already exists is a "modify" — being new is '
+        "a fact about the symbol, not about the file.\n\n"
+        "A CHANGE THAT CHANGES NOTHING IS NOT A CHANGE. Never describe a "
+        'symbol you are leaving alone as a "modify". Every "create", '
+        '"modify" and "delete" entry becomes a line in the reader\'s list '
+        "of files to edit, so one of them saying 'no change is proposed "
+        "here' sends them to a file they must not touch. You have two "
+        "correct places to put it instead. If the symbol matters to the "
+        "design — your new code calls it, reads it, or depends on its "
+        'current behaviour — give it `change_type` "reference", describe '
+        "in `change_description` what the new code relies on it for, and "
+        "state in `implementation_notes` that this file is NOT edited. If "
+        "the symbol merely turned out to be irrelevant, leave it out of "
+        "`changes` entirely and say so in that service's `reasoning`.\n\n"
+        'A "reference" entry still has to be real and still has to earn '
+        "its place. Name a symbol you were actually shown, and include it "
+        "only when a reader implementing the change would otherwise go "
+        'looking for it. Do not pad `changes` with "reference" entries '
+        "for every symbol you happened to read.\n\n"
         "REQUIREMENTS: split `functional_requirements` (what the system must "
         "do after the change) from `non_functional_requirements` (performance, "
         "reliability, security, scalability, observability) — leave either "
@@ -183,14 +591,17 @@ def build_system_prompt() -> str:
         "hand-drawn ASCII art is unreliable (inconsistent alignment, easy "
         "to skip) and spending effort on it takes attention away from the "
         "reasoning that actually matters. Filling these structured fields "
-        "is NOT optional polish — whenever you can name at least one "
-        "component and one relationship between components (true for "
-        "almost every candidate set you'll see), fill them in; only leave "
-        "them empty when there is truly a single, isolated component with "
-        "nothing to relate it to.\n\n"
-        "`current_architecture_components`: one entry per component you can "
-        "name (a service, a gateway, a database, an external system), each "
-        "with its `name` and a `depends_on` list of the OTHER component "
+        "is NOT optional polish — an incomplete component list renders as a "
+        "visibly broken, half-finished diagram, which is worse than no "
+        "diagram at all.\n\n"
+        "`proposed_architecture_components`: EVERY service you listed in "
+        "`services` MUST appear here as a component — including ones you "
+        "gave an empty `changes` list, since the reader needs to see where "
+        "they sit. Appearing here is NOT a claim that a service changes; "
+        "components show structure, `services` shows changes. Add "
+        "non-service components (a gateway, a database, an external system) "
+        "only when the evidence names them. Each component carries its "
+        "`name` and a `depends_on` list of the OTHER component "
         "names it calls/uses. If a 'Known service dependencies' section "
         "was given to you above, that is CONFIRMED, already-verified real "
         "data — you MUST reflect every one of those pairs in `depends_on` "
@@ -200,51 +611,28 @@ def build_system_prompt() -> str:
         "actually states them — never invented, and never omitted just "
         "because stating a relationship feels like an extra assertion — a "
         "component with real, known dependencies that gets listed with an "
-        "empty `depends_on` is a wrong answer, not a cautious one. "
-        "`current_flow_steps`: the ordered "
-        "steps of what currently happens (e.g. \"Validate input\", "
-        "\"Process request\", \"Persist data\"), each as a `step` label with "
-        "an optional `detail` — use `detail` whenever you have something "
-        "concrete and evidenced to add about that step, not just the label "
-        "alone. Also describe `current_architecture` as prose — this is the "
-        "narrative WHY behind the structure (not a restatement of the "
-        "component list, which is just the WHAT).\n\n"
-        "BEFORE writing `root_cause_analysis`, you must actually TRACE the "
-        "real code you were shown — do not summarize it generically. For "
-        "every function in a 'Real code symbols' section that's relevant "
-        "to this issue, walk through what it literally does, in order: "
-        "what it receives as input, each real operation it performs on "
-        "that data (quoting or closely paraphrasing the actual lines, not "
-        "a generic description like \"processes the request\"), and what "
-        "it returns or passes onward. Only after this literal trace should "
-        "you state `root_cause_analysis` — and the confirmed/likely/"
-        "unknown distinction below must be grounded in that trace, not in "
-        "how a similar-sounding bug \"usually\" happens in systems like "
-        "this. If a symbol you need to reason about has NO real source (a "
-        "documentation-only service), say so explicitly rather than "
-        "describing its internals as if you'd seen them.\n\n"
-        "Then describe `root_cause_analysis`, explicitly distinguishing a "
-        "confirmed cause (evidenced by real code/docs) from a likely cause "
-        "(plausible but unconfirmed) from an unknown cause — never present a "
-        "guess as confirmed. Mirror the same pattern for the proposed "
-        "system: `proposed_solution` (what changes, what stays, which "
-        "components participate, how it resolves the issue), "
-        "`proposed_architecture` (prose) + `proposed_architecture_"
-        "components`, `proposed_flow_steps`, and — whenever more than one "
-        "component is involved anywhere in your answer, which is the "
-        "common case — `sequence_steps`: one entry per call or response, "
-        "each with `from_participant`, `to_participant`, `action` (what's "
-        "being requested/returned), and `direction` (\"call\" or "
-        "\"response\"). Only participants supported by the available "
-        "information belong here — never invent a component just to fill "
-        "it out.\n\n"
-        "`proposed_architecture_components` MUST reflect what your own "
+        "empty `depends_on` is a wrong answer, not a cautious one. A "
+        "component that genuinely calls nothing gets an empty list, but it "
+        "must still be present.\n\n"
+        "`current_flow_steps` and `proposed_flow_steps` are rendered side by "
+        "side, so they must be comparable: the same journey at the same "
+        "granularity in both, traversing the services named in the "
+        "reproduction steps in order. If one has a step for submission, so "
+        "does the other. Each step is a `step` label with an optional "
+        "`detail` — use `detail` whenever you have something "
+        "concrete and evidenced to add about that step, naming the service "
+        "and symbol that performs it, not just the label alone. If the two "
+        "lists describe different journeys, or one stops short of where the "
+        "other ends, the rendered flow looks truncated — reread and fix that "
+        "before responding.\n\n"
+        + analysis
+        + "`proposed_architecture_components` MUST reflect what your own "
         "`proposed_solution` actually changes structurally. If the "
         "proposed solution introduces a new call, a new dependency, or a "
         "new component (e.g. writing to a database, calling another "
         "service, publishing to a queue), that new relationship MUST "
-        "appear in `depends_on` here even if it wasn't present in "
-        "`current_architecture_components` — copying the current list "
+        "appear in `depends_on` here even if it wasn't present before — "
+        "copying the current list "
         "over unchanged is only correct when the fix genuinely introduces "
         "no new structural dependency at all. If your own "
         "`proposed_solution` text describes a new call or dependency that "
@@ -259,10 +647,10 @@ def build_system_prompt() -> str:
         "ones in `service_dependencies`, in another candidate service's "
         "'Real code symbols' section, or explicitly named in the "
         "documentation — never to a generically-named concern the domain "
-        "merely reminds you of. \"This changes how `api_payment_auth` is "
-        "called, which `OrdersController.createOrder` depends on\" is a "
-        "real impact statement; \"this could impact payment processing "
-        "and compliance\" with no specific symbol/service named is not — "
+        'merely reminds you of. "This changes how `api_payment_auth` is '
+        'called, which `OrdersController.createOrder` depends on" is a '
+        'real impact statement; "this could impact payment processing '
+        'and compliance" with no specific symbol/service named is not — '
         "it's filler that sounds thorough without saying anything checkable. "
         "If you genuinely cannot trace a consequence to something specific "
         "you were shown, that itself belongs in `open_questions`, not as a "
@@ -278,38 +666,309 @@ def build_system_prompt() -> str:
         "validation, sensitive data, access control — only what's actually "
         "relevant and supported by the material given, never invented "
         "security mechanisms.\n\n"
+        "TEST WORK IS PART OF THE CHANGE, NOT A TESTING RECOMMENDATION. A "
+        "`testing_plan` scenario describes what must be proved; by itself it "
+        "instructs nobody to write anything. Every scenario marked TO ADD "
+        "must ALSO appear as its own step in `implementation_plan`, placed "
+        "after the production change it covers, naming the production symbol "
+        "being tested, the scenario(s) that step implements, and the test "
+        "file it goes in. A test update required by a production change "
+        "belongs in the plan the same way. A plan that edits production code "
+        "with no step that writes the tests leaves whoever implements it free "
+        "to skip them.\n\n"
+        'A SYMBOL\'S "Tested by" LINE NAMES A TEST THAT ALREADY ASSERTS ITS '
+        "CURRENT BEHAVIOUR. Each symbol in a 'Real code symbols' section says "
+        "either which test file sits beside it or that none does. When your "
+        "change alters what that symbol returns, accepts, rejects, logs, "
+        "renders or otherwise does observably, a test in that file will very "
+        "likely assert the behaviour you are removing. Say so, and propose "
+        "updating it in the same implementation step as the production "
+        "change. Leaving a test that asserts the old behaviour is a failure "
+        "you are introducing, not a problem for someone else. You were given "
+        "the test file's PATH, never its contents, so name the file and the "
+        "behaviour that changed — never quote a test, name a test function, "
+        "or state what it currently asserts.\n\n"
+        "A TEST THAT MUST CHANGE IS A FILE CHANGE, NOT ONLY A PLAN STEP. An "
+        "implementation step describes work; only an entry in `changes` "
+        "names a file for someone to open. So when an existing test file "
+        "sits beside a symbol you are changing and your change alters what "
+        "that symbol does observably, add that TEST FILE to the same "
+        "service's `changes` as its own entry: `file_path` is the test "
+        "file's path exactly as you were given it, `change_type` is "
+        '"modify", `function_or_symbol` is the PRODUCTION symbol whose '
+        "behaviour changed, and `change_description` says which behaviour "
+        "the test must assert instead. You were given that file's PATH and "
+        "never its contents, so do not name a test function or state what "
+        "it currently asserts.\n\n"
+        "USE THE IMPORTS YOU WERE SHOWN; DO NOT INVENT MODULE PATHS. A "
+        "symbol's file may list 'This file imports:'. Those lines are "
+        "verbatim from the file, so any sketch for that file must take its "
+        "module paths, aliases and named exports from them rather than "
+        "from what a project of this kind usually looks like.\n\n"
+        "This matters most for a file you are CREATING, where there is no "
+        "existing import block to inherit: take the paths from a file "
+        "you WERE shown in the same area, and say in "
+        "`implementation_notes` which file you took them from so a reader "
+        "can check. An invented import does not fail as a wrong answer — "
+        "it fails as a build error before any test runs.\n\n"
+        "Never name an exported type, helper or component you were not "
+        "shown. A props type that is not exported cannot be imported, and "
+        "neither can a module path nothing in the evidence references.\n\n"
+        "AN EXISTING TEST IS ALWAYS PREFERRED OVER A NEW ONE. A symbol may "
+        "list 'Existing test files that cover this symbol'. Those "
+        "already exercise it, wherever in the project they live, and one of "
+        "them is where its behaviour is asserted today. When your change "
+        "alters what that symbol does observably, MODIFY one of those files "
+        '— a change with that `file_path` and `change_type` "modify" — '
+        "rather than creating a new test file beside the code.\n\n"
+        "Creating one instead is not a neutral choice. A new test file has "
+        "to be written from nothing, including every import, while an "
+        "existing one is edited in place with its imports already correct. "
+        "And the existing file very likely asserts the behaviour you are "
+        "changing, so leaving it untouched breaks it.\n\n"
+        "Create a new test file only when no existing test names the symbol "
+        "at all, which is the normal case for a symbol you are creating: "
+        "code that did not exist cannot already be tested.\n\n"
+        "TAKE A TEST'S SETUP FROM THE TEST YOU WERE SHOWN. One of those "
+        "files may be quoted in full under 'How ... sets this up today'. "
+        "That is the real file, so its fixture, its render call and the "
+        "props it sets are facts about what this code needs in order to run "
+        "at all — copy them. Do not write a shorter fixture that looks "
+        "sufficient: a missing field makes the component throw on render, "
+        "and a missing flag leaves the thing you are testing disabled or "
+        "absent from the page.\n\n"
+        "Read the quoted test for HOW THE VALUE REACHES THE CODE before "
+        "you write a step that changes it. If the setup passes state in as "
+        "props and the code reads it from there, then simulating a user "
+        "typing does not change what the code sees, and a test built that "
+        "way asserts against the fixture's old value instead of the new "
+        "one. Such a test passes before your fix and fails after it, which "
+        "is the exact opposite of what it is for. Drive the behaviour the "
+        "way the quoted test drives it.\n\n"
+        "WHEN A SYMBOL NAMES WHERE A NEW TEST BELONGS, WRITE THE TEST "
+        "THERE. A symbol with no test beside it may still say where one "
+        'would go ("a new test for it belongs at ...") — that path was '
+        "measured from this service's own layout, not guessed, so use it "
+        "exactly as given: add a change with that `file_path` and "
+        '`change_type` "create", with `function_or_symbol` naming the '
+        "production symbol the test covers. Every scenario you marked TO "
+        "ADD for that symbol must be covered by one of these changes.\n\n"
+        "Only when no path is given anywhere do you leave the test out: "
+        "do NOT invent a path, and do NOT add a change without one — a "
+        "change with no `file_path` is skipped by whoever implements it, "
+        "so the test silently never gets written. Put the question of "
+        "where this project keeps tests for that code into "
+        "`open_questions` instead.\n\n"
+        "When a symbol says no test file sits beside it AND names no test "
+        "that mentions it, do not conclude it is untested: a test may still "
+        "exist that never names it directly. Treat it as "
+        "unknown, and put the question of where this project keeps tests for "
+        "that code into `open_questions`.\n\n"
+        "For every change, `implementation_notes` states which of these is "
+        "true: new tests are required; an existing test beside the symbol "
+        "asserts the behaviour being changed and must be updated; or test "
+        "coverage cannot be determined from the evidence, in which case name "
+        "what must be inspected in `open_questions`. Understanding the "
+        "production code is not evidence that it is tested, so never claim "
+        "coverage is adequate.\n\n"
         "`testing_plan`: a list of concrete test scenarios, each with a "
-        "`category` (\"unit\", \"integration\", \"api\", \"regression\", or "
-        "\"edge_case\"), a `scenario`, and its `expected_result` — alongside "
-        "`testing_notes` for any overall testing narrative that doesn't fit "
-        "a single scenario. `implementation_plan`: an ORDERED list of "
-        "concrete steps across the whole change (e.g. \"Modify X\", \"Add "
-        "validation to Y\", \"Add unit tests\", \"Run regression tests\") — "
-        "only steps actually supported by your analysis above.\n\n"
+        '`category` ("unit", "integration", "api", "regression", or '
+        '"edge_case"), a `scenario`, and its `expected_result`. Every '
+        "change you propose maps to at least one scenario, and every "
+        "scenario maps back to a proposed change — a test for behavior you "
+        "are not changing is out of scope. Include negative cases: invalid "
+        "input, missing input, the boundary just outside what is accepted. "
+        "At least one entry is a `regression` scenario written so it FAILS "
+        "against the code as it exists today and PASSES after your change — "
+        'state both halves explicitly ("today: <observed>; after: '
+        '<expected>"). Write scenarios with concrete inputs and concrete '
+        "expected outputs — an actual value, an actual status, an actual "
+        'error message — never "test that validation works". Each '
+        "scenario says whether it is a test TO ADD or an EXISTING test to "
+        "run, naming an existing one only if you actually saw it in the "
+        "evidence. There is no third kind: NOTHING here executes tests, you "
+        "have run nothing, and no execution results exist — never write "
+        "that a test passed, failed, ran or was verified. `testing_notes` "
+        "carries any overall testing narrative that doesn't fit a single "
+        "scenario.\n\n"
+        "`implementation_plan`: an ORDERED list of concrete steps across "
+        "the whole change. Each step names (a) the verified code location "
+        "it touches, as `<service> <file_path> <symbol>` copied from a "
+        "'Real code symbols' section, (b) the intended change in one line, "
+        "(c) why that step is needed, and (d) which `testing_plan` scenario "
+        "validates it. A step that cannot name a verified location is not "
+        "an implementation step — it is an open question, and belongs "
+        "there instead. The single exception is a step that writes or "
+        "updates tests: test files are not part of the evidence you were "
+        "given, so such a step names the production symbol it covers and "
+        "the test file path it proposes, marked as proposed rather than "
+        "existing — unless a test file was listed beside that symbol, in "
+        "which case name that file. Every file appearing in any change must be "
+        "justified by at least one step. Do not pad the plan with generic "
+        'steps ("review the code", "deploy") your analysis does not '
+        "support. Do NOT number the steps yourself — they are a list and the "
+        'rendering step numbers them, so a step beginning with its own "1." '
+        'is printed as "1. 1.".\n\n'
         "Be as thorough as the documentation actually supports — but if "
         "something isn't described in the docs, say so in `open_questions` "
         "rather than inventing plausible-sounding detail. Thoroughness means "
         "using everything the documentation gives you, not adding facts it "
         "doesn't contain.\n\n"
-        "You no longer need to spend any effort hand-drawing diagrams — that "
-        "is handled separately from structured facts you provide above. "
-        "Put that freed-up effort into DEPTH on `root_cause_analysis`, "
-        "`proposed_solution`, and every `reasoning`/`change_description`/"
-        "`implementation_notes` field: write multiple sentences that "
-        "actually explain the reasoning chain (this is true because X, "
-        "which means Y, therefore Z), not a single terse label. A short "
-        "phrase where a real explanation is possible is a worse answer, "
-        "even if it's not technically wrong.\n\n"
+        "WRITE FOR A BUSY DEVELOPER: short, specific, no repetition. "
+        "The document is read top to bottom by someone who will make the "
+        "change, so every sentence must add a fact they need.\n"
+        "- `issue_summary`: 2-4 sentences restating the reported problem — "
+        "what the user sees, where, and the trigger. No causes or fixes.\n"
+        "- `proposed_solution`: 2-5 sentences — what changes, in which "
+        "services, and how that resolves the issue.\n"
+        "- Each change's `change_description`, `implementation_notes` and "
+        "`reasoning`: 1-3 sentences each, naming the concrete thing (field, "
+        "condition, call) — never restating the issue.\n"
+        "- `function_or_symbol` is exactly ONE symbol name as listed in "
+        "'Real code symbols' (e.g. `isPhoneValid` or `Form.validate`), never "
+        "two names joined with '/' or 'and'. If two functions change, that "
+        "is two separate changes.\n"
+        "- `pseudocode_sketch`: only the lines that change, at most ~10.\n"
+        "- Leave `sequence_steps` empty, leave `current_architecture_"
+        "components` empty, and keep `current_architecture` and "
+        "`overall_reasoning` to one sentence each — they are not shown.\n"
+        "- Don't repeat the same fact in several fields; say it once in the "
+        "field it belongs to.\n"
+        '- No generic recommendation ("add logging", "consider caching", '
+        '"follow best practices") the ticket did not ask for. A concise '
+        "accurate document beats a long one padded with speculation, and an "
+        "empty list is a valid answer.\n\n"
+        "SELF-CHECK BEFORE YOU RESPOND. Your sections are rendered as one "
+        "document and read top to bottom; a reader who finds two sections "
+        "disagreeing stops trusting all of them. Verify:\n"
+        "- every service on the reproduction-step path appears in `services`;\n"
+        "- every service with a non-empty `changes` list has evidence in its "
+        "`reasoning` that it must change, not merely that it sits on the "
+        "data path;\n"
+        '- no service you called "no change needed" also carries changes;\n'
+        "- no root cause is marked Confirmed on reported-symptom evidence "
+        "alone;\n"
+        "- every `file_path` is a plain path with no line range appended;\n"
+        "- no identifier appears in a `pseudocode_sketch` that you did not "
+        "see in the evidence, unless `implementation_notes` says it must be "
+        "created;\n"
+        "- every line a `pseudocode_sketch` changes from the real source is "
+        "one its `change_description` announced — nothing narrowed, dropped "
+        "or tidied along the way;\n"
+        "- every service in `proposed_solution` appears in `services`, in "
+        "`proposed_architecture_components` and in `proposed_flow_steps`;\n"
+        "- every change has an `implementation_plan` step and a "
+        "`testing_plan` scenario, and every acceptance criterion maps to a "
+        "scenario;\n"
+        "- `open_questions` and `risks` do not contradict certainty claimed "
+        "elsewhere;\n"
+        "- every change has test work in `implementation_plan`, or a reason "
+        "grounded in the evidence that it needs none;\n"
+        "- every symbol whose behaviour changes and that named a test file "
+        "beside it has that file in a step;\n"
+        "- nothing claims a test was run.\n\n"
         "Respond with ONLY one JSON object matching this schema, no markdown "
         "fences, no prose outside the JSON:\n" + schema
     )
 
 
-def _format_code_symbol(symbol: dict, snippet: str | None) -> str:
+_MAX_FILE_CONTEXT_NAMES = 20
+
+# How many existing tests are shown whole for one symbol, and how much text
+# that may take. Smallest first, deliberately: of the four tests covering
+# the ATS settings form, the three focused ones are 1,605-3,920 characters
+# and each shows a complete working fixture, while the fourth is a
+# 29,652-char suite for a whole settings tab. The small ones teach the setup
+# in a fraction of the tokens.
+_TESTS_SHOWN_WHOLE = 2
+_TEST_SOURCE_BUDGET_CHARS = 6000
+
+
+def _format_test_sources(paths: list[str], sources: dict[str, str]) -> str:
+    """The smallest of the given tests, shown whole, within a budget.
+
+    Paths alone were never enough. A test file reaches the graph as a
+    fraction of itself — parse_file() extracts functions and classes, and a
+    Jest file is top-level describe()/it() calls and object literals, so a
+    3,920-char test was stored as 192 characters. The planner was therefore
+    told a test existed and shown nothing about how it works, and wrote one
+    that typed into an input and asserted on a callback — for a component
+    whose handler reads its value from its parent's settings, not from the
+    input. The test passed before the fix and failed after it.
+
+    Smallest first: a focused unit test is both shorter and a better model
+    of the setup than a suite covering a whole screen.
+    """
+    available = [(len(sources[p]), p) for p in paths if sources.get(p)]
+    if not available:
+        return ""
+    available.sort()
+    out = ""
+    left = _TEST_SOURCE_BUDGET_CHARS
+    for _, path_ in available[:_TESTS_SHOWN_WHOLE]:
+        source = sources[path_]
+        if len(source) > left:
+            continue
+        left -= len(source)
+        out += (
+            f"\n  How `{path_}` sets this up today — copy this fixture and "
+            f"render, do not invent one:\n  ```\n{source}\n  ```"
+        )
+    return out
+
+
+def _format_code_symbol(
+    symbol: dict,
+    snippet: str | None,
+    file_neighbors: list[str] | None = None,
+    tests_beside: list[str] | None = None,
+    new_test_path: str | None = None,
+    tests_naming_it: list[str] | None = None,
+    imports: str | None = None,
+    test_sources: dict[str, str] | None = None,
+) -> str:
     location = f"{symbol['file_path']}:{symbol['line_start']}-{symbol['line_end']}"
     line = f"- `{location}` `{symbol['qualified_name']}` — `{symbol['signature']}`"
     if symbol.get("docstring"):
         line += f"\n  {symbol['docstring']}"
+    if symbol.get("matched_identifiers"):
+        named = ", ".join(f"`{w}`" for w in symbol["matched_identifiers"])
+        line += f"\n  Contains {named}, named in the issue itself."
+    others = [n for n in file_neighbors or [] if n != symbol["name"]]
+    if others:
+        shown = ", ".join(others[:_MAX_FILE_CONTEXT_NAMES])
+        hidden = len(others) - _MAX_FILE_CONTEXT_NAMES
+        more = f" (+{hidden} more)" if hidden > 0 else ""
+        line += f"\n  Also defined in this file: {shown}{more}"
+    if tests_beside is not None:
+        # Paths only — enough to tell the model a test exists and must be
+        # updated, without test source competing with the real code.
+        if tests_beside:
+            named = ", ".join(f"`{t}`" for t in tests_beside)
+            line += f"\n  Tested by (existing test file beside it): {named}"
+        elif new_test_path:
+            # Where a NEW test belongs, measured from this service's own
+            # habit (graph_reader.test_naming_conventions) — without it the
+            # model is left with nowhere to put the test and can only ask
+            # the question, which leaves the test unwritten.
+            line += (
+                "\n  No test file sits beside this one. Tests in this service sit "
+                f"beside the code they cover, so a new test for it belongs at `{new_test_path}`."
+            )
+        else:
+            line += "\n  No test file sits beside this one in its folder."
+    if tests_naming_it:
+        # Wherever they live — the sibling lookup above only sees the same
+        # folder, and on this project the tests are usually somewhere else.
+        named = ", ".join(f"`{t}`" for t in tests_naming_it)
+        line += f"\n  Existing test files that cover this symbol: {named}"
+        line += _format_test_sources(tests_naming_it, test_sources or {})
+    if imports:
+        # Verbatim, because the point is the exact module paths — a
+        # paraphrase would be no better than guessing.
+        line += "\n  This file imports:\n" + "\n".join(
+            f"    {importline}" for importline in imports.splitlines()
+        )
     if snippet:
         line += f"\n  ```{symbol.get('language') or ''}\n{snippet}\n  ```"
     return line
@@ -322,6 +981,14 @@ def build_user_prompt(
     snippets_by_key: dict[tuple[str, str], str] | None = None,
     seed_names: set[str] | None = None,
     known_dependencies: list[dict] | None = None,
+    file_context: dict[tuple[str, str], list[str]] | None = None,
+    technology_constraints: list[str] | None = None,
+    api_contracts: str = "",
+    sibling_tests: dict[tuple[str, str], list[str]] | None = None,
+    new_test_paths: dict[tuple[str, str], str] | None = None,
+    tests_by_symbol: dict[tuple[str, str], list[str]] | None = None,
+    file_imports: dict[tuple[str, str], str] | None = None,
+    test_sources: dict[tuple[str, str], str] | None = None,
 ) -> str:
     """`known_dependencies`: real CALLS edges among the candidate services,
     read from the graph BEFORE the LLM call — shown here as confirmed
@@ -334,13 +1001,13 @@ def build_user_prompt(
     Giving it the real edges as input directly fixes that.
 
     `seed_names`: services that were DIRECT semantic matches to the issue
-    (vector_search_services hits), as opposed to ones only pulled in via a
+    (the best-scoring services), as opposed to ones only pulled in via a
     1-2 hop CALLS traversal from a seed. `None` (the default) treats every
     candidate as a seed, preserving old behavior for any caller that doesn't
     distinguish them.
 
     Every candidate service only ever gets its short, code-derived `summary`
-    (see summarizer.py) — there is no longer a separate "full doc" tier to
+    (each repository's committed SERVICE.md) — there is no separate tier of
     choose between; the real per-symbol detail comes entirely from
     `code_symbols_by_service`/`snippets_by_key` when a service's code graph
     matched. A seed with no matched code, or a graph-neighbor pulled in via
@@ -351,8 +1018,28 @@ def build_user_prompt(
     """
     code_symbols_by_service = code_symbols_by_service or {}
     snippets_by_key = snippets_by_key or {}
+    file_context = file_context or {}
+    sibling_tests = sibling_tests or {}
+    new_test_paths = new_test_paths or {}
+    tests_by_symbol = tests_by_symbol or {}
+    file_imports = file_imports or {}
+    # Regrouped per service, because a symbol is formatted knowing only its
+    # own service and the test paths attached to it.
+    test_sources_by_service: dict[str, dict[str, str]] = {}
+    for (svc, path_), source in (test_sources or {}).items():
+        test_sources_by_service.setdefault(svc, {})[path_] = source
 
     sections = [f"## Issue\n{issue_text}\n"]
+    if technology_constraints:
+        sections.append(
+            "## Technology constraints (read from the repositories' build files)\n"
+            + "\n".join(f"- {c}" for c in technology_constraints)
+            + "\n"
+        )
+    if api_contracts:
+        sections.append(
+            "## API contracts (current, read from the repositories)\n" + api_contracts + "\n"
+        )
 
     if known_dependencies:
         edges = "\n".join(f"- {d['source']} -> {d['target']}" for d in known_dependencies)
@@ -397,7 +1084,14 @@ def build_user_prompt(
         if code_symbols:
             lines = [
                 _format_code_symbol(
-                    symbol, snippets_by_key.get((doc["name"], symbol["qualified_name"]))
+                    symbol,
+                    snippets_by_key.get((doc["name"], symbol["qualified_name"])),
+                    file_context.get((doc["name"], symbol["file_path"])),
+                    sibling_tests.get((doc["name"], symbol["file_path"])),
+                    new_test_paths.get((doc["name"], symbol["file_path"])),
+                    tests_by_symbol.get((doc["name"], symbol["name"])),
+                    file_imports.get((doc["name"], symbol["file_path"])),
+                    test_sources_by_service.get(doc["name"], {}),
                 )
                 for symbol in code_symbols
             ]
@@ -407,37 +1101,70 @@ def build_user_prompt(
 
 
 def _use_gateway() -> bool:
-    return bool(os.environ.get("AGENTS_GATEWAY_KEY") and os.environ.get("AI_GATEWAY_URL"))
+    return gateway_env.use_gateway()
+
+
+def gateway_models() -> list[str]:
+    """The models to try, in order: the one that last worked, PLANNING_LLM_MODEL,
+    then the strongest available Claude down to the one used before."""
+    chosen = [_working_model, os.environ.get("PLANNING_LLM_MODEL", "").strip()]
+    return list(dict.fromkeys(m for m in [*chosen, *_GATEWAY_MODELS] if m))
 
 
 async def _plan_via_gateway(system_prompt: str, user_prompt: str) -> str:
+    global _working_model
     from agent_lib.gateway.ai import AiGatewayClient
 
+    models = gateway_models()
     async with AiGatewayClient(
-        gateway_key=os.environ["AGENTS_GATEWAY_KEY"],
-        gateway_url=os.environ["AI_GATEWAY_URL"],
+        gateway_key=gateway_env.gateway_key(),
+        gateway_url=gateway_env.gateway_url(),
     ) as client:
-        reply = await client.chat(
-            provider=_GATEWAY_PROVIDER,
-            model_name=_GATEWAY_MODEL,
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            # The schema grew substantially (architecture/flow/sequence
-            # diagrams, requirements, testing plan, etc.), and diagrams are
-            # now explicitly required rather than optional — 8000 was
-            # already a big jump from the original 4000, but multiple
-            # multi-line ASCII diagrams plus everything else can still eat
-            # into it fast.
-            max_tokens=12000,
-            temperature=_TEMPERATURE,
-        )
-        return reply["content"]
+        for model in models:
+            try:
+                reply = await client.chat(
+                    provider=_GATEWAY_PROVIDER,
+                    model_name=model,
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=_GATEWAY_MAX_TOKENS,
+                    temperature=_TEMPERATURE,  # dropped by the SDK for a thinking model
+                )
+            except Exception as error:
+                if model == models[-1] or not _MODEL_REJECTED.search(str(error)):
+                    raise
+                print(f"  [PLANNER] {model} not available ({error}); trying the next model")
+                continue
+            if model != _working_model:
+                print(f"  [PLANNER] answered by {model}")
+            _working_model = model
+            return reply["content"]
+    raise RuntimeError("no model answered")  # unreachable: the last model raises
+
+
+def _openai_params(model: str) -> dict:
+    """Output-length and sampling settings for `model`.
+
+    Three shapes, because the families differ: a thinking model needs
+    `max_completion_tokens` and room to think on top of the TDD itself, and
+    some of those also refuse `temperature`/`seed` entirely.
+    """
+    if model.startswith(_OPENAI_NO_TEMPERATURE_PREFIXES):
+        return {"max_completion_tokens": _OPENAI_REASONING_MAX_TOKENS}
+    if model.startswith(_OPENAI_REASONING_PREFIXES):
+        return {
+            "max_completion_tokens": _OPENAI_REASONING_MAX_TOKENS,
+            "temperature": _TEMPERATURE,
+            "seed": _SEED,
+        }
+    return {"max_tokens": 12000, "temperature": _TEMPERATURE, "seed": _SEED}
 
 
 async def _plan_via_openai(system_prompt: str, user_prompt: str) -> str:
-    from openai import AsyncOpenAI
+    from src.ingestion import local_client
 
-    client = AsyncOpenAI()  # reads OPENAI_API_KEY from the environment
+    # Installed by the laptop launcher; the platform always uses the gateway.
+    client = local_client.new_client()
     resp = await client.chat.completions.create(
         model=_OPENAI_MODEL,
         messages=[
@@ -445,8 +1172,7 @@ async def _plan_via_openai(system_prompt: str, user_prompt: str) -> str:
             {"role": "user", "content": user_prompt},
         ],
         response_format={"type": "json_object"},
-        max_tokens=12000,
-        temperature=_TEMPERATURE,
+        **_openai_params(_OPENAI_MODEL),
     )
     return resp.choices[0].message.content
 

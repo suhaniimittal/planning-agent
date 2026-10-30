@@ -50,6 +50,10 @@ def _inject_fake_openai_module(monkeypatch):
     fake_module = types.ModuleType("openai")
     fake_module.AsyncOpenAI = FakeAsyncOpenAI
     monkeypatch.setitem(sys.modules, "openai", fake_module)
+    # The laptop launcher installs the client class (src/ingestion/local_client.py).
+    from src.ingestion import local_client
+
+    monkeypatch.setattr(local_client, "_factory", FakeAsyncOpenAI)
 
 
 class FakeGatewayClient:
@@ -159,10 +163,15 @@ async def test_embed_via_gateway_concurrent_calls_construct_client_exactly_once(
 
 
 @pytest.mark.asyncio
-async def test_use_gateway_requires_both_env_vars(monkeypatch):
-    monkeypatch.setenv("AGENTS_GATEWAY_KEY", "test-key")
-    # AI_GATEWAY_URL deliberately left unset.
+async def test_the_gateway_is_used_when_a_key_is_given(monkeypatch):
+    """2026-10-13: the platform gives its key as BIFROST_VIRTUAL_KEY / AI_GATEWAY_KEY and
+    may leave AI_GATEWAY_URL unset (the SDK's own default address is used) — as the
+    Jira agents reach it. No key at all (a laptop) means OpenAI directly."""
+    for name in ("AGENTS_GATEWAY_KEY", "BIFROST_VIRTUAL_KEY", "AI_GATEWAY_KEY", "AI_GATEWAY_URL"):
+        monkeypatch.delenv(name, raising=False)
     assert embedder._use_gateway() is False
+    monkeypatch.setenv("BIFROST_VIRTUAL_KEY", "platform-key")
+    assert embedder._use_gateway() is True
 
 
 # --- embed_many: one request for many texts ----------------------------------

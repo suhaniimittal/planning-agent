@@ -1,0 +1,11 @@
+flowchart LR
+    J[Jira story comment<br/>@Aetherion create TDD] --> O[Orchestration]
+    O --> R[Requirement Review<br/>readiness gate 4/5]
+    R --> O
+    O --> P[Planning agent]
+    P <--> G[(Neo4j code graph<br/>encrypted)]
+    P --> O
+    O --> C[Confluence TDD page<br/>v1.0, v1.1, ...]
+    C -- "@Aetherion why not ... / update the TDD" --> O
+    O -- "@Aetherion code" --> K[Coding agent] --> PR[GitHub pull request]
+    PR -- merged --> P

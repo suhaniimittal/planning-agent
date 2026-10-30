@@ -8,12 +8,11 @@ agent's only source of "which repos to analyze" is the `repos` field a
 user typed into the UI form — no yaml file is ever read once this is
 published, each run supplies its own service list as input.
 
-Parses that text directly in this file, rather than importing
-manifest.parse_service_specs: a real platform run proved the exact same
-input/function that works correctly when run locally returns an empty
-result once deployed, while every change in THIS file does take effect —
-meaning something about the deployed build of manifest.py specifically does
-not match its source. Inlining the (small, already-proven-correct) parsing
+Parses that text directly in this file, rather than in manifest.py: a real
+platform run proved the exact same input/function that works correctly when
+run locally returns an empty result once deployed, while every change in
+THIS file does take effect — meaning something about the deployed build of
+manifest.py specifically does not match its source. Inlining the (small, already-proven-correct) parsing
 logic here removes that dependency entirely, regardless of the platform-side
 cause.
 """
@@ -90,4 +89,9 @@ async def run_ingestion(repos_text: str) -> dict:
     from a previous run is left completely untouched."""
     specs = _parse_repos_text(repos_text)
     await run_ingest(specs=specs)
-    return {"status": "success", "services": [s.name for s in specs]}
+    return {
+        "status": "success",
+        "services": [s.name for s in specs],
+        # Where each service lives, so the design can read its build files.
+        "repos": {s.name: s.repo + (f"@{s.branch}" if s.branch else "") for s in specs},
+    }

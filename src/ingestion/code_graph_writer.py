@@ -14,6 +14,7 @@ reconciliation.
 
 from __future__ import annotations
 
+from . import code_crypto
 from .graph_writer import get_driver
 
 # Rows per write transaction. One UNWIND over a whole large repo (tens of
@@ -66,7 +67,19 @@ def create_chunk_vector_index(dimensions: int = 1536) -> None:
 
 
 def upsert_files(service: str, records: list[dict]) -> None:
-    """Each record: {"file_path": str, "language": str}."""
+    """Each record: {"file_path": str, "language": str}, optionally with
+    "imports" — the file's import lines verbatim. Stored on the File node
+    rather than as a symbol because imports belong to the file, not to any
+    class or function in it, and nothing searches them: they are shown to
+    the planner so that code written for this file uses module paths that
+    exist.
+
+    `imports` and `source` (a test file's text) are stored encrypted,
+    named by the file's path (code_crypto)."""
+    records = [
+        code_crypto.encrypt_row(r, label="File", service=service, qualified_name=r["file_path"])
+        for r in records
+    ]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -80,6 +93,8 @@ def upsert_files(service: str, records: list[dict]) -> None:
 
 
 def upsert_classes(service: str, records: list[dict]) -> None:
+    """Source, signature and docstring are stored encrypted (code_crypto)."""
+    records = [code_crypto.encrypt_row(r, label="Class", service=service) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -93,6 +108,8 @@ def upsert_classes(service: str, records: list[dict]) -> None:
 
 
 def upsert_functions(service: str, records: list[dict]) -> None:
+    """Source, signature and docstring are stored encrypted (code_crypto)."""
+    records = [code_crypto.encrypt_row(r, label="Function", service=service) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -106,6 +123,9 @@ def upsert_functions(service: str, records: list[dict]) -> None:
 
 
 def upsert_chunks(service: str, records: list[dict]) -> None:
+    """The text is stored encrypted, with the hashes of its words beside it
+    (``text_terms``) so the exact-name search still works (code_crypto)."""
+    records = [_sealed_chunk(service, r) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -117,6 +137,13 @@ def upsert_chunks(service: str, records: list[dict]) -> None:
         batch_size=_CHUNK_WRITE_BATCH,
         service=service,
     )
+
+
+def _sealed_chunk(service: str, row: dict) -> dict:
+    if "text" not in row or code_crypto.is_encrypted(row["text"]):
+        return code_crypto.encrypt_row(row, label="Chunk", service=service)
+    terms = code_crypto.text_terms(service, row["text"] or "")
+    return {**code_crypto.encrypt_row(row, label="Chunk", service=service), "text_terms": terms}
 
 
 def create_has_chunk_edges(service: str, function_to_chunk_qnames: list[tuple[str, str]]) -> None:
@@ -285,7 +312,10 @@ def rename_file(service: str, old_path: str, new_path: str) -> None:
     reparse. `qualified_name` (which embeds the OLD path textually) is left
     untouched: it's just a stored identifier, and nothing downstream
     recomputes a symbol's file_path from it — file_path is always read as
-    its own explicit property, never derived from qualified_name."""
+    its own explicit property, never derived from qualified_name.
+
+    The File node's encrypted fields are named by its path, so they are
+    unlocked under the old path and sealed again under the new one."""
     with get_driver().session() as session:
         session.run(
             """
@@ -297,6 +327,34 @@ def rename_file(service: str, old_path: str, new_path: str) -> None:
             service=service,
             old_path=old_path,
             new_path=new_path,
+        )
+        records = list(
+            session.run(
+                """
+                MATCH (f:File {service: $service, file_path: $new_path})
+                RETURN f.source AS source, f.imports AS imports
+                """,
+                service=service,
+                new_path=new_path,
+            )
+        )
+        if not records:
+            return
+        opened = code_crypto.decrypt_row(
+            dict(records[0]), label="File", service=service, qualified_name=old_path
+        )
+        sealed = code_crypto.encrypt_row(
+            opened, label="File", service=service, qualified_name=new_path
+        )
+        session.run(
+            """
+            MATCH (f:File {service: $service, file_path: $new_path})
+            SET f.source = $source, f.imports = $imports
+            """,
+            service=service,
+            new_path=new_path,
+            source=sealed["source"],
+            imports=sealed["imports"],
         )
 
 
@@ -316,31 +374,3 @@ def get_aggregated_file_references(service: str) -> list[str]:
             service=service,
         )
         return [r["target"] for r in result]
-
-
-def load_current_symbols(service: str) -> tuple[list[dict], list[dict]]:
-    """(classes, functions) currently in the graph for `service`, each a
-    plain dict shaped for summarizer.build_digest — used to rebuild a
-    service's summary digest WITHOUT a fresh RepoGraph (an incremental run
-    only reparses the files that changed, so it never has the service's
-    full symbol set in memory; this reads it back from Neo4j instead,
-    never from a repo clone)."""
-    with get_driver().session() as session:
-        result = session.run(
-            """
-            MATCH (n)
-            WHERE (n:Class OR n:Function) AND n.service = $service
-            RETURN n.qualified_name AS qualified_name, n.name AS name,
-                   n.file_path AS file_path, n.language AS language,
-                   n.docstring AS docstring, n.is_method AS is_method,
-                   n.parent_class AS parent_class, labels(n)[0] AS kind
-            """,
-            service=service,
-        )
-        classes: list[dict] = []
-        functions: list[dict] = []
-        for record in result:
-            row = dict(record)
-            kind = row.pop("kind")
-            (classes if kind == "Class" else functions).append(row)
-        return classes, functions

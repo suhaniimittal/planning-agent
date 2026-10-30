@@ -161,35 +161,6 @@ def test_fetch_file_content_raises_on_http_failure(monkeypatch):
         github_api.fetch_file_content("org/orders-service", "app.py", "abc123")
 
 
-def test_create_pull_request_returns_html_url(monkeypatch):
-    captured = {}
-
-    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
-        captured["url"] = url
-        captured["json"] = json
-        return FakeResponse({"html_url": "https://github.com/org/orders-service/pull/7"})
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-
-    html_url = github_api.create_pull_request(
-        "org/orders-service", head="fix/branch", base="main", title="t", body="b"
-    )
-
-    assert html_url == "https://github.com/org/orders-service/pull/7"
-    assert captured["url"] == "https://api.github.com/repos/org/orders-service/pulls"
-    assert captured["json"] == {"title": "t", "body": "b", "head": "fix/branch", "base": "main"}
-
-
-def test_create_pull_request_raises_on_http_failure(monkeypatch):
-    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
-        raise httpx.ConnectError("boom")
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-
-    with pytest.raises(github_api.GitHubApiError):
-        github_api.create_pull_request("org/orders-service", head="fix/branch", base="main", title="t", body="b")
-
-
 def test_download_zipball_returns_bytes_and_follows_redirects(monkeypatch):
     seen = {}
 
