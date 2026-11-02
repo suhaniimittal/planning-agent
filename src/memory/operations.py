@@ -100,11 +100,24 @@ def remember(payload: dict) -> dict:
         snapshot = record.with_version(
             snapshot, version, str(payload.get("page_id") or ""), facts_hash
         )
+    decisions = list(payload.get("decisions") or [])
+    superseded = [str(s) for s in payload.get("superseded") or []]
+    if version and decisions:
+        # A TDD version lists every decision it keeps (decisions_block asks for
+        # each kept one with its id), so the story's own decisions it no longer
+        # lists are replaced (BTS-38 v1.1, 2026-10-30: "max 50" stayed agreed
+        # next to the "max 60" that replaced it).
+        listed = {str(d.get("id")) for d in decisions if d.get("id")}
+        superseded += [
+            d["id"]
+            for d in record.agreed(snapshot)
+            if d["story_key"] == issue_key and d["id"] not in listed and d["id"] not in superseded
+        ]
     snapshot, stored_decisions = record.with_decisions(
         snapshot,
         issue_key,
-        list(payload.get("decisions") or []),
-        superseded=[str(s) for s in payload.get("superseded") or []],
+        decisions,
+        superseded=superseded,
         source=str(payload.get("source") or ""),
     )
     return {"facts": stored_facts, "decisions": stored_decisions, "snapshot": snapshot}

@@ -114,3 +114,26 @@ async def test_the_story_text_is_remembered_and_compared_next_time():
         "BTS-25: a daily cap of 2,00,000 INR.", snapshot, judge=judge, extract=extract
     )
     assert found["verdict"] == "reworded" and text in prompts[0]
+
+
+def test_a_new_version_retires_the_story_s_decisions_it_no_longer_lists():
+    # BTS-38 v1.1, live 2026-10-30: "max 50" stayed agreed next to "max 60".
+    first = _record(
+        tdd_version="v1.0",
+        decisions=[
+            {"id": "note-50", "choice": "max 50"},
+            {"id": "paise", "choice": "long paise"},
+        ],
+    )
+    second = _record(
+        first,
+        tdd_version="v1.1",
+        decisions=[{"id": "note-60", "choice": "max 60"}, {"id": "paise", "choice": "long paise"}],
+    )
+    assert sorted(d["id"] for d in record.agreed(second)) == ["note-60", "paise"]
+
+
+def test_a_record_without_a_version_retires_nothing():
+    first = _record(tdd_version="v1.0", decisions=[{"id": "note-50", "choice": "max 50"}])
+    second = _record(first, decisions=[{"id": "extra", "choice": "c"}])
+    assert sorted(d["id"] for d in record.agreed(second)) == ["extra", "note-50"]
