@@ -1,6 +1,6 @@
 """The conversation about a TDD, kept in Memsy (2026-10-26).
 
-Neo4j keeps what was decided (facts, versions, decisions). Memsy keeps the
+record.py keeps what was decided (facts, versions, decisions). This keeps the
 conversation: the questions and cross-questions people ask about a TDD, the
 answers, and a note for each published version, so a later question is
 answered knowing what was already discussed, even on another day.

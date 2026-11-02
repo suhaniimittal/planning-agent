@@ -1,38 +1,24 @@
 {
     "name": "planning_agent",
     "version": "1.0.0",
-    "description": "Syncs the service graph, then turns a requirement or bug report into a downloadable technical design doc.",
+    "description": "Turns a Jira card, its ranked services and its answered questions into a plain-English technical design and a work order, reading code only through GitHub's API.",
     "config": {
         "triggers": [
             {
-                "name": "issue_text",
+                "name": "planning_input",
                 "type": "textarea",
                 "required": true,
-                "description": "Plain-text requirement or bug report",
-                "friendly_name": "Issue"
+                "description": "The card as JSON: {\"card\": {key, type, title, description, files}, \"services\": [{service, repo, branch, rank, reason, prs, path}], \"questions\": [{question, answers}], \"issue_key\" (optional)}.",
+                "friendly_name": "Planning input"
             },
             {
-                "name": "repos",
-                "type": "textarea",
-                "required": true,
-                "description": "One service per line: 'name: org/repo' or 'name: org/repo@branch'. Example:\norders: myorg/orders-service\npayment: myorg/payment-service@develop",
-                "friendly_name": "Repositories"
-            },
-            {
-                "name": "issue_key",
-                "type": "text",
-                "required": false,
-                "description": "Optional: the Jira ticket ID, e.g. KS-17531. With it, the design reads and is saved to that ticket's memory, so a later run builds on this one.",
-                "friendly_name": "Issue key"
-            },
-            {
-                "name": "uploaded_files",
+                "name": "attachments",
                 "type": "file",
                 "required": false,
                 "multiple": true,
-                "accepts": ".png,.jpg,.jpeg,.webp,.gif",
-                "description": "Optional: screenshots from the ticket (up to 5). They are shown to the planner with the code.",
-                "friendly_name": "Screenshots"
+                "accepts": ".png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md",
+                "description": "Optional: the card's files (images, PDFs, text). Add one, then more. Describe each in Planning input under card.files, with the same name: {\"name\": \"screenshot.png\", \"description\": \"what it shows\"}.",
+                "friendly_name": "Attachments"
             }
         ]
     }

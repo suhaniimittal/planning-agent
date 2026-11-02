@@ -1,35 +1,21 @@
-"""Prompt construction, the LLM planning call, and parsing its output into a
-TechnicalDesignDoc.
+"""The model call every part of Planning makes (2026-11-02: trimmed to it).
 
-Same provider-fallback split as ingestion/embedder.py: AI Gateway if
-AGENTS_GATEWAY_KEY + AI_GATEWAY_URL are set, else OpenAI directly. Only the
-OpenAI path can request native JSON mode (the gateway's chat() has no
-response_format parameter), so the prompt itself is the primary mechanism
-for valid JSON, with parse_tdd() as the defensive safety net.
-
-That safety net now also repairs, not just detects, one common real-world
-failure: the schema is large (many optional narrative fields per service/
-change), and a model occasionally omits one required field (e.g. a single
-service's `reasoning`) while getting everything else right. Treating that
-as a hard failure means the ENTIRE run produces nothing — the same
-"one gap shouldn't abort the whole thing" principle already used throughout
-ingestion (one bad file/repo/chunk never aborts that run either).
+AI Gateway when a gateway key is set (the platform), else OpenAI directly (a
+laptop). Only the OpenAI path can ask for native JSON and send images; the
+gateway's chat() takes text only. Callers parse what comes back: the TDD
+flow (src/tdd/flow.py), the requirement facts and the equivalence judge
+(src/memory), and the design Q&A (design_qa.py).
 """
 
 from __future__ import annotations
 
-import copy
-import json
+import base64
 import os
 import re
-from typing import get_origin
-
-from pydantic import BaseModel, ValidationError
 
 from src.ingestion import gateway_env
 
 from .images import around_slot
-from .models import FileChange, ServicePlan, TechnicalDesignDoc
 
 _GATEWAY_PROVIDER = "anthropic"
 # The strongest Claude first (2026-10-23), then the next, so a design is never
@@ -67,51 +53,6 @@ _TEMPERATURE = 0
 # (GPU arithmetic is not perfectly reproducible), but the large swings go.
 _SEED = 7
 
-
-class TddParseError(Exception):
-    """Raised when the LLM's raw output can't be parsed into a TechnicalDesignDoc."""
-
-
-_SCHEMA_NODE_MARKERS = ("type", "$ref", "allOf", "anyOf", "enum")
-
-
-def _strip_schema_titles(node: object) -> object:
-    """Pydantic's model_json_schema() adds a "title" key to every schema
-    NODE purely as cosmetic metadata (the class/field name, title-cased) —
-    e.g. the whole schema's own top-level "title": "TechnicalDesignDoc"
-    sits directly above the TDD's actual `title` FIELD's schema (itself
-    carrying its own cosmetic "title": "Title"). Dumped raw into the
-    prompt, that collision is a real, observed failure mode: the model
-    echoed the schema's class name back as the TDD's title verbatim.
-
-    Only removes "title" from a dict that looks like an actual schema node
-    (one of the markers above present as a sibling key) — NOT from a
-    "properties" mapping, whose keys are real field names (one of which is
-    legitimately "title" itself, e.g. TechnicalDesignDoc.title) and must
-    never be dropped just because a key happens to match this string."""
-    if isinstance(node, dict):
-        stripped = {k: _strip_schema_titles(v) for k, v in node.items()}
-        if "title" in stripped and any(marker in stripped for marker in _SCHEMA_NODE_MARKERS):
-            del stripped["title"]
-        return stripped
-    if isinstance(node, list):
-        return [_strip_schema_titles(v) for v in node]
-    return node
-
-
-# ---------------------------------------------------------------------------
-# Mode-specific prompt blocks.
-#
-# A bug report and a feature request need different thinking, and sending both
-# sets of rules on every ticket is worse than sending the right one: the
-# bulk-print feature ticket ran through the bug prompt and had to strain its
-# gap analysis through "Not the cause:" lines, while every genuinely new symbol
-# came back as a "modify" of the nearest existing one.
-#
-# Everything mode-independent stays in build_system_prompt's own text, so the
-# shared rules cannot drift between two copies — that is the whole reason this
-# is one function with two inserts rather than two prompts.
-# ---------------------------------------------------------------------------
 
 def _use_gateway() -> bool:
     return gateway_env.use_gateway()
@@ -152,6 +93,33 @@ async def _plan_via_gateway(system_prompt: str, user_prompt: str) -> str:
                 print(f"  [PLANNER] answered by {model}")
             _working_model = model
             return reply["content"]
+    raise RuntimeError("no model answered")  # unreachable: the last model raises
+
+
+async def describe_image(image, prompt: str, system_prompt: str) -> str:
+    """What an image shows, in words, from the gateway's vision call (2026-11-02):
+    its chat() takes text only, so a ticket's screenshot reaches the planner
+    on the platform as this description. ``image`` is an images.TicketImage."""
+    from agent_lib.gateway.ai import AiGatewayClient
+
+    models = gateway_models()
+    async with AiGatewayClient(
+        gateway_key=gateway_env.gateway_key(),
+        gateway_url=gateway_env.gateway_url(),
+    ) as client:
+        for model in models:
+            try:
+                return await client.describe_image(
+                    provider=_GATEWAY_PROVIDER,
+                    model_name=model,
+                    prompt=prompt,
+                    image_b64=base64.b64encode(image.data).decode(),
+                    media_type=image.media_type,
+                    system_prompt=system_prompt,
+                )
+            except Exception as error:
+                if model == models[-1] or not _MODEL_REJECTED.search(str(error)):
+                    raise
     raise RuntimeError("no model answered")  # unreachable: the last model raises
 
 
@@ -205,115 +173,3 @@ async def call_llm(system_prompt: str, user_prompt: str, images=None) -> str:
             print(f"  [TDD] images: the gateway path cannot send images; {len(images)} left out")
         return await _plan_via_gateway(system_prompt, user_prompt)
     return await _plan_via_openai(system_prompt, user_prompt, images)
-
-
-def _model_for_loc(loc: tuple) -> type[BaseModel] | None:
-    """The known schema is only ever nested two levels deep — services[i]
-    (ServicePlan), and services[i].changes[j] (FileChange) — so this is a
-    fixed lookup by loc shape, not a generic walker."""
-    if len(loc) == 1:
-        return TechnicalDesignDoc
-    if len(loc) == 3 and loc[0] == "services":
-        return ServicePlan
-    if len(loc) == 5 and loc[0] == "services" and loc[2] == "changes":
-        return FileChange
-    return None
-
-
-def _placeholder_for(model_cls: type[BaseModel], field_name: str) -> object | None:
-    field = model_cls.model_fields.get(field_name)
-    if field is None:
-        return None
-    if get_origin(field.annotation) is list:
-        return []
-    if field.annotation is bool:
-        return False
-    return "Not provided by the model — verify manually."
-
-
-def _repair_missing_fields(data: dict, errors: list[dict]) -> tuple[dict, list[str]] | None:
-    """Best-effort: if EVERY validation error is a MISSING required field
-    (never a wrong type/value for a field that IS present — that's a real
-    problem, not a gap worth papering over), fill each with a clearly-
-    labeled placeholder instead of failing the whole parse. Returns the
-    repaired data plus a human-readable note per repair (surfaced in the
-    final TDD's open_questions, never silently hidden), or None if any
-    error can't be confidently repaired this way.
-    """
-    if not errors or not all(e["type"] == "missing" for e in errors):
-        return None
-
-    repaired = copy.deepcopy(data)
-    notes = []
-    for e in errors:
-        loc = e["loc"]
-        model_cls = _model_for_loc(loc)
-        if model_cls is None:
-            return None
-        placeholder = _placeholder_for(model_cls, loc[-1])
-        if placeholder is None:
-            return None
-        target = repaired
-        try:
-            for key in loc[:-1]:
-                target = target[key]
-            target[loc[-1]] = placeholder
-        except (KeyError, IndexError, TypeError):
-            return None
-        notes.append(
-            f"Model response was missing required field "
-            f"'{'.'.join(str(part) for part in loc)}' — filled with a "
-            "placeholder; verify this section manually."
-        )
-    return repaired, notes
-
-
-_TRAILING_LINE_RANGE = re.compile(r":\d+-\d+$")
-
-
-def _strip_line_ranges(tdd: TechnicalDesignDoc) -> TechnicalDesignDoc:
-    """Defense-in-depth, not a substitute for the prompt fix: the model is
-    shown each real code symbol's location as `path:START-END` (see
-    _format_code_symbol) and occasionally echoes that whole string back
-    into `file_path` instead of the bare path. A downstream coding-agent
-    step resolves `file_path` as a literal path on disk — a stray
-    `:START-END` suffix would make every lookup for that file silently
-    fail (never found in the graph, never found in a clone), so it's
-    stripped here unconditionally rather than trusted from the model's own
-    output, same "verify/normalize, don't just hope" principle already
-    used for service_dependencies/has_real_source elsewhere in this
-    pipeline."""
-    for service_plan in tdd.services:
-        for change in service_plan.changes:
-            if change.file_path:
-                change.file_path = _TRAILING_LINE_RANGE.sub("", change.file_path)
-    return tdd
-
-
-def parse_tdd(raw_llm_output: str) -> TechnicalDesignDoc:
-    text = raw_llm_output.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise TddParseError(f"not valid JSON: {e}\nRaw: {raw_llm_output[:500]}") from e
-
-    try:
-        return _strip_line_ranges(TechnicalDesignDoc.model_validate(data))
-    except ValidationError as e:
-        repair = _repair_missing_fields(data, e.errors())
-        if repair is None:
-            raise TddParseError(f"JSON didn't match schema: {e}") from e
-        repaired_data, notes = repair
-        try:
-            tdd = TechnicalDesignDoc.model_validate(repaired_data)
-        except ValidationError as e2:
-            raise TddParseError(
-                f"JSON didn't match schema even after filling missing fields: {e2}"
-            ) from e2
-        tdd.open_questions = [*notes, *tdd.open_questions]
-        return _strip_line_ranges(tdd)

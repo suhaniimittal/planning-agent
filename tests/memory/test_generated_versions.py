@@ -4,9 +4,9 @@ next version, seen by no other ticket until the TDD is published."""
 
 import pytest
 
-from src.memory import operations, record
-from src.query.models import DesignDecision, TechnicalDesignDoc
-from src.tools import query_tools
+from src.memory import hooks, operations, record
+from src.query.models import DesignDecision
+from src.tdd.models import TddDocument
 from tests.memory.fake_memsy import FakeMemsy
 
 LIMIT = {
@@ -111,7 +111,7 @@ async def test_before_planning_the_memory_says_what_changed_and_what_was_decided
         lambda key: [{**_decision("title-width"), "story_key": "KS-1", "applies_to": ON_GRID}],
     )
 
-    memory = await query_tools._memory_before("ks-1", "story", ["ui"])
+    memory = await hooks.memory_before("ks-1", "story", ["ui"])
 
     assert "last written as version 2" in memory["text"]
     assert "daily_limit: 2,00,000 -> 5,00,000" in memory["text"]
@@ -125,7 +125,7 @@ async def test_memory_that_cannot_be_read_never_stops_a_tdd(monkeypatch, capsys)
 
     monkeypatch.setattr(operations, "check_story", down)
 
-    assert await query_tools._memory_before("KS-1", "story", ["ui"]) is None
+    assert await hooks.memory_before("KS-1", "story", ["ui"]) is None
     assert "planning without it" in capsys.readouterr().out
 
 
@@ -137,13 +137,13 @@ async def test_after_planning_the_tdd_is_saved_as_the_next_version(memsy, monkey
         notes.append((args, kwargs))
         return True
 
-    monkeypatch.setattr(query_tools.conversation, "remember_version", remember_version)
-    tdd = TechnicalDesignDoc(
-        title="Keep the header on one line", issue_summary="s", overall_reasoning="r", services=[],
+    monkeypatch.setattr(hooks.conversation, "remember_version", remember_version)
+    tdd = TddDocument(
+        title="Keep the header on one line",
         decisions=[DesignDecision(id="title-width", title="t", choice="c", reason="r")],
     )
 
-    await query_tools._memory_after("ks-1", "story", CHECKED, tdd)
+    await hooks.memory_after("ks-1", "story", CHECKED, tdd)
 
     assert [d["id"] for d in record.proposed_decisions("KS-1")] == ["title-width"]
     assert notes[0][0][:2] == ("KS-1", "1")

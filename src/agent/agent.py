@@ -1,20 +1,13 @@
 """Agent — planning_agent.
 
-Thin Aetherion binding covering the whole pipeline in one call: syncs the
-service graph for exactly the repos named in ``repos`` (``run_ingestion`` —
-a full clone the first time a service is ingested, a git-diff incremental
-sync with no clone every run after), then produces a technical design doc
-for ``issue_text`` (``generate_technical_design``). With ``repos`` and no
-``issue_text`` it only syncs the graph — how the orchestrator refreshes it
-after a merge. No pipeline logic lives
-here — per the SDK's "no direct I/O in the agent" rule, both tools do all
-the actual clone/parse/Neo4j/LLM work; this just orchestrates the two calls
-via ``toolExecutor.execute`` and shapes the result for the platform UI.
-
-``repos`` is the ONLY source of "which services exist" once this is
-published — deliberately not services.yaml, which this agent never reads.
-Each run supplies its own service list as input, so a user never needs
-access to this project's source to point it at a different/new repo.
+Thin Aetherion binding. A Jira card with its ranked services and questions
+becomes a plain-English TDD and a work order (``plan_tdd``, src/tdd): the
+code is seen only through GitHub's REST API, never cloned and never stored.
+The other modes are Orchestration's: ``discuss`` (a question on a published
+TDD, answered without code), ``facts`` and ``record`` (the ticket's memory).
+No pipeline logic lives here — per the SDK's "no direct I/O in the agent"
+rule, the tools do all the GitHub, storage and LLM work; this routes the
+payload and shapes the result for the platform UI.
 
 The one piece of logic here is the error boundary. A workflow that raises
 shows up in the console as a failed run with *no output to summarise*, which
@@ -25,6 +18,7 @@ itself. Nothing is swallowed: the full traceback still reaches the worker log.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import timedelta
 from typing import Any
@@ -32,23 +26,11 @@ from typing import Any
 from aetherion_sdk import agent, toolExecutor
 from temporalio.common import RetryPolicy
 
-# Neither tool call below specifies a timeout by default, which leaves it at
-# whatever the platform's own default activity timeout is — observed in a
-# real run to be far too short (~30s) for genuine work: a large repo's first
-# ingestion embeds tens of thousands of chunks, and a TDD's one LLM
-# call gets slower the more matched code it's given. Both are set generously
-# here instead of trusting that default, since the real risk isn't a logic
-# bug — it's a correct, slow run getting killed mid-flight by an undersized
-# clock (confirmed via a real run: the PDF was uploaded successfully only
-# seconds after Temporal had already given up and reported a timeout).
-#
-# Ingestion has no practical limit: Temporal requires some timeout on every
-# activity (left unset, it falls back to a short default), so this is a
-# ceiling only a truly stuck run would ever hit, not a cap on large repos.
-_INGESTION_TIMEOUT = timedelta(hours=6)
-# With the lookup loop (PLANNER_LOOP) a TDD makes several model calls: the
-# loop is told to answer by 6 minutes (tool_loop.MAX_SECONDS), and this
-# leaves room past that for its last rounds, the context and the PDF.
+# Left unset, a tool call gets the platform's default activity timeout —
+# observed in a real run to be far too short (~30s) for genuine work. A TDD
+# makes up to three model calls (scout, writer, one repair) plus its GitHub
+# calls, so it is given room; the real risk is a correct, slow run killed
+# mid-flight by an undersized clock.
 _TDD_TIMEOUT = timedelta(minutes=15)
 # A TDD is never re-run on its own. A timed-out step was not stuck — it was
 # slow — and running it again starts a second, identical, paid run beside
@@ -71,90 +53,18 @@ def _workflow_id() -> str | None:
 @agent(name="planning_agent")
 async def planning_agent(payload: dict[str, Any]) -> dict[str, Any]:
     workflow_id = _workflow_id()
-    issue_text = payload.get("issue_text")
-    repos_text = payload.get("repos") or ""
-    # An empty form field arrives as null, not as a missing key, and both
-    # mean "use the default". Deliberately passed on AS None rather than
-    # resolved here: a second copy of the numbers in this workflow silently
-    # overrode the real defaults, so generate_technical_design owns them.
-    top_k = payload.get("top_k")
-    hops = payload.get("hops")
     requested = str(payload.get("mode") or "").strip().lower()
     if requested == "discuss":
         return await _discuss(payload, workflow_id)
     if requested in _MEMORY_MODES:
         return await _MEMORY_MODES[requested](payload, workflow_id)
-    # Optional override. Left unset (the normal case), the ticket is
-    # classified from its own text during the issue split.
-    mode = payload.get("mode") or None
-    # Optional screenshots. "uploaded_files" is the platform's own key for a
-    # `file` field: a list of storage keys (the files are already uploaded),
-    # or nothing when none were attached.
-    uploaded = payload.get("uploaded_files") or []
-    image_keys = [uploaded] if isinstance(uploaded, str) else list(uploaded)
-    try:
-        ingestion = await toolExecutor.execute(
-            "run_ingestion", repos_text, start_to_close_timeout=_INGESTION_TIMEOUT
-        )
-        if not str(issue_text or "").strip():
-            # Graph refresh only: the orchestrator sends this when a pull
-            # request is merged, so the next design sees the latest code.
-            # There is no requirement to design for, so no TDD is written.
-            return {
-                "status": "success",
-                "mode": "graph_sync",
-                "services": (ingestion or {}).get("services", []),
-                "results": [],
-            }
-        # The orchestrator asks for the document itself, to publish it in
-        # Confluence and give its text to Coding.
-        return_document = bool(payload.get("return_document"))
-        result = await toolExecutor.execute(
-            "generate_technical_design",
-            issue_text,
-            top_k,
-            hops,
-            # The TDD considers only the services this run listed.
-            ingestion["services"],
-            return_document,
-            # Their repositories: the build files give the design its versions.
-            dict(ingestion.get("repos") or {}),
-            mode,
-            image_keys,
-            # Its decisions in force, and its project's, are kept (2026-10-26).
-            str(payload.get("issue_key") or "") or None,
-            start_to_close_timeout=_TDD_TIMEOUT,
-            retry_policy=_TDD_RETRY,
-        )
-
-        structured_results = [
-            {
-                "type": "s3_download_link",
-                "title": "Technical Design Document",
-                "file_key": result["s3_key"],
-                "label": "Download TDD (PDF)",
-                "extension": "pdf",
-            }
-        ]
-
-        out = {"status": "success", "results": structured_results}
-        if return_document:
-            out["document"] = {k: result.get(k, "") for k in ("title", "confluence_html", "text")}
-            # The decisions the design uses, for Orchestration to record (2026-10-26).
-            out["document"]["decisions"] = list(result.get("decisions") or [])
-        return out
-    except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
-        logger.error("planning_agent run failed: %s", error, exc_info=True)
-        return {
-            "status": "error",
-            "error": type(error).__name__,
-            "message": (
-                f"The run failed before it could produce a technical design: "
-                f"{type(error).__name__}: {error}"
-            )[:500],
-            "issue_text": issue_text,
-            "details": {"workflow_id": workflow_id},
-        }
+    if payload.get("planning_input") or isinstance(payload.get("card"), dict):
+        return await _plan(payload, workflow_id)
+    return {
+        "status": "error",
+        "error": "MissingInput",
+        "message": "Fill in Planning input: the card, its ranked services and its questions.",
+    }
 
 
 async def _discuss(payload: dict[str, Any], workflow_id: str | None) -> dict[str, Any]:
@@ -191,7 +101,7 @@ async def _discuss(payload: dict[str, Any], workflow_id: str | None) -> dict[str
     return {"status": "success", "mode": "discuss", **answer}
 
 
-# --- memory and bug investigation (2026-10-26) ------------------------------------------
+# --- memory (2026-10-26) ----------------------------------------------------------------
 
 
 def _failed(what: str, error: Exception, workflow_id: str | None) -> dict[str, Any]:
@@ -240,25 +150,95 @@ async def _record(payload: dict[str, Any], workflow_id: str | None) -> dict[str,
     return {"status": "success", "mode": "record", "stored": stored}
 
 
-async def _investigate(payload: dict[str, Any], workflow_id: str | None) -> dict[str, Any]:
-    """A bug's root cause in the code graph (contract mode "investigate")."""
-    report_text = str(payload.get("report_text") or "").strip()
-    if not report_text:
-        return {
-            "status": "error",
-            "error": "MissingInput",
-            "message": "An investigation needs the bug report's text.",
-        }
+_MEMORY_MODES = {"facts": _facts, "record": _record}
+
+
+# --- the TDD with no stored code (2026-11-02) -------------------------------------------
+
+_INPUT_KEYS = ("card", "services", "questions", "issue_key")
+
+
+async def _plan(payload: dict[str, Any], workflow_id: str | None) -> dict[str, Any]:
+    """A card, its ranked services and its questions -> a plain-English TDD and
+    a work order, the code seen only through GitHub's API (src/tdd).
+
+    The input comes as the form's `planning_input` (JSON text) or as the
+    object's own keys (Orchestration). Uploaded files come as storage keys —
+    the form folds every file field into `uploaded_files` — and/or an
+    `attachments` list of keys or {key, name, description}; each is joined to
+    the card file that describes it."""
+    raw = payload.get("planning_input")
+    if not raw:
+        raw = json.dumps({k: payload[k] for k in _INPUT_KEYS if k in payload})
+    elif not isinstance(raw, str):
+        raw = json.dumps(raw)
+    attachments = _uploads(payload)
     try:
-        found = await toolExecutor.execute(
-            "investigate_bug",
-            report_text,
-            str(payload.get("repos") or ""),
+        result = await toolExecutor.execute(
+            "plan_tdd",
+            raw,
+            attachments,
             start_to_close_timeout=_TDD_TIMEOUT,
+            retry_policy=_TDD_RETRY,
         )
     except Exception as error:  # noqa: BLE001 - surface the failure, never hide it
-        return _failed("The investigation", error, workflow_id)
-    return {"status": "success", "mode": "investigate", "investigation": found}
+        logger.error("planning_agent plan failed: %s", error, exc_info=True)
+        return {
+            "status": "error",
+            "error": type(_root(error)).__name__,
+            # The innermost message: an invalid input lists every problem there.
+            "message": f"The TDD could not be written: {_root(error)}"[:2000],
+            "details": {"workflow_id": workflow_id},
+        }
+    # The run's result is the TDD itself (the PDF link) and whether it is final;
+    # the PDF holds everything else, the work order and the warnings included.
+    out = {
+        "status": "success",
+        "mode": "plan",
+        "tdd_status": result["status"],
+        "results": [
+            {
+                "type": "s3_download_link",
+                "title": "Technical Design Document",
+                "file_key": result["s3_key"],
+                "label": "Download TDD (PDF)",
+                "extension": "pdf",
+            }
+        ],
+    }
+    if result["status"] == "draft":
+        out["draft_reason"] = result["draft_reason"]
+    if result.get("confluence_url"):
+        out["confluence_url"] = result["confluence_url"]
+    if payload.get("return_document"):
+        # Orchestration asks for the document itself: to publish it in
+        # Confluence, give Coding the work order and record the decisions.
+        out["document"] = {
+            k: result.get(k) for k in ("title", "text", "confluence_html", "decisions")
+        }
+        out["work_order"] = result["work_order"]
+        out["warnings"] = result["warnings"]
+        out["evidence"] = result.get("evidence") or {}
+    return out
 
 
-_MEMORY_MODES = {"facts": _facts, "record": _record, "investigate": _investigate}
+def _uploads(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """[{key, name?, description?}]: every uploaded file, in order. A field
+    holds one storage key, a list of them, or (Orchestration) dicts."""
+    out = []
+    for field in ("uploaded_files", "attachments"):
+        value = payload.get(field) or []
+        for item in [value] if isinstance(value, str | dict) else list(value):
+            if isinstance(item, dict) and item.get("key"):
+                out.append(dict(item))
+            elif isinstance(item, str) and item.strip():
+                out.append({"key": item.strip()})
+    return out
+
+
+def _root(error: BaseException) -> BaseException:
+    """The error at the bottom of Temporal's wrapping (ActivityError ->
+    ApplicationError -> ...), whose message says what actually went wrong."""
+    while getattr(error, "cause", None) is not None:
+        error = error.cause
+    return error

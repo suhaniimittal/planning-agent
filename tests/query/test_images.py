@@ -2,9 +2,7 @@ import types
 
 import pytest
 
-from src.query import context as ctx
 from src.query import images, planner
-from src.query import prompt as prompts
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 20
@@ -35,21 +33,6 @@ def test_at_most_five_images_are_used():
     loaded = images.load([f"k{i}.png" for i in range(8)], lambda key: PNG)
 
     assert len(loaded) == images.MAX_IMAGES
-
-
-def test_the_screenshots_sit_right_after_the_issue_before_the_code():
-    prompt = prompts.build_user_prompt(
-        "Controls shift.", [{"name": "ui", "summary": "s"}], ctx.Context(),
-        image_names=["before.png", "after.png"],
-    )
-
-    assert "## Screenshots (2, in this order)\n1. before.png\n2. after.png" in prompt
-    assert "the before screen is how it should stay" in prompt
-    head, tail = images.around_slot(prompt)
-    assert head.startswith("## Issue\nControls shift.") and head.endswith(images.SLOT)
-    assert "## Code" in tail and "## Code" not in head
-    assert "## Screenshots" not in prompts.build_user_prompt(
-        "i", [{"name": "ui", "summary": "s"}], ctx.Context())
 
 
 def test_a_prompt_without_the_slot_is_all_head():

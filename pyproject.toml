@@ -15,9 +15,9 @@ dependencies = [
     "httpx",
     # Memsy: the conversation about each TDD (src/memory/conversation.py, 2026-10-26).
     "memsy==0.3.5",
-    # AES-256-GCM / HKDF / HMAC for the code stored in Neo4j (src/ingestion/code_crypto.py).
+    # AES-256-GCM / HKDF / HMAC for the memory snapshots kept in Memsy
+    # (src/ingestion/code_crypto.py, used by src/memory/record.py).
     "cryptography>=43",
-    "neo4j",
     "pydantic>=2.13,<3",
     "pyyaml",
     # pyhanko (pulled in by xhtml2pdf, for a PDF-signing feature this project
@@ -26,22 +26,13 @@ dependencies = [
     # containers often ship with no system timezone database at all, so
     # that import fails outright with ZoneInfoNotFoundError unless the
     # Python-side tzdata package (a pure-Python, platform-independent
-    # bundle of the IANA database — no wheel-availability concern like
-    # tree-sitter-language-pack had) is installed as a fallback.
+    # bundle of the IANA database, with no platform wheel to miss) is
+    # installed as a fallback.
     "tzdata",
-    "tree-sitter",
-    # Pinned to 0.13.0, not latest: every release from 1.0.0 through 1.20.0
-    # (the latest) publishes NO Linux wheel at all — only macOS. The
-    # Aetherion platform runs on Linux, so an unpinned/latest install there
-    # silently breaks this entire import, cascading into run_ingestion
-    # failing to register as a tool at all. 0.13.0 is the newest release
-    # that still ships real Linux wheels, has the exact same public API
-    # (get_parser/get_language/get_binding, same signature), and supports
-    # every language this project parses (python/java/typescript/tsx/
-    # javascript/kotlin/graphql) — confirmed by running the full test suite
-    # against it before pinning, not just checked for importability.
-    "tree-sitter-language-pack==0.13.0",
     "xhtml2pdf",
+    # The text of a PDF attached to a card (src/tdd/attachments.py, 2026-11-02).
+    # Pure Python and BSD: no platform wheel to miss.
+    "pypdf",
     # Pinned explicitly: arize-phoenix (a transitive dep of aetherion-sdk,
     # never imported by our own code) pulls in strawberry-graphql, which in
     # turn requires a graphql-core version it's actually compatible with.

@@ -1,84 +1,42 @@
 """Renders a TDD as an actual downloadable PDF — the file a user downloads
-from planning_agent's own UI and hands, unmodified, to coding_agent's PDF
-input. Kept separate from render.py (which only ever produces text/markup,
-never bytes) for the same one-module-per-responsibility reason
-confluence_api.py is its own file.
+from planning_agent's own UI and hands to coding_agent's PDF input.
 
-Deliberately reuses render_text()'s exact content rather than building a
-second, separate document layout: coding_agent's own PDF-extraction step
-re-derives the structured TDD from this PDF's text via an LLM call, so
-whatever render_text() already produces (section-numbered, unambiguous
-plain text) is also the ideal shape for that later extraction — a fancier
-visual layout would only risk making that extraction less reliable, not
-more.
+The same HTML body Confluence gets (src/tdd/render.py), with a print style:
+headings, tables and numbered steps in a proportional font, so it reads as
+a document (2026-11-02; before, it was the plain text in one monospace
+block). Its text still comes out cleanly for coding_agent's extraction.
 
 xhtml2pdf, not PyMuPDF: PyMuPDF is AGPL, which is a real licensing concern
 for code that ships as part of a product; xhtml2pdf is BSD-licensed. It
-converts HTML to PDF, so the plain text is wrapped in a minimal HTML shell
-(a single <pre> block) rather than reformatted — the wrapping is only there
-to give xhtml2pdf something to render, not to restyle the content.
+supports a subset of CSS 2: the style below keeps to it.
 """
 
 from __future__ import annotations
 
 import html
 import io
-import textwrap
+import json
 
-from .models import TechnicalDesignDoc
-from .render import render_text
-
-# xhtml2pdf ignores `white-space: pre-wrap`/`word-wrap`, so a <pre> line is
-# never wrapped: anything past ~105 characters (9pt monospace on an A4 page)
-# is drawn off the right edge — still in the file's text, but invisible to a
-# reader. Lines are therefore wrapped here, before xhtml2pdf sees them.
-_WRAP_WIDTH = 100
-# A first line this short after wrapping is a label ("- ", "File:", "- modify:")
-# that lost its value to the next line.
-_MAX_LEAD_IN = 12
-
-
-def _split_long(line: str, continuation: str) -> list[str]:
-    """Splits a line that's still too long after word wrapping — one
-    unbreakable token, almost always a deep file path — right after a "/",
-    never inside a name, so a reader (or coding_agent reading this text)
-    sees whole path segments. A hard cut only if there's no "/" to use."""
-    pieces: list[str] = []
-    while len(line) > _WRAP_WIDTH:
-        cut = line.rfind("/", len(continuation) + 1, _WRAP_WIDTH) + 1 or _WRAP_WIDTH
-        pieces.append(line[:cut])
-        line = continuation + line[cut:]
-    pieces.append(line)
-    return pieces
-
-
-def _wrap_lines(text: str) -> str:
-    """Wraps every line longer than _WRAP_WIDTH. Continuation lines keep the
-    original line's indentation plus two spaces, so nested sections still
-    read as nested; a single over-long token (e.g. a deep file path) is split
-    at a "/" rather than left running off the page."""
-    wrapped: list[str] = []
-    for line in text.splitlines():
-        if len(line) <= _WRAP_WIDTH:
-            wrapped.append(line)
-            continue
-        indent = line[: len(line) - len(line.lstrip(" "))]
-        continuation = indent + "  "
-        pieces = textwrap.wrap(
-            line,
-            width=_WRAP_WIDTH,
-            subsequent_indent=continuation,
-            break_long_words=False,
-            break_on_hyphens=False,
-        )
-        # textwrap puts a token too long for the line (a deep path) on a line
-        # of its own, stranding a short lead-in like "- " or "File:" above it;
-        # rejoin them — _split_long then breaks the path at a "/" instead.
-        if len(pieces) > 1 and len(pieces[0].strip()) <= _MAX_LEAD_IN:
-            pieces = [pieces[0] + " " + pieces[1].strip(), *pieces[2:]]
-        for piece in pieces:
-            wrapped.extend(_split_long(piece, continuation))
-    return "\n".join(wrapped)
+_STYLE = """
+@page { size: A4; margin: 1.8cm 1.6cm; }
+body { font-family: Helvetica; font-size: 9.5pt; color: #1f2328; line-height: 1.35; }
+h1 { font-size: 17pt; margin: 0 0 2pt 0; }
+h2 { font-size: 12.5pt; margin: 14pt 0 5pt 0; padding-bottom: 2pt;
+     border-bottom: 0.6pt solid #b8bec6; }
+h3 { font-size: 10.5pt; margin: 8pt 0 3pt 0; }
+h4 { font-size: 10pt; margin: 8pt 0 2pt 0; }
+p { margin: 3pt 0; }
+p.meta { color: #59636e; font-size: 9pt; margin-bottom: 8pt; }
+p.note { background-color: #fff4d6; padding: 4pt; border: 0.6pt solid #e0c26a; }
+p.foot { color: #59636e; font-size: 8.5pt; margin-top: 14pt; }
+ul, ol { margin: 2pt 0 2pt 0; }
+li { margin-bottom: 2pt; }
+table { width: 100%; margin: 3pt 0 6pt 0; }
+th, td { border: 0.5pt solid #c9ced4; padding: 3pt 4pt; vertical-align: top;
+         text-align: left; font-size: 9pt; }
+th { background-color: #eef1f4; }
+table.kv th { width: 16%; }
+"""
 
 
 class PdfRenderError(Exception):
@@ -86,22 +44,33 @@ class PdfRenderError(Exception):
     not treat a failed render as an empty-but-valid file."""
 
 
-def _html_shell(text: str) -> str:
-    escaped = html.escape(text)
-    return (
-        "<html><head><style>"
-        "body { font-family: monospace; font-size: 9pt; }"
-        "pre { white-space: pre-wrap; word-wrap: break-word; }"
-        "</style></head><body><pre>" + escaped + "</pre></body></html>"
-    )
+TASK_KEY = "/CodingTask"
 
 
-def render_pdf(tdd: TechnicalDesignDoc) -> bytes:
+def pdf_from_html(body_html: str, title: str = "", task: dict | None = None) -> bytes:
+    """An HTML body (src/tdd/render.render_html) as a styled A4 PDF. `task`
+    (render.coding_task) goes into the file's metadata under TASK_KEY, as
+    JSON: not shown on any page, read by coding_agent instead of the text."""
     from xhtml2pdf import pisa
 
-    text = _wrap_lines(render_text(tdd))
+    page = (
+        f"<html><head><meta charset='utf-8'><title>{html.escape(title)}</title>"
+        f"<style>{_STYLE}</style></head><body>{body_html}</body></html>"
+    )
     buffer = io.BytesIO()
-    result = pisa.CreatePDF(_html_shell(text), dest=buffer)
+    result = pisa.CreatePDF(page, dest=buffer, encoding="utf-8")
     if result.err:
-        raise PdfRenderError(f"xhtml2pdf reported {result.err} error(s) rendering {tdd.title!r}")
-    return buffer.getvalue()
+        raise PdfRenderError(f"xhtml2pdf reported {result.err} error(s) rendering {title!r}")
+    if task is None:
+        return buffer.getvalue()
+    return _with_metadata(buffer.getvalue(), {TASK_KEY: json.dumps(task, ensure_ascii=False)})
+
+
+def _with_metadata(pdf: bytes, entries: dict[str, str]) -> bytes:
+    from pypdf import PdfWriter
+
+    writer = PdfWriter(clone_from=io.BytesIO(pdf))
+    writer.add_metadata(entries)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()

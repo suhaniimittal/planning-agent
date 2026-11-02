@@ -2,10 +2,13 @@
 
 A design discussion happens in comments on the TDD's Confluence page. The
 orchestrator hands each question here with the TDD as it stands and the
-discussion so far. The answer is grounded in the TDD and in the code the
-question touches (the same graph a TDD is written from): it explains the
-reasoning, weighs the alternative honestly, and says whether the design should
-change. It never changes the TDD itself — a person asks for that explicitly.
+discussion so far. The answer is grounded in the TDD, the story's facts, the
+decisions in force and the earlier discussion — never in code: since
+2026-11-02 no code is read, stored or cloned to answer a question. Where an
+answer depends on code the TDD does not describe, it says so and names the
+file to check. It explains the reasoning, weighs the alternative honestly,
+and says whether the design should change. It never changes the TDD itself —
+a person asks for that explicitly.
 
 One model call, same provider switch as planner.py: AI Gateway when
 AGENTS_GATEWAY_KEY + AI_GATEWAY_URL are set, else OpenAI directly.
@@ -17,26 +20,26 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 
-from src.ingestion.embedder import embed
-
-from . import graph_reader, planner
+from . import planner
 
 _MAX_TDD_CHARS = 30_000
-_MAX_SNIPPETS = 8
 
 SYSTEM_PROMPT = """You are the software architect who wrote a Technical Design Document (TDD).
 A reviewer comments on the design page: a question, a proposed alternative, or a requested
 change. You answer, and you are also the GATE for changes: the TDD changes only for a valid
 modification.
 
-Ground everything ONLY in the TDD, the story's facts, the decisions in force, the discussion
-and the code excerpts given. Never invent code, files or facts.
+Ground everything ONLY in the TDD, the story's facts, the decisions in force and the
+discussion. You have no access to the code: never invent code, files or facts. Where the
+answer depends on code the TDD does not describe, say so and name the file to check (only
+files the TDD names). Answer in plain words, with no code.
 
 The comment's KIND is given:
 - question ("why this?"): explain the reasons and trade-offs. verdict "answer_only".
 - proposal ("why not X?") or update ("update the TDD: X"): judge each requested change:
   1. Does it contradict the story's facts (the requirement)? Then refuse it, naming the fact.
-  2. Is it technically worse or wrong for THIS code? Then refuse it, with the code reason.
+  2. Is it technically worse or wrong for this design as the TDD describes it? Then refuse
+     it, with the reason.
   3. Does it contradict a DECISION IN FORCE? Refuse it, citing the decision id — unless it is
      clearly better, then apply it and list that decision id in "supersedes".
   4. Is it already in the TDD? Then it is "already_present": say where.
@@ -45,8 +48,8 @@ The comment's KIND is given:
   "already_present" (nothing new to do).
 For every change you apply that is a design choice (how money is computed, a check's place in
 the validation order, how time is read, concurrency handling, ...), add it to
-"new_decisions" with a short stable id slug, title, choice, reason, and applies_to (only real
-files from the TDD or code shown: {"service","file_path","symbol"}).
+"new_decisions" with a short stable id slug, title, choice, reason, and applies_to (only files
+the TDD names: {"service","file_path","symbol"}).
 
 Respond with ONLY a JSON object:
 {
@@ -66,13 +69,13 @@ LEGACY_SYSTEM_PROMPT = (
     """You are the software architect who wrote a Technical Design Document (TDD).
 A reviewer asks you a question about it in a comment on the design page.
 
-Answer as the author, in plain language, grounded ONLY in the TDD, the discussion so far and
-the code excerpts given. Never invent code, files or facts that are not there.
+Answer as the author, in plain language, grounded ONLY in the TDD and the discussion so far.
+You have no access to the code: never invent code, files or facts that are not there.
 
-- "Why this approach?": give the concrete reasons from the TDD and the code (constraints,
-  existing structure, risk, effort), and what was traded off.
+- "Why this approach?": give the concrete reasons from the TDD (constraints, existing
+  structure, risk, effort), and what was traded off.
 - "Why not <alternative>?": evaluate the alternative fairly — where it would be better, where
-  it would be worse for THIS codebase and requirement — and conclude.
+  it would be worse for THIS design and requirement — and conclude.
 - If the alternative, or the reviewer's point, is genuinely better, say so and recommend a change.
 
 Respond with ONLY a JSON object:
@@ -103,40 +106,10 @@ class DesignAnswer:
         return asdict(self)
 
 
-async def _related_code(question: str, tdd_text: str) -> list[str]:
-    """The code the question is most likely about: chunks near the question.
-
-    Every service is searched, best SERVICE.md match first (2026-10-23): a
-    service without a SERVICE.md has no doc embedding, so the doc index alone
-    never returned it and its questions were answered without seeing any code.
-    The chunks' own similarity decides what is shown.
-    """
-    try:
-        embedding = await embed(f"{question}\n\n{tdd_text[:2000]}")
-        scores = graph_reader.summary_scores(embedding)
-        services = sorted(scores, key=lambda name: -scores[name])
-        hits = graph_reader.vector_search_chunks(embedding, services, k=_MAX_SNIPPETS * 3)
-    except Exception as error:  # noqa: BLE001 - an answer from the TDD alone is still useful
-        print(f"  [DESIGN Q&A] no code context: {type(error).__name__}: {error}")
-        return []
-    seen: set[tuple[str, str]] = set()
-    out: list[str] = []
-    for hit in hits:
-        key = (hit["service"], hit["function_qualified_name"])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(f"[{hit['service']}] {hit['function_qualified_name']}\n{hit['text']}")
-        if len(out) >= _MAX_SNIPPETS:
-            break
-    return out
-
-
 def build_user_prompt(
     question: str,
     tdd_text: str,
     discussion: list[str],
-    code: list[str],
     kind: str = "question",
     facts: list[dict] | None = None,
     decisions: list[dict] | None = None,
@@ -153,8 +126,6 @@ def build_user_prompt(
     parts += ["", "TDD (as it stands):", tdd_text[:_MAX_TDD_CHARS]]
     if discussion:
         parts += ["", "DISCUSSION SO FAR (oldest first):", *discussion]
-    if code:
-        parts += ["", "RELATED CODE (from the code graph):", *code]
     return "\n".join(parts)
 
 
@@ -223,20 +194,18 @@ def override(change: str) -> DesignAnswer:
     )
 
 
-def legacy_user_prompt(question: str, tdd_text: str, discussion: list[str], code: list[str]) -> str:
+def legacy_user_prompt(question: str, tdd_text: str, discussion: list[str]) -> str:
     parts = [f"QUESTION:\n{question.strip()}", "", "TDD (as it stands):", tdd_text[:_MAX_TDD_CHARS]]
     if discussion:
         parts += ["", "DISCUSSION SO FAR (oldest first):", *discussion]
-    if code:
-        parts += ["", "RELATED CODE (from the code graph):", *code]
     return "\n".join(parts)
 
 
 async def legacy_answer(question: str, tdd_text: str, discussion: list[str] | None = None) -> dict:
-    """The answer exactly as before 2026-10-26: answer, change_recommended, proposed_change."""
-    code = await _related_code(question, tdd_text)
+    """The answer in its shape from before 2026-10-26: answer, change_recommended,
+    proposed_change."""
     raw = await planner.call_llm(
-        LEGACY_SYSTEM_PROMPT, legacy_user_prompt(question, tdd_text, list(discussion or []), code)
+        LEGACY_SYSTEM_PROMPT, legacy_user_prompt(question, tdd_text, list(discussion or []))
     )
     a = parse_answer(raw)
     return {
@@ -257,9 +226,8 @@ async def answer_question(
     kind = kind if kind in KINDS else "question"
     if kind == "update_override":
         return override(question.strip())
-    code = await _related_code(question, tdd_text)
     raw = await planner.call_llm(
         SYSTEM_PROMPT,
-        build_user_prompt(question, tdd_text, list(discussion or []), code, kind, facts, decisions),
+        build_user_prompt(question, tdd_text, list(discussion or []), kind, facts, decisions),
     )
     return parse_answer(raw)

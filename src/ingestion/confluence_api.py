@@ -1,10 +1,9 @@
 """Talks to Confluence Cloud's REST API to publish a TDD as a real page.
 
-Same auth convention as the rest of this pipeline's external calls
-(repo_fetcher.py/github_api.py): credentials come from the environment,
-never hardcoded. Confluence Cloud uses HTTP Basic auth with the account
-email + an API token (the same kind of token Jira uses — same Atlassian
-account, same token, different product).
+Same auth convention as the agent's other external calls (GitHub, Memsy):
+credentials come from the environment, never hardcoded. Confluence Cloud
+uses HTTP Basic auth with the account email + an API token (the same kind
+of token Jira uses — same Atlassian account, same token, different product).
 """
 
 from __future__ import annotations

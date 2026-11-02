@@ -1,8 +1,8 @@
 """Planning's memory in Memsy (2026-10-26): what a story requires, which TDD
 version answered it, and the design decisions its versions keep.
 
-Neo4j keeps only the code. Memsy keeps the memory, next to the conversation
-about the same TDD (conversation.py):
+Memsy keeps the memory, next to the conversation about the same TDD
+(conversation.py):
 
     actor  tdd:<STORY>       session memory:<STORY>:<seq>:<part>   the story's snapshots
     actor  project:<PROJECT> session memory:project:<PROJECT>:...  the project's agreed decisions
