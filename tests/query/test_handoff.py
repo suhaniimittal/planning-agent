@@ -20,7 +20,7 @@ PAYLOAD = {
             "service": "statement-service",
             "repo": "AetherionAgentDemo/bank",
             "branch": "main",
-            "rank": 7,
+            "rank": 3,
             "reason": "The remark must appear on the statement",
             "prs": [],
         },
@@ -28,7 +28,7 @@ PAYLOAD = {
             "service": "imps-service",
             "repo": "AetherionAgentDemo/bank",
             "branch": "main",
-            "rank": 9,
+            "rank": 1,
             "reason": "spec.pdf names POST /imps/transfer",
             "prs": [],
         },
@@ -36,7 +36,7 @@ PAYLOAD = {
             "service": "payments-service",
             "repo": "AetherionAgentDemo/bank",
             "branch": "main",
-            "rank": 8,
+            "rank": 2,
             "reason": "RemarkValidator already checks remark length",
             "prs": [
                 {
@@ -64,8 +64,10 @@ def test_the_planner_reads_the_card_its_ranked_services_and_the_answers():
     assert "=== spec.pdf ===\nPOST /imps/transfer" in text
     assert "=== recording.mp4 === (not read)" in text
     assert "- Please keep NEFT as it is." in text
+    # Rank 1 is the main service, designed first (2026-11-02).
     order = [
-        text.index(f"- {s}") for s in ("imps-service", "payments-service", "statement-service")
+        text.index(f"- {n}. {s}")
+        for n, s in ((1, "imps-service"), (2, "payments-service"), (3, "statement-service"))
     ]
     assert order == sorted(order)
     assert "earlier: BTS-20 PR #41 on branch feature/BTS-20-neft-remark" in text

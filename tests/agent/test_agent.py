@@ -184,7 +184,7 @@ async def test_the_agreed_input_becomes_the_text_and_repositories(tools):
     )
     payload = {
         "card": {"key": "BTS-60", "title": "Add a remark"},
-        "services": [{"service": "bank", "repo": "o/bank", "branch": "main", "rank": 9}],
+        "services": [{"service": "bank", "repo": "o/bank", "branch": "main", "rank": 1}],
         "questions": [],
     }
     out = await agent_module.planning_agent.fn(payload)

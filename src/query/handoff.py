@@ -6,8 +6,9 @@
                    "prs": [{"card", "pr", "branch", "url"}]}],
      "questions": [{"question", "answers": ["..."]}]}
 
-Services are listed by name, highest rank first, so the planner always
-designs them (a service the text names is always selected). A question with
+The rank is a position (2026-11-02): 1 is the main service, where the change
+mainly goes, then 2, 3. Services are listed by name, rank 1 first, so the
+planner always designs them (a service the text names is always selected). A question with
 answers is a requirement; one without is an open question the TDD lists and
 does not guess. Pure: no I/O.
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 MAX_FILE_CHARS = 8_000
+_UNRANKED = 999  # a service without a rank is listed last
 MAX_FILES_CHARS = 40_000
 
 
@@ -36,7 +38,7 @@ def _files(files: list[dict[str, Any]]) -> list[str]:
 
 def _service(s: dict[str, Any]) -> list[str]:
     where = f"{s.get('repo')}@{s.get('branch') or 'main'}" if s.get("repo") else ""
-    line = f"- {s.get('service')} (rank {s.get('rank')}/10)"
+    line = f"- {s.get('rank')}. {s.get('service')}"
     line += f" in {where}" if where else ""
     line += f": {s['reason']}" if s.get("reason") else ""
     out = [line]
@@ -64,13 +66,13 @@ def issue_text(payload: dict[str, Any]) -> str:
 
     services = sorted(
         [s for s in payload.get("services") or [] if s.get("service")],
-        key=lambda s: -int(s.get("rank") or 0),
+        key=lambda s: int(s.get("rank") or _UNRANKED),
     )
     if services:
         lines += [
             "",
-            "Services this card touches, ranked by the review (10 = the centre of the change, "
-            "6-8 = must change, 3-5 = check whether it changes). Design them in this order; "
+            "Services this card touches, in order of importance (1 = the main one, where the "
+            "change mainly goes; then 2, 3). Design them in this order; "
             "an earlier pull request shows the code that already does something similar — "
             "reuse it, and keep what it built working:",
         ]
