@@ -34,7 +34,15 @@ def test_the_form_does_not_offer_top_k_or_hops():
     triggers = json.loads((_ROOT / "src" / "agent" / "metadata.json").read_text())["config"][
         "triggers"
     ]
-    assert [t["name"] for t in triggers] == ["issue_text", "repos", "uploaded_files"]
+    assert [t["name"] for t in triggers] == ["issue_text", "repos", "issue_key", "uploaded_files"]
+
+
+def test_the_issue_key_is_optional():
+    triggers = json.loads((_ROOT / "src" / "agent" / "metadata.json").read_text())["config"][
+        "triggers"
+    ]
+    key = next(t for t in triggers if t["name"] == "issue_key")
+    assert key["required"] is False
 
 
 def test_screenshots_are_an_optional_upload_of_several_images():

@@ -1,20 +1,18 @@
-"""Renders a TechnicalDesignDoc as a readable Markdown document. Pure
-function, no I/O — the structured TechnicalDesignDoc object itself remains
-available unchanged for a coding agent that wants to consume it
-programmatically; this is purely an additive, human-readable form.
+"""Renders a TechnicalDesignDoc for people: as a Confluence page
+(render_confluence) and as plain text (render_text — the PDF, and what the
+coding agent reads). Pure functions, no I/O — the structured
+TechnicalDesignDoc object itself remains available unchanged.
 
-Diagrams here are real Mermaid (```mermaid fences) — rendered as actual
-boxes/arrows by GitHub, VSCode's Markdown preview, Notion, etc. — built
-entirely from the same structured facts (ArchComponent/FlowStep/
-SequenceStep/ServiceDependency) the LLM/graph already produced; nothing
-here is hand-drawn or invented by the renderer.
+Everything shown, diagrams included, is built from the structured facts the
+LLM/graph already produced; nothing here is hand-drawn or invented by the
+renderer.
 """
 
 from __future__ import annotations
 
 import re
 
-from .models import ArchComponent, FlowStep, SequenceStep, ServiceDependency, TechnicalDesignDoc
+from .models import TechnicalDesignDoc
 
 _VERIFICATION_LABELS = {
     "verified": "VERIFIED",
@@ -103,355 +101,27 @@ def _mermaid_id(name: str) -> str:
     while the real name still shows as the node's quoted label."""
     slug = re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_") or "n"
     return f"n_{slug}" if slug[0].isdigit() else slug
+def _kept_lists(tdd: TechnicalDesignDoc) -> list[tuple[str, list[str]]]:
+    """What the change must keep, and fit (2026-10-15) — part of the requirements,
+    so the coding agent reads them with everything else it must satisfy."""
+    out = []
+    if tdd.preserved_behavior:
+        out.append(("Existing behaviour to preserve", tdd.preserved_behavior))
+    if tdd.technology_constraints:
+        out.append(("Technology constraints", tdd.technology_constraints))
+    return out
 
 
-def _mermaid_label(text: str) -> str:
-    """Mermaid node/edge labels break on a literal quote — swap for a
-    plain apostrophe rather than trying to escape it."""
-    return text.replace('"', "'")
-
-
-def _mermaid_architecture_diagram(components: list[ArchComponent]) -> str | None:
-    """One node per named component, one edge per stated dependency — built
-    from facts the LLM states (name + depends_on), never a diagram it hand-
-    draws itself."""
-    if not components:
-        return None
-    lines = ["```mermaid", "flowchart LR"]
-    declared: set[str] = set()
-
-    def _declare(name: str) -> str:
-        node_id = _mermaid_id(name)
-        if node_id not in declared:
-            lines.append(f'    {node_id}["{_mermaid_label(name)}"]')
-            declared.add(node_id)
-        return node_id
-
-    for c in components:
-        source_id = _declare(c.name)
-        for dep in c.depends_on:
-            lines.append(f"    {source_id} --> {_declare(dep)}")
-    lines.append("```")
-    return "\n".join(lines)
-
-
-def _mermaid_service_dependency_diagram(dependencies: list[ServiceDependency]) -> str | None:
-    """The real CALLS edges among the candidate services — grounded in
-    graph data (query_flow.build_tdd fills this in after parsing), never
-    guessed by the LLM. None if there are no edges."""
-    if not dependencies:
-        return None
-    lines = ["```mermaid", "flowchart LR"]
-    declared: set[str] = set()
-
-    def _declare(name: str) -> str:
-        node_id = _mermaid_id(name)
-        if node_id not in declared:
-            lines.append(f'    {node_id}["{_mermaid_label(name)}"]')
-            declared.add(node_id)
-        return node_id
-
-    for e in dependencies:
-        if e.via:
-            lines.append(f"    {_declare(e.source)} -- {e.via} --> {_declare(e.target)}")
-        else:
-            lines.append(f"    {_declare(e.source)} --> {_declare(e.target)}")
-    lines.append("```")
-    return "\n".join(lines)
-
-
-def _mermaid_flow_diagram(steps: list[FlowStep]) -> str | None:
-    """A straight-line flowchart, one node per ordered step — the detail
-    (when given) renders inside the same node, under the step label."""
-    if not steps:
-        return None
-    lines = ["```mermaid", "flowchart TD"]
-    ids = [f"s{i}" for i in range(len(steps))]
-    for i, s in enumerate(steps):
-        label = _mermaid_label(s.step)
-        if s.detail:
-            label += f"<br/><i>{_mermaid_label(s.detail)}</i>"
-        lines.append(f'    {ids[i]}["{label}"]')
-    for i in range(len(steps) - 1):
-        lines.append(f"    {ids[i]} --> {ids[i + 1]}")
-    lines.append("```")
-    return "\n".join(lines)
-
-
-def _mermaid_sequence_diagram(steps: list[SequenceStep]) -> str | None:
-    """A real Mermaid sequenceDiagram — a solid arrow for a call, a dashed
-    arrow for a response, participants declared implicitly in the order
-    they first appear (Mermaid's own default)."""
-    if not steps:
-        return None
-    lines = ["```mermaid", "sequenceDiagram"]
-    for s in steps:
-        arrow = "-->>" if s.direction == "response" else "->>"
-        action = s.action.replace(":", " -")  # a literal colon breaks the message syntax
-        lines.append(f"    {s.from_participant}{arrow}{s.to_participant}: {action}")
-    lines.append("```")
-    return "\n".join(lines)
-
-
-def _md_table(headers: list[str], rows: list[list[str]]) -> str | None:
-    if not rows:
-        return None
-    esc = lambda cell: cell.replace("|", "\\|").replace("\n", "<br/>")  # noqa: E731
-    lines = [
-        "| " + " | ".join(headers) + " |",
-        "| " + " | ".join(["---"] * len(headers)) + " |",
+def _cf_kept(tdd: TechnicalDesignDoc) -> list[str]:
+    return [
+        f"<p><strong>{_cf_escape(heading)}:</strong></p>\n" + _cf_bullets(items)
+        for heading, items in _kept_lists(tdd)
     ]
-    lines += ["| " + " | ".join(esc(c) for c in row) + " |" for row in rows]
-    return "\n".join(lines)
 
 
 def _edge_case_lines(c) -> list[str]:
     """Each traced state as one line: the state, then today and after."""
     return [f"{e.case}: today {e.today}; after {e.after}" for e in c.edge_cases]
-
-
-def _md_change_block(c) -> list[str]:
-    loc = f"`{c.file_path}` — " if c.file_path else ""
-    source_tag = (
-        " _(grounded in real source)_"
-        if c.has_real_source
-        else " _(illustrative only, not verified code)_"
-    )
-    pseudocode_label = (
-        "Proposed approach (may reflect real source shown to the model):"
-        if c.has_real_source
-        else "Proposed approach (illustrative pseudocode, not real code):"
-    )
-    lines = [f"##### {loc}{_symbol_label(c)}{source_tag}", ""]
-    if c.current_behavior:
-        lines += [f"- **Current behavior:** {c.current_behavior}"]
-    lines += [f"- **Change type:** {_change_type_label(c)}"]
-    if _code_check(c):
-        lines += [f"- **Code check:** {_code_check(c)}"]
-    lines += [
-        f"- **Change:** {c.change_description}",
-        f"- **Implementation:** {c.implementation_notes}",
-        f"- **Why:** {c.reasoning}",
-        "",
-        pseudocode_label,
-        "```",
-        c.pseudocode_sketch,
-        "```",
-    ]
-    if c.edge_cases:
-        lines.append("**Edge cases:**")
-        lines += [f"- {e}" for e in _edge_case_lines(c)]
-    if c.acceptance_criteria:
-        lines.append("**Acceptance criteria:**")
-        lines += [f"- {ac}" for ac in c.acceptance_criteria]
-    lines.append("")
-    return lines
-
-
-def _md_section(number: int, title: str, *body_parts: str | None) -> str | None:
-    """One numbered Markdown section, or None if every part is empty —
-    omitted entirely rather than printed as a bare header, mirroring
-    render_text()'s _txt_section discipline exactly."""
-    parts = [p.strip() for p in body_parts if p and p.strip()]
-    if not parts:
-        return None
-    return f"## {number}. {title}\n\n" + "\n\n".join(parts)
-
-
-def render_markdown(tdd: TechnicalDesignDoc) -> str:
-    """The full TDD as Markdown, with real Mermaid diagrams — mirrors
-    render_text()'s section coverage and numbering (for easy cross-
-    reference between the two output formats) but renders every
-    architecture/flow/sequence diagram as an actual Mermaid figure instead
-    of plain ASCII, and omits any section with nothing to show exactly the
-    way render_text() does."""
-    header = [f"# {tdd.title}"]
-    if tdd.generated_at:
-        header.append(f"*Generated: {tdd.generated_at}*")
-
-    sections: list[str | None] = ["\n".join(header)]
-
-    sections.append(_md_section(2, "Issue Summary", tdd.issue_summary))
-
-    sections.append(
-        _md_section(
-            3,
-            "Requirements",
-            "**Functional:**\n\n"
-            + ("\n".join(f"- {r}" for r in tdd.functional_requirements) or "Not specified."),
-            "**Non-functional:**\n\n"
-            + ("\n".join(f"- {r}" for r in tdd.non_functional_requirements) or "Not specified."),
-        )
-    )
-
-    current_arch_diagram = _mermaid_architecture_diagram(tdd.current_architecture_components)
-    sections.append(
-        _md_section(
-            4, "Current System / Architecture", tdd.current_architecture, current_arch_diagram
-        )
-    )
-
-    current_flow_diagram = _mermaid_flow_diagram(tdd.current_flow_steps)
-    sections.append(_md_section(5, "Current Flow", current_flow_diagram))
-
-    sections.append(_md_section(6, "Root Cause / Problem Analysis", tdd.root_cause_analysis))
-
-    coverage = _coverage_lines(tdd)
-    sections.append(
-        _md_section(
-            7, "Proposed Solution", tdd.proposed_solution,
-            ("**Ticket coverage**\n\n" + "\n".join(coverage)) if coverage else None,
-        )
-    )
-
-    proposed_arch_diagram = _mermaid_architecture_diagram(tdd.proposed_architecture_components)
-    sections.append(
-        _md_section(8, "Proposed Architecture", tdd.proposed_architecture, proposed_arch_diagram)
-    )
-
-    proposed_flow_diagram = _mermaid_flow_diagram(tdd.proposed_flow_steps)
-    sections.append(_md_section(9, "Proposed Flow", proposed_flow_diagram))
-
-    sequence_diagram = _mermaid_sequence_diagram(tdd.sequence_steps)
-    sections.append(_md_section(10, "Sequence / Interaction Flow", sequence_diagram))
-
-    service_blocks = []
-    for s in tdd.services:
-        data_model = f" | Data model: {s.affected_data_model}" if s.affected_data_model else ""
-        block = [f"### {s.service}", "", f"Complexity: {s.complexity}{data_model}", "", s.reasoning]
-        if s.responsibility_change:
-            block += ["", f"**Responsibility change:** {s.responsibility_change}"]
-        service_blocks.append("\n".join(block))
-    sections.append(_md_section(11, "Affected Services", *service_blocks))
-
-    change_blocks = []
-    for s in tdd.services:
-        if not s.changes:
-            continue
-        change_texts = ["\n".join(_md_change_block(c)) for c in s.changes]
-        change_blocks.append(f"#### {s.service}\n\n" + "\n\n".join(change_texts))
-    sections.append(_md_section(12, "Affected Files, Classes & Functions", *change_blocks))
-
-    api_blocks = [
-        f"**{s.service}:**\n\n" + "\n".join(f"- {a}" for a in s.api_changes)
-        for s in tdd.services
-        if s.api_changes
-    ]
-    sections.append(
-        _md_section(
-            13,
-            "API Changes",
-            *(
-                api_blocks
-                if api_blocks
-                else ["No API changes identified from the available documentation."]
-            ),
-        )
-    )
-
-    dm_lines = [
-        f"- **{s.service}:** {s.affected_data_model}" for s in tdd.services if s.affected_data_model
-    ]
-    sections.append(
-        _md_section(
-            14,
-            "Data Model / Database Changes",
-            "\n".join(dm_lines) if dm_lines else "Affected data model: Unknown",
-        )
-    )
-
-    comm_parts = []
-    dependency_diagram = _mermaid_service_dependency_diagram(tdd.service_dependencies)
-    if dependency_diagram:
-        comm_parts.append(
-            "Real service-to-service dependencies (from the graph):\n\n" + dependency_diagram
-        )
-    if tdd.communication_notes:
-        comm_parts.append("**Notes:**\n\n" + "\n".join(f"- {n}" for n in tdd.communication_notes))
-    sections.append(_md_section(15, "Inter-Service Communication", *comm_parts))
-
-    sections.append(_md_section(16, "Error Handling & Edge Cases", tdd.error_handling_notes))
-    sections.append(_md_section(17, "Security Considerations", tdd.security_considerations))
-    sections.append(_md_section(18, "Backward Compatibility", tdd.backward_compatibility_notes))
-
-    testing_parts = []
-    if tdd.testing_notes:
-        testing_parts.append(tdd.testing_notes)
-    testing_table = _md_table(
-        ["Category", "Scenario", "Expected Result"],
-        [[t.category, t.scenario, t.expected_result] for t in tdd.testing_plan],
-    )
-    if testing_table:
-        testing_parts.append(testing_table)
-    sections.append(_md_section(19, "Testing Strategy", *testing_parts))
-
-    if tdd.implementation_plan:
-        sections.append(
-            _md_section(
-                20,
-                "Implementation Plan",
-                "\n".join(f"{i + 1}. {step}" for i, step in enumerate(tdd.implementation_plan)),
-            )
-        )
-
-    sections.append(
-        _md_section(21, "Risks", "\n".join(f"- {r}" for r in tdd.risks) if tdd.risks else None)
-    )
-    sections.append(
-        _md_section(
-            22,
-            "Open Questions",
-            "\n".join(f"- {q}" for q in tdd.open_questions) if tdd.open_questions else None,
-        )
-    )
-
-    summary_rows = [
-        [s.service, c.file_path or "Unknown", _symbol_text(c), c.change_type, s.complexity]
-        for s in tdd.services
-        for c in s.changes
-    ]
-    summary_table = _md_table(
-        ["Service", "File", "Symbol", "Change Type", "Complexity"], summary_rows
-    )
-    sections.append(_md_section(23, "Change Summary", summary_table))
-
-    created = sorted(
-        {
-            c.file_path
-            for s in tdd.services
-            for c in s.changes
-            if c.change_type == "create" and c.file_path
-        }
-    )
-    modified = sorted(
-        {
-            c.file_path
-            for s in tdd.services
-            for c in s.changes
-            if c.change_type == "modify" and c.file_path
-        }
-    )
-    deleted = sorted(
-        {
-            c.file_path
-            for s in tdd.services
-            for c in s.changes
-            if c.change_type == "delete" and c.file_path
-        }
-    )
-    referenced = sorted({f for s in tdd.services for f in _reference_paths(s.changes)})
-    parts_24 = [
-        "**Create:**\n\n" + ("\n".join(f"- `{f}`" for f in created) or "None identified."),
-        "**Modify:**\n\n" + ("\n".join(f"- `{f}`" for f in modified) or "None identified."),
-        "**Delete:**\n\n" + ("\n".join(f"- `{f}`" for f in deleted) or "None identified."),
-    ]
-    if referenced:
-        parts_24.append("**Read but NOT changed:**\n\n" + "\n".join(f"- `{f}`" for f in referenced))
-    sections.append(_md_section(24, "Files to Create / Modify / Delete", *parts_24))
-
-    sections.append(_md_section(25, "Overall Reasoning", tdd.overall_reasoning))
-
-    return "\n\n".join(s for s in sections if s)
 
 
 # --- Plain-text renderer: the full, section-numbered TDD -------------------
@@ -471,21 +141,6 @@ def _txt_bullets(items: list[str]) -> str | None:
     if not items:
         return None
     return "\n".join(f"- {i}" for i in items)
-
-
-def _txt_table(headers: list[str], rows: list[list[str]]) -> str | None:
-    """A simple aligned plain-text table — no markdown pipes, readable in
-    any plain .txt viewer."""
-    if not rows:
-        return None
-    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
-
-    def _fmt_row(cells: list[str]) -> str:
-        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
-
-    lines = [_fmt_row(headers), _fmt_row(["-" * w for w in widths])]
-    lines += [_fmt_row(row) for row in rows]
-    return "\n".join(lines)
 
 
 def _architecture_parts(components, service_dependencies, changed=None, services=None) -> list[str]:
@@ -570,41 +225,6 @@ def _architecture_parts(components, service_dependencies, changed=None, services
     return parts
 
 
-def _ascii_flow_diagram(steps) -> str | None:
-    """A numbered breakdown (with each step's optional detail) plus a
-    simple vertical arrow chain — both built from the same ordered list of
-    facts, so nothing is stated twice in two different shapes."""
-    if not steps:
-        return None
-    numbered = []
-    for i, s in enumerate(steps):
-        line = f"{i + 1}. {s.step}"
-        if s.detail:
-            line += f"\n   {s.detail}"
-        numbered.append(line)
-    chain = "\n   |\n   v\n".join(s.step for s in steps)
-    return "\n".join(numbered) + "\n\nFlow:\n" + chain
-
-
-def _ascii_sequence_diagram(steps) -> str | None:
-    """One line per interaction (`A --- action --> B` for a call, `A <--
-    action --- B` for a response) — deliberately not a column-aligned
-    multi-participant table. True column alignment gets fragile fast with
-    more than 2-3 participants (exactly the kind of hand-drawn-diagram
-    unreliability this whole restructure was meant to remove); a plain
-    per-line arrow is unambiguous and always renders correctly regardless
-    of how many participants are involved."""
-    if not steps:
-        return None
-    lines = []
-    for s in steps:
-        if s.direction == "response":
-            lines.append(f"{s.from_participant} <-- {s.action} --- {s.to_participant}")
-        else:
-            lines.append(f"{s.from_participant} --- {s.action} --> {s.to_participant}")
-    return "\n".join(lines)
-
-
 def _txt_change_block(number: str, c) -> str:
     """One change as a short labelled block: what, where, whether the code
     graph confirmed it, then what/how/why and when it's done."""
@@ -649,7 +269,7 @@ def _cf_escape(text: str) -> str:
 
 def _cf_section(number: int, title: str, *body_parts: str | None) -> str | None:
     """One numbered Confluence section, or None if every part is empty —
-    omitted entirely, same discipline as _txt_section/_md_section."""
+    omitted entirely, same discipline as _txt_section."""
     parts = [p for p in body_parts if p]
     if not parts:
         return None
@@ -698,8 +318,7 @@ def _cf_code(text: str, language: str = "none") -> str:
 
 
 def _cf_flow_list(steps) -> str | None:
-    """The ordered steps only — no arrow-chain diagram, unlike
-    _ascii_flow_diagram/_mermaid_flow_diagram."""
+    """The ordered steps only — no arrow-chain diagram."""
     if not steps:
         return None
     items = [f"{s.step} — {s.detail}" if s.detail else s.step for s in steps]
@@ -707,8 +326,7 @@ def _cf_flow_list(steps) -> str | None:
 
 
 def _cf_sequence_list(steps) -> str | None:
-    """Same interaction facts as _ascii_sequence_diagram, as a plain list
-    instead of arrow art."""
+    """The interactions as a plain list, not arrow art."""
     if not steps:
         return None
     items = []
@@ -750,6 +368,16 @@ def _cf_change_block(c) -> str:
     return "\n".join(lines)
 
 
+def _decision_lines(tdd: TechnicalDesignDoc) -> list[str]:
+    """Each decision a later version and the Coding agent must keep (2026-10-26)."""
+    lines = []
+    for d in tdd.decisions:
+        files = ", ".join(sorted({t.file_path for t in d.applies_to}))
+        line = f"[{d.id}] {d.title}: {d.choice} Why: {d.reason}"
+        lines.append(line + (f" (applies to {files})" if files else ""))
+    return lines
+
+
 def render_confluence(tdd: TechnicalDesignDoc) -> str:
     """The full TDD as Confluence storage-format XHTML — same section
     coverage/numbering as render_text(), for easy cross-reference, but with
@@ -773,6 +401,7 @@ def render_confluence(tdd: TechnicalDesignDoc) -> str:
             + (_cf_bullets(tdd.functional_requirements) or "<p>Not specified.</p>"),
             "<p><strong>Non-functional:</strong></p>\n"
             + (_cf_bullets(tdd.non_functional_requirements) or "<p>Not specified.</p>"),
+            *_cf_kept(tdd),
         )
     )
 
@@ -832,6 +461,12 @@ def render_confluence(tdd: TechnicalDesignDoc) -> str:
             13,
             "API Changes",
             *(api_blocks or ["<p>No API changes identified from the available documentation.</p>"]),
+            (
+                "<p><strong>Rollout order (merge and deploy in this order):</strong></p>\n"
+                + _cf_numbered(tdd.rollout_order)
+                if tdd.rollout_order
+                else None
+            ),
         )
     )
 
@@ -932,6 +567,9 @@ def render_confluence(tdd: TechnicalDesignDoc) -> str:
     sections.append(_cf_section(24, "Files to Create / Modify / Delete", *parts_24))
 
     sections.append(_cf_section(25, "Overall Reasoning", _cf_p(tdd.overall_reasoning)))
+    sections.append(
+        _cf_section(26, "Decisions in Force", _cf_bullets(_decision_lines(tdd)))
+    )
 
     return "\n".join(s for s in sections if s)
 
@@ -952,6 +590,8 @@ def render_text(tdd: TechnicalDesignDoc) -> str:
     requirements = [_txt_bullets(tdd.functional_requirements)]
     if tdd.non_functional_requirements:
         requirements.append("Non-functional:\n" + _txt_bullets(tdd.non_functional_requirements))
+    for heading, items in _kept_lists(tdd):
+        requirements.append(f"{heading}:\n" + _txt_bullets(items))
     body.append(("Requirements", requirements))
 
     body.append(("Root Cause", [_one_finding_per_line(tdd.root_cause_analysis)]))
@@ -1023,6 +663,10 @@ def render_text(tdd: TechnicalDesignDoc) -> str:
 
     plan = "\n".join(f"{i}. {step}" for i, step in enumerate(tdd.implementation_plan, start=1))
     body.append(("Implementation Plan", [plan]))
+    if tdd.rollout_order:
+        order = "\n".join(f"{i}. {step}" for i, step in enumerate(tdd.rollout_order, start=1))
+        body.append(("Rollout Order", [order]))
+    body.append(("Decisions in Force", [_txt_bullets(_decision_lines(tdd))]))
     body.append(("Risks", [_txt_bullets(tdd.risks)]))
     body.append(("Open Questions", [_txt_bullets(tdd.open_questions)]))
 

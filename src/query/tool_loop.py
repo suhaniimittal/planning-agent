@@ -2,7 +2,7 @@
 it was not shown.
 
 The first call is the same prompt the single-call planner sends — the ticket
-and the code context_v2 chose — plus a list of read-only lookups. The model
+and the code context chose — plus a list of read-only lookups. The model
 either answers with the TDD, or asks for lookups; their results are added to
 the same conversation and it is called again, until it answers or a limit is
 reached, when it is told to answer with what it has. Nothing earlier in the
@@ -29,8 +29,8 @@ from dataclasses import dataclass, field
 
 from src.ingestion.embedder import embed
 
-from . import graph_reader, images as ticket_images, planner, prompt_v2
-from .context_v2 import CONTEXT_BUDGET_CHARS, MAX_FILE_SHARE, Context, ShownFile
+from . import graph_reader, images as ticket_images, planner, prompt
+from .context import CONTEXT_BUDGET_CHARS, MAX_FILE_SHARE, Context, ShownFile
 
 # The limits, all of them. Safety caps on time, cost and size — the same
 # for every ticket, not tuned to one. A ticket the starting code covers
@@ -224,7 +224,7 @@ class Lookups:
                                   "ask for a line range")
         else:
             self.files.append(shown)
-        return prompt_v2._file_block(shown)
+        return prompt._file_block(shown)
 
     async def _find_importers(self, service: str, path: str) -> str:
         if outside := self._outside(service):
@@ -413,9 +413,10 @@ async def run(
     the later rounds continue that conversation, so the model keeps them.
     Returns the answer, raw."""
     if client is None:
-        from openai import AsyncOpenAI
+        from src.ingestion import local_client
 
-        client = AsyncOpenAI()
+        # The loop runs only off the gateway: a laptop's installed client.
+        client = local_client.new_client()
     params = {
         "model": planner._OPENAI_MODEL,
         "instructions": system_prompt,

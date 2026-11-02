@@ -11,11 +11,16 @@ from pathlib import Path
 from aetherion_sdk import tool
 from common_lib.storage.storage_client import RetrievalMode, storage
 
+from src.ingestion import github_api
 from src.ingestion.confluence_api import ConfluenceApiError, create_page
+from src.memory import conversation
+from src.memory import operations, record
+from src.query import contracts, stack
 from src.query import images as ticket_images
+from src.query.design_qa import answer_question, legacy_answer
 from src.query.pdf_render import render_pdf
 from src.query.query_flow import build_tdd
-from src.query.render import render_confluence
+from src.query.render import render_confluence, render_text
 
 _NON_SLUG_CHARS = re.compile(r"[^a-z0-9]+")
 
@@ -92,13 +97,160 @@ def _stamp(generated_at: str | None) -> str:
 
 
 @tool()
+async def answer_design_question(
+    question: str,
+    tdd_text: str,
+    discussion: list[str] | None = None,
+    issue_key: str | None = None,
+    kind: str | None = None,
+    page_id: str = "",
+) -> dict:
+    """A comment on a TDD ("why this approach?", "why not X?", "update the TDD: X"),
+    answered from the TDD, the story's facts, the decisions in force, the
+    discussion and the related code — and judged: a change is applied only when
+    it is valid (2026-10-26). Changes nothing itself; the caller revises.
+    With no ``kind`` (a caller with memory off) it answers exactly as before."""
+    if not kind:
+        return await legacy_answer(question, tdd_text, discussion)
+    facts, decisions = [], []
+    if issue_key:
+        stored = record.load_requirement(issue_key)
+        facts = (stored or {}).get("facts") or []
+        decisions = record.decisions_in_force(issue_key)
+    # What was said before about this TDD, from Memsy (2026-10-26): earlier
+    # questions and answers, even from other days or another page's thread.
+    earlier = await conversation.recall(issue_key or "", question) if issue_key else []
+    context = list(discussion or []) + [f"(remembered) {line}" for line in earlier]
+    answer = await answer_question(
+        question, tdd_text, context, kind or "question", facts, decisions
+    )
+    out = answer.to_dict()
+    if issue_key:
+        await conversation.remember_exchange(
+            issue_key, page_id, question, out.get("answer") or "", kind, out.get("verdict") or ""
+        )
+    return out
+
+
+def repository_facts(
+    service_repos: dict[str, str], *, read_stack: bool = True
+) -> tuple[list[str], str]:
+    """(technology constraints, API contracts) of each service's repository (2026-10-15).
+
+    One call lists the repository's files; then only its build files (the root
+    one, every module's, the Gradle catalog) and its API contracts (OpenAPI,
+    AsyncAPI, protobuf) are read. A repository that cannot be read adds a line
+    saying so — the design then knows its versions are unknown. With
+    ``read_stack`` off, the build files are not read and no constraint is
+    returned: only the contracts."""
+    constraints: list[str] = []
+    contract_files: dict[str, list[tuple[str, str]]] = {}
+    for name, slug in sorted(service_repos.items()):
+        repo, _, branch = slug.partition("@")
+        ref = branch or "HEAD"
+        try:
+            paths = github_api.list_tree(repo, branch or None)
+
+            def read(path: str, repo: str = repo, ref: str = ref) -> str:
+                return github_api.fetch_file_content(repo, path, ref)
+
+            found = stack.read_stack(paths, read) if read_stack else None
+            files = [(p, read(p)) for p in contracts.contract_paths(paths)]
+        except github_api.GitHubApiError as exc:
+            if read_stack:
+                constraints.append(
+                    f"{name}: build files could not be read ({exc}); versions unknown."
+                )
+            continue
+        prefix = f"{name}: " if len(service_repos) > 1 else ""
+        if found is not None:
+            constraints.extend(prefix + rule for rule in found.constraints())
+        if files:
+            contract_files[name] = files
+    return constraints, contracts.contracts_section(contract_files)
+
+
+def _change_line(change) -> str:
+    if not isinstance(change, dict):
+        return str(change)
+    what = change.get("slot") or change.get("value") or "requirement"
+    if change.get("old") or change.get("new"):
+        return f"{what}: {change.get('old') or '(none)'} -> {change.get('new') or '(none)'}"
+    return f"{what}: {change.get('why') or change}"
+
+
+async def _memory_before(
+    issue_key: str, story_text: str, services: list[str] | None
+) -> dict | None:
+    """The ticket's memory before planning (2026-10-27): whether its story
+    changed since its last version, its agreed decisions and its project's on
+    the same services, and its own proposed decisions. {"checked", "text"},
+    or None when Memsy cannot be read — memory never stops a TDD."""
+    key = issue_key.upper()
+    try:
+        checked = await operations.check_story(key, story_text)
+        agreed = await asyncio.to_thread(record.decisions_in_force, key, services)
+        earlier = await asyncio.to_thread(record.proposed_decisions, key)
+    except Exception as error:  # noqa: BLE001 - planned without memory instead
+        print(f"  [MEMORY] {key}: not available ({type(error).__name__}: {error}); "
+              "planning without it")
+        return None
+    current = checked.get("current") or {}
+    changes = [_change_line(c) for c in checked.get("changes") or []]
+    print(f"  [MEMORY] {key}: story {checked.get('verdict')}"
+          + (f" since version {current['tdd_version']}" if current else "")
+          + (f" ({'; '.join(changes)})" if changes else "")
+          + f"; {len(agreed)} agreed and {len(earlier)} proposed decisions")
+    parts = []
+    if current:
+        parts.append(f"This ticket's TDD was last written as version {current['tdd_version']}.")
+    if checked.get("verdict") in ("changed", "unsure") and (changes or checked.get("reason")):
+        parts.append(
+            "The ticket has changed since then: " + ("; ".join(changes) or checked["reason"])
+            + ". Design for the ticket as it reads now."
+        )
+    block = record.decisions_block(agreed, key, earlier)
+    if block:
+        parts.append(block)
+    return {"checked": checked, "text": "\n\n".join(parts)}
+
+
+async def _memory_after(issue_key: str, story_text: str, checked: dict, tdd) -> None:
+    """The generated TDD saved to the ticket's memory as its next version,
+    with its decisions proposed (2026-10-27). A failure is logged; the TDD
+    is delivered either way."""
+    key = issue_key.upper()
+    decisions = [d.model_dump() for d in tdd.decisions]
+    try:
+        saved = await asyncio.to_thread(
+            operations.remember_generated, key, story_text, checked, decisions
+        )
+        await conversation.remember_version(
+            key, saved["version"], "", decisions, [], generated=tdd.title
+        )
+    except Exception as error:  # noqa: BLE001 - the TDD is delivered either way
+        print(f"  [MEMORY] {key}: could not save this version ({type(error).__name__}: {error})")
+        return
+    print(f"  [MEMORY] {key}: saved as version {saved['version']} "
+          f"({saved['decisions']} decisions, proposed)")
+
+
+def technology_constraints(service_repos: dict[str, str]) -> list[str]:
+    """Each service's real stack, from its build files (see repository_facts)."""
+    return repository_facts(service_repos)[0]
+
+
+@tool()
 async def generate_technical_design(
     issue_text: str,
     top_k: int | None = None,
     hops: int | None = None,
     service_names: list[str] | None = None,
+    return_document: bool = False,
+    service_repos: dict[str, str] | None = None,
     mode: str | None = None,
     image_keys: list[str] | None = None,
+    issue_key: str | None = None,
 ) -> dict:
     """Search the service graph for services relevant to a requirement/bug
     report and produce a technical design doc: structured data plus a real
@@ -112,8 +264,20 @@ async def generate_technical_design(
     never blocks the PDF output if it fails or isn't configured.
 
     `service_names`: the services this run covers; None considers every
-    service in the graph. `image_keys`: storage keys of screenshots
-    uploaded with the ticket (optional), shown to the planner."""
+    service in the graph. `service_repos` ("name" -> "org/repo[@branch]"): the
+    repositories whose build files give the design its technology
+    constraints. `return_document`: also return the title, the
+    Confluence HTML and the plain text, for the orchestrator. `mode`:
+    "bug" or "feature" to override how the ticket is classified.
+    `image_keys`: storage keys of screenshots uploaded with the ticket
+    (optional), shown to the planner. `issue_key`: the ticket (e.g.
+    KS-17531), whose memory the design reads and is saved to — see
+    _memory_before and _memory_after (2026-10-27)."""
+    # Technology constraints are off for now (2026-10-28): every TDD listed
+    # all services' build-file versions, most for services it never changed.
+    # To turn them back on, read the stack here and pass the constraints on.
+    _, api_contracts = repository_facts(service_repos or {}, read_stack=False)
+    memory = await _memory_before(issue_key, issue_text, service_names) if issue_key else None
     # Only what the caller actually chose is forwarded, so build_tdd's own
     # signature stays the single definition of what top_k and hops default
     # to — nothing here restates the numbers.
@@ -129,8 +293,16 @@ async def generate_technical_design(
             lambda key: _read_upload(bucket, key),
         )
     tdd = await build_tdd(
-        issue_text, service_names=service_names, mode=mode, images=images, **chosen
+        issue_text,
+        service_names=service_names,
+        api_contracts=api_contracts,
+        mode=mode,
+        memory=memory["text"] if memory else "",
+        images=images,
+        **chosen,
     )
+    if memory:
+        await _memory_after(issue_key, issue_text, memory["checked"], tdd)
     pdf_bytes = render_pdf(tdd)
 
     # Named from the TDD's own title, not the raw issue text: the title is
@@ -150,4 +322,14 @@ async def generate_technical_design(
 
     _publish_to_confluence(tdd)
 
-    return {"s3_key": s3_key}
+    result = {"s3_key": s3_key}
+    if return_document:
+        # For the orchestrator, which publishes the TDD in the project's
+        # Confluence space and hands its text to Coding (2026-10-08).
+        result |= {
+            "title": tdd.title,
+            "confluence_html": render_confluence(tdd),
+            "text": render_text(tdd),
+            "decisions": [d.model_dump() for d in tdd.decisions],
+        }
+    return result

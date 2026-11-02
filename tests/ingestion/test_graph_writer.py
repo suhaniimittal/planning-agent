@@ -1,4 +1,4 @@
-from src.ingestion import graph_writer
+from src.ingestion import code_crypto, graph_writer
 
 
 class FakeResult(list):
@@ -90,12 +90,14 @@ def test_update_service_doc_sets_doc_embedding_and_hash(monkeypatch):
     # stored so the next run can tell an edited SERVICE.md from an unchanged
     # one — the file, not the commit, decides whether this moves.
     assert "s.doc_hash = $doc_hash" in query
-    assert params == {
-        "name": "orders",
-        "doc": "# orders\n\nPlacing orders.",
-        "embedding": [0.1, 0.2],
-        "doc_hash": "abc123",
-    }
+    assert params["name"] == "orders" and params["embedding"] == [0.1, 0.2]
+    assert params["doc_hash"] == "abc123"
+    # SERVICE.md describes the code, so it is stored encrypted
+    assert code_crypto.is_encrypted(params["doc"])
+    opened = code_crypto.decrypt(
+        params["doc"], label="Service", service="orders", qualified_name="orders", field="doc"
+    )
+    assert opened == "# orders\n\nPlacing orders."
 
 
 def test_set_service_dependencies_passes_source_and_targets(monkeypatch):

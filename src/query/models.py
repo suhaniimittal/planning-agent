@@ -158,6 +158,27 @@ class PointCoverage(BaseModel):
     )
 
 
+class DecisionTarget(BaseModel):
+    service: str
+    file_path: str
+    symbol: str | None = None
+
+
+class DesignDecision(BaseModel):
+    """One design choice the TDD makes, kept by later versions (2026-10-26)."""
+
+    id: str = Field(description="A short stable slug for the choice, e.g. 'money-integer-paise'.")
+    title: str = Field(
+        description="The choice in a few words, e.g. 'Money summed as integer paise'."
+    )
+    choice: str = Field(description="What is decided, concretely enough to check code against.")
+    reason: str = Field(description="Why, in one sentence.")
+    applies_to: list[DecisionTarget] = Field(
+        default_factory=list,
+        description="The real files (and symbols) this choice governs, from the code shown.",
+    )
+
+
 class TechnicalDesignDoc(BaseModel):
     # A short, specific title for THIS issue/fix — e.g. "Propagate shipment
     # creation failures in the orders service" — never the schema/class
@@ -217,3 +238,36 @@ class TechnicalDesignDoc(BaseModel):
     # from the model, how each is answered.
     ticket_points: list[str] = Field(default_factory=list)
     ticket_coverage: list[PointCoverage] = Field(default_factory=list)
+    # 2026-10-15: what the change must not break, and what it must fit.
+    preserved_behavior: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Existing behaviour of the code this change touches that must keep "
+            "working afterwards — each an observable fact from the real code shown: "
+            "a validation and its error message, a side effect, an existing feature "
+            "and what it returns. Empty only when the change touches no existing code."
+        ),
+    )
+    technology_constraints: list[str] = Field(
+        default_factory=list,
+        description="Filled from the repositories' build files — leave this empty.",
+    )
+    # 2026-10-26: the choices this design makes, remembered across versions.
+    decisions: list[DesignDecision] = Field(
+        default_factory=list,
+        description=(
+            "The design choices a later version must keep: how money is computed, "
+            "where a check sits in the validation order, how time is read, how "
+            "concurrency is handled, etc. Include every DECISION IN FORCE you were "
+            "given that this design keeps, with the same id; add new ones with new ids."
+        ),
+    )
+    rollout_order: list[str] = Field(
+        default_factory=list,
+        description=(
+            "When more than one service changes: the order to merge and deploy them, "
+            "one step per service — '<service>: <why it goes here>' — a provider "
+            "before the services that call it, each step safe on its own. Empty when "
+            "one service changes."
+        ),
+    )

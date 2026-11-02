@@ -1,0 +1,12 @@
+flowchart TD
+    A[create TDD on a story] --> B{Normalised text<br/>same as stored?}
+    B -- yes --> SAME[Return current TDD<br/>no AI call]
+    B -- no --> C[Extract canonical facts<br/>Claude, fixed schema]
+    C --> D{Numbers, dates, amounts<br/>or acceptance criteria changed?}
+    D -- yes --> REV[Revise only the changed facts<br/>reply names each change]
+    D -- no --> F{Canonical facts<br/>identical?}
+    F -- yes --> SAME2[Return current TDD<br/>'reworded, same requirement']
+    F -- no --> J{Equivalence judge:<br/>same meaning?}
+    J -- same, high confidence --> SAME2
+    J -- different --> REV
+    J -- unsure --> ASK[Ask the person:<br/>keep the TDD or revise?]

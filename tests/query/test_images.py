@@ -1,9 +1,10 @@
-import sys
 import types
 
 import pytest
 
-from src.query import images, planner, prompt_v2, context_v2
+from src.query import context as ctx
+from src.query import images, planner
+from src.query import prompt as prompts
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 20
@@ -37,8 +38,8 @@ def test_at_most_five_images_are_used():
 
 
 def test_the_screenshots_sit_right_after_the_issue_before_the_code():
-    prompt = prompt_v2.build_user_prompt(
-        "Controls shift.", [{"name": "ui", "summary": "s"}], context_v2.Context(),
+    prompt = prompts.build_user_prompt(
+        "Controls shift.", [{"name": "ui", "summary": "s"}], ctx.Context(),
         image_names=["before.png", "after.png"],
     )
 
@@ -47,8 +48,8 @@ def test_the_screenshots_sit_right_after_the_issue_before_the_code():
     head, tail = images.around_slot(prompt)
     assert head.startswith("## Issue\nControls shift.") and head.endswith(images.SLOT)
     assert "## Code" in tail and "## Code" not in head
-    assert "## Screenshots" not in prompt_v2.build_user_prompt(
-        "i", [{"name": "ui", "summary": "s"}], context_v2.Context())
+    assert "## Screenshots" not in prompts.build_user_prompt(
+        "i", [{"name": "ui", "summary": "s"}], ctx.Context())
 
 
 def test_a_prompt_without_the_slot_is_all_head():
@@ -69,7 +70,9 @@ async def test_the_single_call_sends_images_at_the_slot(monkeypatch):
         def __init__(self):
             self.chat = types.SimpleNamespace(completions=Completions())
 
-    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(AsyncOpenAI=FakeOpenAI))
+    from src.ingestion import local_client
+
+    monkeypatch.setattr(local_client, "_factory", FakeOpenAI)
     shot = images.TicketImage(name="a.png", media_type="image/png", data=PNG)
 
     await planner._plan_via_openai("system", f"issue\n{images.SLOT}\ncode", [shot])

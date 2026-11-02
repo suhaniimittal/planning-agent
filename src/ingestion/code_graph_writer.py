@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 
+from . import code_crypto
 from .graph_writer import get_driver
 
 # Rows per write transaction. One UNWIND over a whole large repo (tens of
@@ -85,13 +86,27 @@ def create_chunk_vector_index(dimensions: int = 1536) -> None:
         )
 
 
+def _sealed_file(service: str, row: dict) -> dict:
+    sealed = code_crypto.encrypt_row(row, label="File", service=service, qualified_name=row["file_path"])
+    source = row.get("source")
+    if source and not code_crypto.is_encrypted(source):
+        sealed["text_terms"] = code_crypto.text_terms(service, source)
+    return sealed
+
+
 def upsert_files(service: str, records: list[dict]) -> None:
     """Each record: {"file_path": str, "language": str}, optionally with
     "imports" — the file's import lines verbatim. Stored on the File node
     rather than as a symbol because imports belong to the file, not to any
     class or function in it, and nothing searches them: they are shown to
     the planner so that code written for this file uses module paths that
-    exist."""
+    exist.
+
+    `imports` and `source` (since pipeline version 4, every file's text) are
+    stored encrypted, named by the file's path (code_crypto). Beside the
+    source go the hashes of its words (``text_terms``), as a chunk's do, so
+    the exact-text search can still find the file (graph_reader.find_text)."""
+    records = [_sealed_file(service, r) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -105,6 +120,8 @@ def upsert_files(service: str, records: list[dict]) -> None:
 
 
 def upsert_classes(service: str, records: list[dict]) -> None:
+    """Source, signature and docstring are stored encrypted (code_crypto)."""
+    records = [code_crypto.encrypt_row(r, label="Class", service=service) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -118,6 +135,8 @@ def upsert_classes(service: str, records: list[dict]) -> None:
 
 
 def upsert_functions(service: str, records: list[dict]) -> None:
+    """Source, signature and docstring are stored encrypted (code_crypto)."""
+    records = [code_crypto.encrypt_row(r, label="Function", service=service) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -132,7 +151,9 @@ def upsert_functions(service: str, records: list[dict]) -> None:
 
 def upsert_variables(service: str, records: list[dict]) -> None:
     """Top-level constants and properties: a styled component, a config
-    object, a `static final` field."""
+    object, a `static final` field. Their code is stored encrypted, like a
+    function's (code_crypto)."""
+    records = [code_crypto.encrypt_row(r, label="Variable", service=service) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -163,6 +184,9 @@ def create_contains_edges(service: str, parent_to_child_qnames: list[tuple[str, 
 
 
 def upsert_chunks(service: str, records: list[dict]) -> None:
+    """The text is stored encrypted, with the hashes of its words beside it
+    (``text_terms``) so the exact-name search still works (code_crypto)."""
+    records = [_sealed_chunk(service, r) for r in records]
     _run_batched(
         """
         UNWIND $rows AS row
@@ -174,6 +198,13 @@ def upsert_chunks(service: str, records: list[dict]) -> None:
         batch_size=_CHUNK_WRITE_BATCH,
         service=service,
     )
+
+
+def _sealed_chunk(service: str, row: dict) -> dict:
+    if "text" not in row or code_crypto.is_encrypted(row["text"]):
+        return code_crypto.encrypt_row(row, label="Chunk", service=service)
+    terms = code_crypto.text_terms(service, row["text"] or "")
+    return {**code_crypto.encrypt_row(row, label="Chunk", service=service), "text_terms": terms}
 
 
 def create_file_has_chunk_edges(service: str, file_to_chunk_qnames: list[tuple[str, str]]) -> None:
@@ -385,7 +416,10 @@ def rename_file(service: str, old_path: str, new_path: str) -> None:
     reparse. `qualified_name` (which embeds the OLD path textually) is left
     untouched: it's just a stored identifier, and nothing downstream
     recomputes a symbol's file_path from it — file_path is always read as
-    its own explicit property, never derived from qualified_name."""
+    its own explicit property, never derived from qualified_name.
+
+    The File node's encrypted fields are named by its path, so they are
+    unlocked under the old path and sealed again under the new one."""
     with get_driver().session() as session:
         session.run(
             """
@@ -397,6 +431,34 @@ def rename_file(service: str, old_path: str, new_path: str) -> None:
             service=service,
             old_path=old_path,
             new_path=new_path,
+        )
+        records = list(
+            session.run(
+                """
+                MATCH (f:File {service: $service, file_path: $new_path})
+                RETURN f.source AS source, f.imports AS imports
+                """,
+                service=service,
+                new_path=new_path,
+            )
+        )
+        if not records:
+            return
+        opened = code_crypto.decrypt_row(
+            dict(records[0]), label="File", service=service, qualified_name=old_path
+        )
+        sealed = code_crypto.encrypt_row(
+            opened, label="File", service=service, qualified_name=new_path
+        )
+        session.run(
+            """
+            MATCH (f:File {service: $service, file_path: $new_path})
+            SET f.source = $source, f.imports = $imports
+            """,
+            service=service,
+            new_path=new_path,
+            source=sealed["source"],
+            imports=sealed["imports"],
         )
 
 
@@ -469,7 +531,13 @@ def load_sources(service: str, file_paths: list[str]) -> dict[str, str]:
             service=service,
             paths=file_paths,
         )
-        return {r["file_path"]: r["source"] for r in result}
+        return {
+            r["file_path"]: code_crypto.decrypt(
+                r["source"], label="File", service=service, qualified_name=r["file_path"],
+                field="source",
+            )
+            for r in result
+        }
 
 
 # --- Stage 3: links inside one service --------------------------------------

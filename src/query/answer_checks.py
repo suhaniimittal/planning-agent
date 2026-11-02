@@ -3,7 +3,7 @@
 Each check finds something missing, not something wrong: a ticket point
 without an answer (ticket_points.py), and a change that does not trace its
 edge cases. Whether the answer is RIGHT is left to the re-check round
-(prompt_v2.RECHECK), which the model does itself — code cannot read a
+(prompt.RECHECK), which the model does itself — code cannot read a
 sketch and see that `[].every()` makes its label "Unarchive".
 
 A failed check goes back to the model inside the lookup loop (tool_loop),

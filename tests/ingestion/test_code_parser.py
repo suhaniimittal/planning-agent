@@ -1,4 +1,3 @@
-from pathlib import Path
 
 from src.ingestion import code_parser
 
@@ -144,10 +143,10 @@ def test_parse_repo_skips_oversized_files(tmp_path):
     assert graph.functions == []
 
 
-def test_parse_repo_counts_unsupported_extensions(tmp_path):
+def test_parse_repo_gives_an_unparsed_file_a_node_but_parses_nothing(tmp_path):
     (tmp_path / "readme.md").write_text("# hello\n")
     graph = parse_repo(tmp_path, "orders")
-    assert graph.files_skipped_unsupported == 1
+    assert graph.files_parsed == 0 and graph.tracked_files == {"readme.md": "markdown"}
 
 
 def test_parse_repo_continues_after_one_file_fails(tmp_path, monkeypatch):

@@ -8,6 +8,9 @@ import os
 
 from neo4j import GraphDatabase
 
+from src.ingestion import code_crypto
+from src.ingestion.secret_store import secret
+
 _driver = None
 
 
@@ -16,7 +19,8 @@ def get_driver():
     if _driver is None:
         uri = os.environ["NEO4J_URI"]
         user = os.environ.get("NEO4J_USER", "neo4j")
-        password = os.environ["NEO4J_PASSWORD"]
+        # A mounted secret in production, the variable on a laptop (2026-10-15).
+        password = secret("NEO4J_PASSWORD") or os.environ["NEO4J_PASSWORD"]
         _driver = GraphDatabase.driver(
             uri,
             auth=(user, password),
@@ -228,7 +232,10 @@ def update_service_doc(name: str, doc: str, embedding: list[float], doc_hash: st
                 s.doc_hash = $doc_hash
             """,
             name=name,
-            doc=doc,
+            # SERVICE.md describes the code, so it is stored encrypted too.
+            doc=code_crypto.encrypt(
+                doc, label="Service", service=name, qualified_name=name, field="doc"
+            ),
             embedding=embedding,
             doc_hash=doc_hash,
         )

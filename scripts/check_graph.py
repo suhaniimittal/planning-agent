@@ -106,21 +106,43 @@ def main() -> int:
                 print("  (none — not parsed into the graph)")
 
         if args.text:
+            # Chunk text is encrypted, so this matches the same hashed words
+            # graph_reader.search_service_chunks does (or plain text on nodes
+            # written before encryption), then checks the decrypted text.
+            from src.ingestion import code_crypto
+
             print(f"\nchunks containing {args.text!r}:")
-            res = session.run(
-                """
-                MATCH (c:Chunk) WHERE c.text CONTAINS $text
-                  AND ($service IS NULL OR c.service = $service)
-                OPTIONAL MATCH (f:Function)-[:HAS_CHUNK]->(c)
-                RETURN c.service AS service, f.qualified_name AS fn, size(c.text) AS len
-                ORDER BY service, fn LIMIT 25
-                """,
-                text=args.text,
-                service=args.service,
-            )
-            hits = list(res)
-            for r in hits:
-                print(f"  [{r['service']}] {r['fn']}  ({r['len']} chars)")
+            services = [args.service] if args.service else [
+                r["name"] for r in session.run("MATCH (s:Service) RETURN s.name AS name")
+            ]
+            hits = []
+            for service in services:
+                res = session.run(
+                    """
+                    MATCH (c:Chunk {service: $service})
+                    WHERE (size($terms) > 0
+                           AND all(t IN $terms WHERE t IN coalesce(c.text_terms, [])))
+                       OR (c.text_terms IS NULL AND c.text CONTAINS $text)
+                    OPTIONAL MATCH (f:Function)-[:HAS_CHUNK]->(c)
+                    RETURN c.qualified_name AS qualified_name, f.qualified_name AS fn,
+                           c.text AS text
+                    """,
+                    service=service,
+                    terms=code_crypto.query_terms(service, args.text),
+                    text=args.text,
+                )
+                for r in res:
+                    text = code_crypto.decrypt(
+                        r["text"],
+                        label="Chunk",
+                        service=service,
+                        qualified_name=r["qualified_name"],
+                        field="text",
+                    )
+                    if args.text in (text or ""):
+                        hits.append((service, r["fn"], len(text)))
+            for service, fn, length in sorted(hits, key=lambda h: (h[0], h[1] or ""))[:25]:
+                print(f"  [{service}] {fn}  ({length} chars)")
             if not hits:
                 print("  (none — the exact-identifier query would find nothing)")
     return 0

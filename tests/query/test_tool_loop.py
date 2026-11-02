@@ -2,7 +2,9 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from src.query import context_v2, prompt_v2, tool_loop
+from src.query import context as ctx
+from src.query import tool_loop
+from src.query import prompt as prompts
 
 SCREEN = "src/apps/client/modules/Reports/pages/ReportsListScreen/view.tsx"
 GRID = "src/apps/client/components/InfiniteScrollGrid/view.tsx"
@@ -54,7 +56,7 @@ class FakeClient:
 def _lookups(sources=None, files=()):
     sources = sources or {("ui", GRID): "<Grid item md={4} lg={4}>\n</Grid>"}
     return tool_loop.Lookups(services=["ui", "reports-api"],
-                             context=context_v2.Context(files=list(files)),
+                             context=ctx.Context(files=list(files)),
                              reader=FakeReader(sources))
 
 
@@ -153,7 +155,7 @@ def test_a_file_over_the_limit_comes_back_as_its_symbols_and_a_range_is_allowed(
 
 
 def test_a_file_already_shown_whole_is_not_sent_again():
-    shown = context_v2.ShownFile(service="ui", path=GRID, tier="import", reason="r", text="x")
+    shown = ctx.ShownFile(service="ui", path=GRID, tier="import", reason="r", text="x")
     lookups = _lookups(files=[shown])
 
     result = asyncio.run(lookups.run("read_file", {"service": "ui", "path": GRID}))
@@ -207,7 +209,7 @@ def test_exact_text_is_found_with_its_lines():
             return [{"service": "ui", "file_path": GRID,
                      "hits": [{"line": 98, "text": "    <Grid item md={4} lg={4}>"}]}]
 
-    lookups = tool_loop.Lookups(services=["ui"], context=context_v2.Context(), reader=Reader({}))
+    lookups = tool_loop.Lookups(services=["ui"], context=ctx.Context(), reader=Reader({}))
 
     result = asyncio.run(lookups.run("find_text", {"text": "md={4}"}))
     short = asyncio.run(lookups.run("find_text", {"text": "md"}))
@@ -256,8 +258,8 @@ def test_no_re_check_once_the_time_is_spent(monkeypatch):
 
 
 def test_the_prompt_offers_lookups_only_with_the_loop():
-    plain = prompt_v2.build_system_prompt("bug")
-    looping = prompt_v2.build_system_prompt("bug", lookups=(6, 15))
+    plain = prompts.build_system_prompt("bug")
+    looping = prompts.build_system_prompt("bug", lookups=(6, 15))
 
     assert "LOOKUPS" not in plain
     assert "at most 6 rounds and 15 lookups" in looping

@@ -1,4 +1,11 @@
+from src.ingestion import code_crypto
 from src.query import graph_reader
+
+
+def _sealed(text, label, service, qualified_name, field):
+    return code_crypto.encrypt(
+        text, label=label, service=service, qualified_name=qualified_name, field=field
+    )
 
 
 class FakeSession:
@@ -31,19 +38,6 @@ def _patch_driver(monkeypatch, records):
     fake_driver = FakeDriver(records)
     monkeypatch.setattr(graph_reader, "get_driver", lambda: fake_driver)
     return fake_driver
-
-
-def test_vector_search_services_passes_k_and_embedding_params(monkeypatch):
-    driver = _patch_driver(monkeypatch, [{"name": "orders", "score": 0.9}])
-    result = graph_reader.vector_search_services([0.1, 0.2], k=3)
-    assert driver._session.last_params == {"k": 3, "embedding": [0.1, 0.2]}
-    assert result == [{"name": "orders", "score": 0.9}]
-
-
-def test_vector_search_services_query_uses_correct_index_name(monkeypatch):
-    driver = _patch_driver(monkeypatch, [])
-    graph_reader.vector_search_services([0.1], k=5)
-    assert "service_doc_index" in driver._session.last_query
 
 
 def test_expand_neighbors_query_uses_undirected_calls_pattern(monkeypatch):
@@ -87,7 +81,8 @@ def test_load_candidate_docs_returns_name_and_summary_for_given_names(monkeypatc
         [
             {
                 "name": "orders",
-                "summary": "Handles order creation and lookup.",
+                # written before encryption: read as it is
+                "doc": "Handles order creation and lookup.",
             }
         ],
     )
@@ -98,72 +93,9 @@ def test_load_candidate_docs_returns_name_and_summary_for_given_names(monkeypatc
             "summary": "Handles order creation and lookup.",
         }
     ]
-    assert "s.doc AS summary" in driver._session.last_query
+    assert "s.doc AS doc" in driver._session.last_query
     assert "full_doc" not in driver._session.last_query
     assert driver._session.last_params == {"names": ["orders"]}
-
-
-def test_load_code_symbols_for_services_queries_class_or_function_by_service(monkeypatch):
-    driver = _patch_driver(
-        monkeypatch,
-        [
-            {
-                "service": "orders",
-                "qualified_name": "controller.py::OrderController.create_order",
-                "name": "create_order",
-                "file_path": "controller.py",
-                "line_start": 4,
-                "line_end": 7,
-                "signature": "def create_order(self, user_id, items):",
-                "docstring": "Creates a new order.",
-                "language": "python",
-                "is_method": True,
-                "parent_class": "controller.py::OrderController",
-                "kind": "Function",
-            }
-        ],
-    )
-    result = graph_reader.load_code_symbols_for_services(["orders"])
-    assert result[0]["qualified_name"] == "controller.py::OrderController.create_order"
-    assert "source_snippet" not in driver._session.last_query
-    assert driver._session.last_params == {"names": ["orders"]}
-
-
-def test_load_code_symbols_for_services_empty_names_returns_empty_without_query(monkeypatch):
-    driver = _patch_driver(monkeypatch, [{"service": "shouldnt-be-seen"}])
-    result = graph_reader.load_code_symbols_for_services([])
-    assert result == []
-    assert driver._session.last_query is None
-
-
-def test_load_source_snippets_keys_result_by_service_and_qualified_name(monkeypatch):
-    driver = _patch_driver(
-        monkeypatch,
-        [
-            {
-                "service": "orders",
-                "qualified_name": "controller.py::OrderController.create_order",
-                "source_snippet": "def create_order(self, user_id, items):\n    ...",
-            }
-        ],
-    )
-    result = graph_reader.load_source_snippets(
-        [("orders", "controller.py::OrderController.create_order")]
-    )
-    assert result == {
-        ("orders", "controller.py::OrderController.create_order"):
-            "def create_order(self, user_id, items):\n    ..."
-    }
-    assert driver._session.last_params == {
-        "rows": [{"service": "orders", "qualified_name": "controller.py::OrderController.create_order"}]
-    }
-
-
-def test_load_source_snippets_empty_pairs_returns_empty_without_query(monkeypatch):
-    driver = _patch_driver(monkeypatch, [{"service": "shouldnt-be-seen"}])
-    result = graph_reader.load_source_snippets([])
-    assert result == {}
-    assert driver._session.last_query is None
 
 
 def test_vector_search_chunks_queries_chunk_index_and_rolls_up_to_function(monkeypatch):
@@ -173,7 +105,14 @@ def test_vector_search_chunks_queries_chunk_index_and_rolls_up_to_function(monke
             {
                 "service": "orders",
                 "function_qualified_name": "controller.py::OrderController.create_order",
-                "text": "def create_order(self, user_id, items):\n    ...",
+                "chunk_qualified_name": "controller.py::OrderController.create_order::chunk0",
+                "text": _sealed(
+                    "def create_order(self, user_id, items):\n    ...",
+                    "Chunk",
+                    "orders",
+                    "controller.py::OrderController.create_order::chunk0",
+                    "text",
+                ),
                 "score": 0.87,
             }
         ],
@@ -246,9 +185,13 @@ def test_search_service_chunks_merges_semantic_and_identifier_hits(monkeypatch):
         def run(self, query, **params):
             self.queries.append((query, params))
             if "identifiers" in params:
-                return [{"function_qualified_name": "a::g", "text": "t", "score": 0.5,
-                         "identifiers": ["approveDeferredReport"]}]
-            return [{"function_qualified_name": "a::f", "text": "t", "score": 0.9, "identifiers": []}]
+                code = "x = approveDeferredReport(r)"
+                text = _sealed(code, "Chunk", "ui", "a::g::chunk0", "text")
+                return [{"function_qualified_name": "a::g", "chunk_qualified_name": "a::g::chunk0",
+                         "text": text, "score": 0.5}]
+            text = _sealed("t", "Chunk", "ui", "a::f::chunk0", "text")
+            return [{"function_qualified_name": "a::f", "chunk_qualified_name": "a::f::chunk0",
+                     "text": text, "score": 0.9, "identifiers": []}]
 
         def __enter__(self):
             return self
@@ -262,6 +205,8 @@ def test_search_service_chunks_merges_semantic_and_identifier_hits(monkeypatch):
     rows = graph_reader.search_service_chunks("ui", [0.1], ["approveDeferredReport"])
 
     assert [r["function_qualified_name"] for r in rows] == ["a::f", "a::g"]
+    assert rows[1]["text"] == "x = approveDeferredReport(r)"  # decrypted on the way out
+    assert rows[1]["identifiers"] == ["approveDeferredReport"]
     assert all(p["service"] == "ui" for _, p in session.queries)
     assert all("is_test" in q for q, _ in session.queries)  # test code always excluded
 
@@ -282,6 +227,27 @@ def test_load_symbols_and_file_context_skip_the_query_for_nothing(monkeypatch):
 def test_load_file_context_returns_sorted_unique_names(monkeypatch):
     _patch_driver(monkeypatch, [{"service": "ui", "file_path": "a.ts", "names": ["g", "f", "Form.f", "f"]}])
     assert graph_reader.load_file_context([("ui", "a.ts")]) == {("ui", "a.ts"): ["Form.f", "f", "g"]}
+
+
+def test_load_symbols_decrypts_the_source_on_the_way_out(monkeypatch):
+    qname = "controller.py::OrderController.create_order"
+    where = ("Function", "orders", qname)
+    _patch_driver(
+        monkeypatch,
+        [
+            {
+                "service": "orders",
+                "qualified_name": qname,
+                "kind": "Function",
+                "signature": _sealed("create_order(self)", *where, "signature"),
+                "docstring": None,
+                "source_snippet": _sealed("def create_order(self): ...", *where, "source_snippet"),
+            }
+        ],
+    )
+    (symbol,) = graph_reader.load_symbols([("orders", qname)])
+    assert symbol["source_snippet"] == "def create_order(self): ..."
+    assert symbol["signature"] == "create_order(self)" and symbol["docstring"] is None
 
 
 def test_load_sibling_tests_skips_pairs_with_no_folder_or_already_a_test(monkeypatch):
@@ -325,6 +291,13 @@ def test_a_service_with_no_doc_scores_zero_rather_than_vanishing(monkeypatch):
     assert "WHERE s.doc_embedding IS NOT NULL" not in query
 
 
+def _spec(service, path, text):
+    sealed = code_crypto.encrypt(
+        text, label="File", service=service, qualified_name=path, field="source"
+    )
+    return {"service": service, "file_path": path, "source": sealed}
+
+
 def test_tests_naming_finds_tests_by_content_not_by_folder(monkeypatch):
     """The sibling lookup only sees the same folder. On a project that keeps
     src/common/ apart from src/apps/ that finds nothing, and a design that
@@ -332,10 +305,11 @@ def test_tests_naming_finds_tests_by_content_not_by_folder(monkeypatch):
     driver = _patch_driver(
         monkeypatch,
         [
-            {"service": "ui", "symbol": "handleCcEmailAddressesBlur",
-             "file_path": "src/apps/internal/.../ApplicationSettingsTab/view.data.test.tsx"},
-            {"service": "ui", "symbol": "handleCcEmailAddressesBlur",
-             "file_path": "src/apps/client/.../AtsIntegrationSettings/view.test.tsx"},
+            _spec("ui", "src/apps/internal/.../ApplicationSettingsTab/view.data.test.tsx",
+                  "fireEvent.blur(x); handleCcEmailAddressesBlur();"),
+            _spec("ui", "src/apps/client/.../AtsIntegrationSettings/view.test.tsx",
+                  "expect(handleCcEmailAddressesBlur).toHaveBeenCalled()"),
+            _spec("ui", "src/apps/client/other.test.tsx", "nothing relevant"),
         ],
     )
 
@@ -349,11 +323,20 @@ def test_tests_naming_finds_tests_by_content_not_by_folder(monkeypatch):
     }
     query = driver._session.last_query
     # the file's own stored text, not its chunks: a test file's chunks are a
-    # fraction of it and do not contain the fixture
-    assert "coalesce(f.source, '') CONTAINS term" in query
-    # a plain CONTAINS, not a vector search — this runs after the files to
-    # change are chosen, so it can never take a slot from real code
+    # fraction of it and do not contain the fixture. The text is encrypted,
+    # so it is matched here after decrypting, never inside Neo4j.
+    assert "f.source IS NOT NULL" in query and "CONTAINS" not in query
+    # a plain substring match, not a vector search — this runs after the files
+    # to change are chosen, so it can never take a slot from real code
     assert "queryNodes" not in query
+
+
+def test_tests_naming_matches_part_of_a_longer_name_as_before(monkeypatch):
+    """Matching stays a substring match, as the Cypher CONTAINS was: a term
+    inside a longer identifier still counts."""
+    _patch_driver(monkeypatch, [_spec("ui", "a/view.test.tsx", "renderAtsIntegrationSection()")])
+    found = graph_reader.tests_naming([("ui", "X", ["atsIntegration", "AtsIntegration"])])
+    assert found == {("ui", "X"): ["a/view.test.tsx"]}
 
 
 def test_tests_naming_ignores_test_path_files_that_are_not_specs(monkeypatch):
@@ -377,20 +360,16 @@ def test_tests_naming_also_matches_the_issue_identifiers_a_symbol_touches(monkey
     """No test in the ui repo names AtsIntegrationSectionView — a component
     is rendered through a wrapper — while four name the field the ticket is
     about, and those four hold the working fixture."""
-    driver = _patch_driver(monkeypatch, [])
+    _patch_driver(
+        monkeypatch,
+        [_spec("ui", "a/view.test.tsx", "settings.sendReportRequestedLinkCcEmailAddresses = 'a'")],
+    )
 
-    graph_reader.tests_naming(
+    found = graph_reader.tests_naming(
         [("ui", "AtsIntegrationSectionView", ["sendReportRequestedLinkCcEmailAddresses"])]
     )
 
-    assert driver._session.last_params["lookups"] == [
-        {
-            "service": "ui",
-            "symbol": "AtsIntegrationSectionView",
-            # the symbol's own name is always one of the terms
-            "terms": ["AtsIntegrationSectionView", "sendReportRequestedLinkCcEmailAddresses"],
-        }
-    ]
+    assert found == {("ui", "AtsIntegrationSectionView"): ["a/view.test.tsx"]}
 
 
 def test_tests_naming_asks_nothing_when_there_are_no_symbols(monkeypatch):
@@ -402,35 +381,89 @@ def test_load_test_sources_returns_the_stored_text_per_file(monkeypatch):
     """A path alone taught the planner nothing about the fixture, which is
     the one thing it cannot guess and the one thing it got wrong."""
     driver = _patch_driver(
-        monkeypatch,
-        [{"service": "ui", "file_path": "a/view.test.tsx", "source": "const settings = {...}"}],
+        monkeypatch, [_spec("ui", "a/view.test.tsx", "const settings = {...}")]
     )
 
     found = graph_reader.load_test_sources([("ui", "a/view.test.tsx")])
 
+    # decrypted on the way out
     assert found == {("ui", "a/view.test.tsx"): "const settings = {...}"}
     query = driver._session.last_query
     assert "f.source IS NOT NULL AND f.source <> ''" in query
-    # Every file is stored whole since pipeline version 4; the planner is
-    # still shown at most the first MAX_TEST_SOURCE_CHARS of a test.
-    assert "substring(f.source, 0, $cap)" in query
+    # A cut ciphertext would not decrypt: the text is cut once it is open.
+    assert "substring" not in query
+
+
+def test_load_test_sources_shows_at_most_the_first_part_of_a_test(monkeypatch):
+    """Every file is stored whole since pipeline version 4; the planner is
+    still shown at most the first MAX_TEST_SOURCE_CHARS of a test."""
+    long_text = "x" * (graph_reader.MAX_TEST_SOURCE_CHARS + 50)
+    _patch_driver(monkeypatch, [_spec("ui", "a/view.test.tsx", long_text)])
+
+    found = graph_reader.load_test_sources([("ui", "a/view.test.tsx")])
+
+    assert found[("ui", "a/view.test.tsx")] == long_text[: graph_reader.MAX_TEST_SOURCE_CHARS]
+
+
+def test_find_text_matches_word_hashes_then_checks_the_opened_text(monkeypatch):
+    """The source is encrypted: Neo4j picks files holding every word, and the
+    exact text is checked once each is open."""
+    driver = _patch_driver(
+        monkeypatch,
+        [
+            _spec("ui", "grid/view.tsx", "<Grid container>\n  <Grid item md={4} hidden={!title}>\n"),
+            # holds the words, not the text
+            _spec("ui", "other/view.tsx", "const md = 4; hidden(title);"),
+        ],
+    )
+
+    found = graph_reader.find_text(["ui"], "md={4} hidden={!title}")
+
+    assert found == [
+        {"service": "ui", "file_path": "grid/view.tsx",
+         "hits": [{"line": 2, "text": "  <Grid item md={4} hidden={!title}>"}]}
+    ]
+    query, params = driver._session.last_query, driver._session.last_params
+    assert "all(t IN $terms WHERE t IN f.text_terms)" in query
+    assert "CONTAINS $text" in query  # only for a file written before the hashes
+    assert params["terms"] == code_crypto.query_terms("ui", "md hidden title")
 
 
 def test_load_test_sources_asks_nothing_for_an_empty_list(monkeypatch):
     assert graph_reader.load_test_sources([]) == {}
 
 
+def test_load_file_imports_decrypts_the_import_lines(monkeypatch):
+    sealed = code_crypto.encrypt(
+        "import x from 'y';", label="File", service="ui", qualified_name="a/v.ts", field="imports"
+    )
+    _patch_driver(monkeypatch, [{"service": "ui", "file_path": "a/v.ts", "imports": sealed}])
+    assert graph_reader.load_file_imports([("ui", "a/v.ts")]) == {
+        ("ui", "a/v.ts"): "import x from 'y';"
+    }
+
+
+def test_load_candidate_docs_decrypts_service_md(monkeypatch):
+    sealed = code_crypto.encrypt(
+        "# orders", label="Service", service="orders", qualified_name="orders", field="doc"
+    )
+    _patch_driver(monkeypatch, [{"name": "orders", "doc": sealed}])
+    assert graph_reader.load_candidate_docs(["orders"]) == [
+        {"name": "orders", "summary": "# orders"}
+    ]
+
+
 def test_tests_naming_drops_a_term_that_matches_too_many_specs(monkeypatch):
     """Measured over ui's 1,105 spec files: the field this ticket is about
     matches 3, while React matches 1,013 and SetupComponentBuilder 260. A
     term that common identifies an area, not a symbol."""
-    driver = _patch_driver(monkeypatch, [])
+    rows = [_spec("ui", f"a/{i}.test.tsx", "import React; useField()") for i in range(3)]
+    rows.append(_spec("ui", "a/x.test.tsx", "import React; specificField()"))
+    _patch_driver(monkeypatch, rows)
 
-    graph_reader.tests_naming([("ui", "X", ["React"])], max_files=10)
+    found = graph_reader.tests_naming([("ui", "X", ["React", "specificField"])], max_files=2)
 
-    query = driver._session.last_query
-    assert "WHERE size(paths) <= $max_files" in query
-    assert driver._session.last_params["max_files"] == 10
+    assert found == {("ui", "X"): ["a/x.test.tsx"]}
 
 
 def test_find_symbol_files_also_finds_top_level_constants(monkeypatch):

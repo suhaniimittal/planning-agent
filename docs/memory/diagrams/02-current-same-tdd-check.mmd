@@ -1,0 +1,4 @@
+flowchart TD
+    A[create TDD] --> B{SHA-256 of story text<br/>same as stored?}
+    B -- yes --> S[Return current TDD]
+    B -- no --> V[Revise current TDD<br/>keeping its decisions]

@@ -1,60 +1,37 @@
 import pytest
 
 from src.query import query_flow
-from src.query.models import ArchComponent, ServiceDependency
+from src.query.models import (
+    ArchComponent,
+    DecisionTarget,
+    DesignDecision,
+    FileChange,
+    ServiceDependency,
+    ServicePlan,
+    TechnicalDesignDoc,
+)
 from src.query.planner import TddParseError
 
 
-class FakeServicePlan:
-    def __init__(self, service, changes=()):
-        self.service = service
-        self.changes = list(changes)
+def _tdd(**fields) -> TechnicalDesignDoc:
+    return TechnicalDesignDoc(
+        **{"title": "t", "issue_summary": "s", "overall_reasoning": "r", "services": [], **fields}
+    )
 
 
-class FakeTdd:
-    def __init__(self, services=(), current_architecture_components=(), proposed_architecture_components=()):
-        self.services = list(services)
-        self.current_architecture_components = list(current_architecture_components)
-        self.proposed_architecture_components = list(proposed_architecture_components)
-
-
-def _fn(service, qname, source="def f(): pass", file_path=None):
-    return {
-        "service": service,
-        "qualified_name": qname,
-        "name": qname.split("::")[-1].split(".")[-1],
-        "file_path": file_path or qname.split("::")[0],
-        "line_start": 1,
-        "line_end": 2,
-        "signature": "f()",
-        "docstring": None,
-        "language": "python",
-        "source_snippet": source,
-        "is_method": False,
-        "parent_class": None,
-        "kind": "Function",
-    }
+# --- build_tdd: which services the planner is given ---------------------------------------
 
 
 class FakeGraph:
-    """Everything build_tdd reads, configurable per test, with every call recorded."""
+    """Everything build_tdd reads before it plans, with every call recorded,
+    and what it handed to the planner."""
 
     def __init__(self):
         self.summary = {}
         self.hits = {}  # service -> chunk hit rows
-        self.symbols = {}  # (service, qname) -> metadata row
         self.neighbors = []
-        self.edges = []
-        self.file_context = {}
-        self.sibling_tests = {}
-        self.test_conventions = {}
-        self.tests_by_symbol = {}
-        self.file_imports = {}
-        self.test_sources = {}
-        self.peer_tests = {}
         self.calls = []
-        self.prompt = {}
-        self.tdd = FakeTdd()
+        self.plan = {}
 
 
 @pytest.fixture
@@ -81,53 +58,16 @@ def graph(monkeypatch):
         g.calls.append(("load_candidate_docs", list(names)))
         return [{"name": n, "summary": "d"} for n in reversed(names)]  # order must not matter
 
-    def get_edges_among(names):
-        g.calls.append(("get_edges_among", list(names)))
-        return [e for e in g.edges if e["source"] in names and e["target"] in names]
-
-    def load_symbols(pairs):
-        g.calls.append(("load_symbols", list(pairs)))
-        return [g.symbols[p] for p in pairs if p in g.symbols]
-
-    def load_sibling_tests(pairs):
-        g.calls.append(("load_sibling_tests", list(pairs)))
-        return g.sibling_tests
-
-    def load_file_context(pairs):
-        g.calls.append(("load_file_context", list(pairs)))
-        return {p: g.file_context.get(p, []) for p in pairs}
-
-    def test_naming_conventions(services):
-        g.calls.append(("test_naming_conventions", list(services)))
-        return g.test_conventions
-
-    def tests_naming(pairs, limit=4):
-        g.calls.append(("tests_naming", list(pairs)))
-        return g.tests_by_symbol
-
-    def load_file_imports(pairs):
-        g.calls.append(("load_file_imports", list(pairs)))
-        return g.file_imports
-
-    def load_test_sources(pairs):
-        g.calls.append(("load_test_sources", list(pairs)))
-        return g.test_sources
-
-    def tests_of_sibling_components(pairs):
-        g.calls.append(("tests_of_sibling_components", list(pairs)))
-        return g.peer_tests
-
-    def build_user_prompt(issue_text, docs, code_symbols_by_service=None, snippets_by_key=None, **kwargs):
-        g.prompt = {
-            "docs": [d["name"] for d in docs],
-            "code": code_symbols_by_service,
-            "snippets": snippets_by_key,
+    async def plan(issue_text, mode, identifiers, selected, candidate_docs, ranked_by_service,
+                   service_names, debug_dump_prompts, vectors=None, images=None, **kwargs):
+        g.plan = {
+            "selected": list(selected),
+            "docs": [d["name"] for d in candidate_docs],
+            "ranked": ranked_by_service,
+            "images": images,
             **kwargs,
         }
-        return "user"
-
-    async def call_llm(system_prompt, user_prompt):
-        return "raw"
+        return _tdd()
 
     monkeypatch.setattr(query_flow, "embed_many", fake_embed_many)
     for name, fn in {
@@ -135,22 +75,9 @@ def graph(monkeypatch):
         "search_service_chunks": search_service_chunks,
         "expand_neighbors": expand_neighbors,
         "load_candidate_docs": load_candidate_docs,
-        "get_edges_among": get_edges_among,
-        "load_symbols": load_symbols,
-        "load_file_context": load_file_context,
-        "load_sibling_tests": load_sibling_tests,
-        "test_naming_conventions": test_naming_conventions,
-        "tests_naming": tests_naming,
-        "load_file_imports": load_file_imports,
-        "load_test_sources": load_test_sources,
-        "tests_of_sibling_components": tests_of_sibling_components,
     }.items():
         monkeypatch.setattr(query_flow.graph_reader, name, fn)
-    monkeypatch.setattr(query_flow.planner, "build_system_prompt", lambda mode=None: "system")
-    monkeypatch.setattr(query_flow.planner, "build_user_prompt", build_user_prompt)
-    monkeypatch.setattr(query_flow.planner, "call_llm", call_llm)
-    monkeypatch.setattr(query_flow.planner, "parse_tdd", lambda raw: g.tdd)
-    monkeypatch.setattr(query_flow, "verify_tdd", lambda tdd, shown: None)
+    monkeypatch.setattr(query_flow, "_plan", plan)
     return g
 
 
@@ -174,37 +101,28 @@ async def test_code_evidence_can_outrank_a_better_summary_match(graph):
         "candidate": [_hit("cand.kt::isPhoneValid", 0.78)],
         "ui": [_hit("form.ts::validationSchema", 0.87)],
     }
-    for s, rows in graph.hits.items():
-        for h in rows:
-            graph.symbols[(s, h["function_qualified_name"])] = _fn(s, h["function_qualified_name"])
 
     await query_flow.build_tdd("issue", top_k=2, hops=0)
 
-    assert set(graph.prompt["seed_names"]) == {"ui", "candidate"}
-    assert set(graph.prompt["code"]) == {"ui", "candidate"}
+    assert set(graph.plan["selected"]) == {"ui", "candidate"}
     # every service in the run was searched, not just the top few by summary
     assert set(_searched(graph)) == {"compliance", "reports", "candidate", "ui", "pdf"}
 
 
 @pytest.mark.asyncio
 async def test_no_service_is_cut_before_its_code_is_searched(graph):
-    """The one the previous test cannot catch: with more services than any
-    old shortlist would have held, the WORST summary match still gets its
-    code read — and wins on it. A shortlist built on summary alone would
-    have dropped `ui` here before anyone looked at a line of it."""
+    """With more services than any old shortlist would have held, the WORST
+    summary match still gets its code read — and wins on it."""
     graph.summary = {
         "a": 0.70, "b": 0.69, "c": 0.68, "d": 0.67, "e": 0.66,
         "f": 0.65, "g": 0.64, "h": 0.63, "i": 0.62, "ui": 0.10,
     }
     graph.hits = {"ui": [_hit("form.ts::validationSchema", 0.95)]}
-    for s, rows in graph.hits.items():
-        for h in rows:
-            graph.symbols[(s, h["function_qualified_name"])] = _fn(s, h["function_qualified_name"])
 
     await query_flow.build_tdd("issue", top_k=2, hops=0)
 
     assert set(_searched(graph)) == set(graph.summary)
-    assert "ui" in graph.prompt["seed_names"]
+    assert "ui" in graph.plan["selected"]
 
 
 @pytest.mark.asyncio
@@ -214,7 +132,7 @@ async def test_a_service_named_in_the_issue_is_always_selected(graph):
 
     await query_flow.build_tdd("the bug is in candidate-service", top_k=1, hops=0)
 
-    assert graph.prompt["seed_names"] == {"candidate-service"}
+    assert graph.plan["selected"] == ["candidate-service"]
 
 
 @pytest.mark.asyncio
@@ -223,7 +141,7 @@ async def test_only_the_runs_own_services_are_considered(graph):
     await query_flow.build_tdd("issue", top_k=5, hops=0, service_names=["ui"])
 
     assert ("summary_scores", [0.0], ["ui"]) in graph.calls
-    assert graph.prompt["docs"] == ["ui"]
+    assert graph.plan["docs"] == ["ui"]
 
 
 @pytest.mark.asyncio
@@ -248,216 +166,16 @@ async def test_whole_ticket_picks_services_while_its_parts_search_code(graph):
 
 
 @pytest.mark.asyncio
-async def test_a_matched_method_pulls_in_its_whole_small_class(graph):
-    """The real failure: the method that READ a field matched the ticket, the
-    sibling that WROTE it (holding the actual fix) did not — same small class."""
-    graph.summary = {"svc": 0.9}
-    graph.hits = {"svc": [_hit("Input.kt::Input.isPhoneValid", 0.9)]}
-    method = _fn("svc", "Input.kt::Input.isPhoneValid", source="fun isPhoneValid() = ...")
-    method["parent_class"] = "Input.kt::Input"
-    graph.symbols[("svc", "Input.kt::Input.isPhoneValid")] = method
-    graph.symbols[("svc", "Input.kt::Input")] = {
-        **_fn("svc", "Input.kt::Input", source="class Input { isPhoneValid ... toAvro ... }"),
-        "kind": "Class",
-    }
-
-    await query_flow.build_tdd("phone is wrong", top_k=1, hops=0)
-
-    shown = {s["qualified_name"] for s in graph.prompt["code"]["svc"]}
-    assert "Input.kt::Input" in shown  # the whole class came along
-    assert graph.prompt["snippets"][("svc", "Input.kt::Input")] == (
-        "class Input { isPhoneValid ... toAvro ... }"
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_large_class_is_not_pulled_in(graph):
-    graph.summary = {"svc": 0.9}
-    graph.hits = {"svc": [_hit("Big.kt::Big.method", 0.9)]}
-    method = _fn("svc", "Big.kt::Big.method")
-    method["parent_class"] = "Big.kt::Big"
-    graph.symbols[("svc", "Big.kt::Big.method")] = method
-    graph.symbols[("svc", "Big.kt::Big")] = {
-        **_fn("svc", "Big.kt::Big", source="x" * 20000),
-        "kind": "Class",
-    }
-
-    await query_flow.build_tdd("issue", top_k=1, hops=0)
-
-    shown = {s["qualified_name"] for s in graph.prompt["code"]["svc"]}
-    assert "Big.kt::Big" not in shown
-
-
-@pytest.mark.asyncio
-async def test_a_long_best_match_is_shown_whole_while_the_budget_lasts(graph):
-    """A large component is the case the short-function rule handles worst.
-    On a real ticket the component holding the bug was 12,135 characters, so
-    the design saw one ~700-character chunk of it — and a review done with
-    the file open found four things inside the rest that it had missed. It
-    ranked THIRD, behind two much smaller matches, which is why this is a
-    character budget and not a count of symbols."""
-    graph.summary = {"ui": 0.9}
-    graph.hits = {
-        "ui": [
-            _hit("a.ts::small", 0.9),
-            _hit("b.ts::tiny", 0.89),
-            _hit("c.ts::component", 0.88),
-            _hit("gone.ts::stale", 0.87),
-        ]
-    }
-    component = "x" * 12135
-    graph.symbols[("ui", "a.ts::small")] = _fn("ui", "a.ts::small", source="short body")
-    graph.symbols[("ui", "b.ts::tiny")] = _fn("ui", "b.ts::tiny", source="tiny body")
-    graph.symbols[("ui", "c.ts::component")] = _fn("ui", "c.ts::component", source=component)
-
-    await query_flow.build_tdd("issue", top_k=1, hops=0)
-
-    snippets = graph.prompt["snippets"]
-    assert snippets[("ui", "a.ts::small")] == "short body"
-    assert snippets[("ui", "b.ts::tiny")] == "tiny body"
-    # third by score, and long — a count of two would have missed it
-    assert snippets[("ui", "c.ts::component")] == component
-    # a chunk whose function no longer exists is skipped, never fabricated
-    assert [s["qualified_name"] for s in graph.prompt["code"]["ui"]] == [
-        "a.ts::small",
-        "b.ts::tiny",
-        "c.ts::component",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_once_the_budget_is_spent_later_long_matches_fall_back_to_chunks(graph):
-    """Small matches still arrive whole afterwards — only the expensive ones
-    are affected, which is the point of budgeting characters."""
-    graph.summary = {"ui": 0.9}
-    graph.hits = {
-        "ui": [_hit("a.ts::big", 0.9), _hit("b.ts::also_big", 0.89), _hit("c.ts::small", 0.88)]
-    }
-    big = "x" * (query_flow._WHOLE_SOURCE_BUDGET_CHARS - 100)
-    graph.symbols[("ui", "a.ts::big")] = _fn("ui", "a.ts::big", source=big)
-    graph.symbols[("ui", "b.ts::also_big")] = _fn("ui", "b.ts::also_big", source=big)
-    graph.symbols[("ui", "c.ts::small")] = _fn("ui", "c.ts::small", source="small body")
-
-    await query_flow.build_tdd("issue", top_k=1, hops=0)
-
-    snippets = graph.prompt["snippets"]
-    assert snippets[("ui", "a.ts::big")] == big
-    assert snippets[("ui", "b.ts::also_big")] == "chunk of b.ts::also_big"
-    assert snippets[("ui", "c.ts::small")] == "small body"
-
-
-@pytest.mark.asyncio
-async def test_file_context_is_loaded_for_every_shown_file(graph):
-    graph.summary = {"ui": 0.9}
-    graph.hits = {"ui": [_hit("a.ts::f", 0.9)]}
-    graph.symbols[("ui", "a.ts::f")] = _fn("ui", "a.ts::f")
-    graph.file_context[("ui", "a.ts")] = ["f", "g"]
-
-    await query_flow.build_tdd("issue", top_k=1, hops=0)
-
-    assert graph.prompt["file_context"] == {("ui", "a.ts"): ["f", "g"]}
-
-
-@pytest.mark.asyncio
 async def test_graph_neighbors_are_background_context_only(graph):
     graph.summary = {"orders": 0.9, "shipping": 0.1, "billing": 0.1}
     graph.neighbors = ["shipping", "not-in-this-run"]
-    graph.edges = [
-        {"source": "orders", "target": "shipping"},
-        {"source": "shipping", "target": "billing"},
-    ]
 
     await query_flow.build_tdd(
         "issue", top_k=1, hops=1, service_names=["orders", "shipping", "billing"]
     )
 
-    assert graph.prompt["docs"] == ["orders", "shipping"]  # selected first, then context
-    assert graph.prompt["seed_names"] == {"orders"}
-    # only links between selected services are given as known dependencies
-    assert graph.prompt["known_dependencies"] == []
-
-
-@pytest.mark.asyncio
-async def test_known_dependencies_are_links_between_selected_services(graph):
-    graph.summary = {"ui": 0.9, "candidate": 0.8, "pdf": 0.1}
-    graph.edges = [
-        {"source": "ui", "target": "candidate"},
-        {"source": "candidate", "target": "pdf"},
-    ]
-
-    await query_flow.build_tdd("issue", top_k=2, hops=0)
-
-    assert graph.prompt["known_dependencies"] == [{"source": "ui", "target": "candidate"}]
-
-
-@pytest.mark.asyncio
-async def test_dependency_diagram_is_scoped_to_flagged_services_only(graph):
-    """Regression test: the final service_dependencies must only reflect what
-    the LLM actually flagged in `services`, not every candidate."""
-    graph.summary = {"user": 0.9, "orders": 0.8, "shipping": 0.7}
-    graph.tdd = FakeTdd(services=[FakeServicePlan("user")])
-
-    await query_flow.build_tdd("user login issue", top_k=3, hops=0)
-
-    edges_calls = [c[1] for c in graph.calls if c[0] == "get_edges_among"]
-    assert edges_calls[-1] == ["user"]
-
-
-@pytest.mark.asyncio
-async def test_dependency_scope_widens_to_architecture_diagram_targets(graph):
-    """Regression test: the LLM can flag only "orders" while drawing
-    "orders -> shipping"; the verified dependencies must include it."""
-    graph.summary = {"orders": 0.9}
-    graph.edges = [{"source": "orders", "target": "shipping"}]
-    graph.tdd = FakeTdd(
-        services=[FakeServicePlan("orders")],
-        current_architecture_components=[
-            ArchComponent(name="orders", depends_on=["shipping"]),
-            ArchComponent(name="shipping"),
-        ],
-    )
-
-    result = await query_flow.build_tdd("issue", top_k=1, hops=0)
-
-    edges_calls = [c[1] for c in graph.calls if c[0] == "get_edges_among"]
-    assert edges_calls[-1] == ["orders", "shipping"]
-    assert result.service_dependencies == [ServiceDependency(source="orders", target="shipping")]
-
-
-@pytest.mark.asyncio
-async def test_build_tdd_propagates_tdd_parse_error(graph, monkeypatch):
-    def fail(raw):
-        raise TddParseError("boom")
-
-    monkeypatch.setattr(query_flow.planner, "parse_tdd", fail)
-    with pytest.raises(TddParseError):
-        await query_flow.build_tdd("issue text")
-
-
-@pytest.mark.asyncio
-async def test_build_tdd_verifies_changes_against_the_graph(graph, monkeypatch):
-    """build_tdd must hand every change to the verifier, along with the files
-    whose code was shown to the LLM."""
-    from src.query.models import FileChange, ServicePlan, TechnicalDesignDoc
-
-    graph.summary = {"ui": 0.9}
-    graph.hits = {"ui": [_hit("src/m/view.tsx::M.view", 0.9)]}
-    graph.symbols[("ui", "src/m/view.tsx::M.view")] = _fn("ui", "src/m/view.tsx::M.view")
-    change = FileChange(
-        file_path="src/m", function_or_symbol="ghost", change_description="d",
-        implementation_notes="i", pseudocode_sketch="p", reasoning="r",
-    )
-    graph.tdd = TechnicalDesignDoc(
-        title="t", issue_summary="s", overall_reasoning="r",
-        services=[ServicePlan(service="ui", complexity="low", reasoning="r", changes=[change])],
-    )
-    seen = {}
-    monkeypatch.setattr(query_flow, "verify_tdd", lambda t, shown: seen.update(tdd=t, shown=shown))
-
-    result = await query_flow.build_tdd("issue", top_k=1, hops=0)
-
-    assert seen["tdd"] is result
-    assert seen["shown"] == {"ui": {"src/m/view.tsx"}}
+    assert graph.plan["docs"] == ["orders", "shipping"]  # selected first, then context
+    assert graph.plan["selected"] == ["orders"]
 
 
 @pytest.mark.asyncio
@@ -468,84 +186,190 @@ async def test_hops_above_two_are_capped(graph):
 
 
 @pytest.mark.asyncio
-async def test_tests_are_looked_up_by_the_identifiers_a_symbol_touches(graph):
-    """The symbol name alone finds nothing on a UI project: no test in the
-    repo names the component or its handler, because a component is rendered
-    through a wrapper. Four tests name the field the ticket is about."""
-    graph.summary = {"ui": 0.9}
-    qname = "src/m/view.tsx::AtsIntegrationSectionView"
-    graph.hits = {"ui": [_hit(qname, 0.9)]}
-    graph.symbols[("ui", qname)] = _fn(
-        "ui", qname, source="const x = settings.sendReportRequestedLinkCcEmailAddresses;"
-    )
+async def test_memory_constraints_contracts_and_screenshots_reach_the_planner(graph):
+    graph.summary = {"orders": 0.9}
 
     await query_flow.build_tdd(
-        "CC email addresses in sendReportRequestedLinkCcEmailAddresses use a comma",
-        top_k=1,
-        hops=0,
+        "issue", top_k=1, hops=0,
+        technology_constraints=["Language: Java 17 (from pom.xml)."],
+        api_contracts="openapi: 3.0.0",
+        memory="DECISIONS IN FORCE (agreed) ...",
+        images=["shot"],
     )
 
-    lookups = [c[1] for c in graph.calls if c[0] == "tests_naming"][0]
-    assert lookups == [
-        ("ui", "AtsIntegrationSectionView", ["sendReportRequestedLinkCcEmailAddresses"])
-    ]
+    assert graph.plan["technology_constraints"] == ["Language: Java 17 (from pom.xml)."]
+    assert graph.plan["api_contracts"] == "openapi: 3.0.0"
+    assert graph.plan["memory"] == "DECISIONS IN FORCE (agreed) ..."
+    assert graph.plan["images"] == ["shot"]
+
+
+# --- _plan: the planner itself, around the model call ----------------------------------------
+
+
+class FakeContext:
+    def __init__(self, shown=None):
+        self.files, self.tables, self.left_out = [], [], []
+        self.has_tests, self.used, self.budget = False, 0, 240_000
+        self._shown = shown or {}
+
+    def services(self):
+        return list(self._shown)
+
+    def symbol_names_by_service(self):
+        return {}
+
+    def shown_files_by_service(self):
+        return self._shown
+
+
+class Planned:
+    def __init__(self):
+        self.tdd = _tdd()
+        self.shown = {}
+        self.user_prompt_kwargs = {}
+        self.edges_asked = []
+        self.edges = []
+        self.verified = None
+        self.existing_files = set()
+
+
+@pytest.fixture
+def planned(monkeypatch):
+    p = Planned()
+
+    def build_context(ranked, service_names, vectors=None):
+        return FakeContext(p.shown)
+
+    async def extract(issue_text):
+        return []
+
+    def build_user_prompt(issue_text, docs, context, known_dependencies, points, **kwargs):
+        p.user_prompt_kwargs = kwargs
+        return "user"
+
+    async def call_llm(system_prompt, user_prompt, *images):
+        return "raw"
+
+    def get_edges_among(names):
+        p.edges_asked.append(list(names))
+        return [e for e in p.edges if e["source"] in names and e["target"] in names]
+
+    monkeypatch.setattr(query_flow, "build_context", build_context)
+    monkeypatch.setattr(query_flow.ticket_points, "extract", extract)
+    monkeypatch.setattr(query_flow.prompt, "build_user_prompt", build_user_prompt)
+    monkeypatch.setattr(query_flow.prompt, "build_system_prompt", lambda *a, **k: "system")
+    monkeypatch.setattr(query_flow.tool_loop, "enabled", lambda: False)
+    monkeypatch.setattr(query_flow.planner, "_use_gateway", lambda: False)
+    monkeypatch.setattr(query_flow.planner, "call_llm", call_llm)
+    monkeypatch.setattr(query_flow.planner, "parse_tdd", lambda raw: p.tdd)
+    monkeypatch.setattr(query_flow, "verify_tdd", lambda tdd, shown: setattr(p, "verified", shown))
+    for name, fn in {
+        "pipeline_versions": lambda names: {n: 5 for n in names},
+        "load_candidate_docs": lambda names: [],
+        "get_edges_with_evidence": lambda names: [],
+        "get_edges_among": get_edges_among,
+        "file_exists": lambda service, path: (service, path) in p.existing_files,
+    }.items():
+        monkeypatch.setattr(query_flow.graph_reader, name, fn)
+    return p
+
+
+async def _run_plan(**kwargs):
+    return await query_flow._plan(
+        "issue", "bug", [], ["orders"], [{"name": "orders", "summary": "d"}], {"orders": []},
+        None, False, **kwargs,
+    )
 
 
 @pytest.mark.asyncio
-async def test_an_identifier_absent_from_a_symbol_is_not_attributed_to_it(graph):
-    """A ticket's identifier only earns a test lookup when the symbol being
-    changed genuinely touches it — otherwise every symbol in the service
-    would be handed the same tests."""
-    graph.summary = {"ui": 0.9}
-    qname = "src/m/other.tsx::unrelatedThing"
-    graph.hits = {"ui": [_hit(qname, 0.9)]}
-    graph.symbols[("ui", qname)] = _fn("ui", qname, source="const y = 1;")
+async def test_the_prompt_gets_memory_constraints_and_contracts(planned):
+    await _run_plan(memory="m", technology_constraints=["Java 17"], api_contracts="c")
 
-    await query_flow.build_tdd(
-        "CC email addresses in sendReportRequestedLinkCcEmailAddresses use a comma",
-        top_k=1,
-        hops=0,
+    assert planned.user_prompt_kwargs["memory"] == "m"
+    assert planned.user_prompt_kwargs["technology_constraints"] == ["Java 17"]
+    assert planned.user_prompt_kwargs["api_contracts"] == "c"
+
+
+@pytest.mark.asyncio
+async def test_technology_constraints_come_from_the_build_files_never_the_model(planned):
+    """2026-10-15: the versions are a fact read from the repository; whatever the
+    model writes there is replaced."""
+    planned.tdd = _tdd(technology_constraints=["Language: Java 22 (invented by the model)"])
+
+    result = await _run_plan(technology_constraints=["Language: Java 17 (from pom.xml)."])
+
+    assert result.technology_constraints == ["Language: Java 17 (from pom.xml)."]
+
+
+@pytest.mark.asyncio
+async def test_dependency_diagram_is_scoped_to_flagged_services_only(planned):
+    """The final service_dependencies only reflect what the model actually
+    flagged in `services`, not every candidate."""
+    planned.tdd = _tdd(services=[ServicePlan(service="user", complexity="low", reasoning="r")])
+
+    await _run_plan()
+
+    assert planned.edges_asked[-1] == ["user"]
+
+
+@pytest.mark.asyncio
+async def test_dependency_scope_widens_to_architecture_diagram_targets(planned):
+    """The model can flag only "orders" while drawing "orders -> shipping";
+    the verified dependencies must include it."""
+    change = FileChange(
+        file_path="o.kt", change_description="c", implementation_notes="n",
+        pseudocode_sketch="p", reasoning="r",
+    )
+    planned.edges = [{"source": "orders", "target": "shipping"}]
+    planned.tdd = _tdd(
+        services=[ServicePlan(service="orders", complexity="low", reasoning="r", changes=[change])],
+        current_architecture_components=[
+            ArchComponent(name="orders", depends_on=["shipping"]),
+            ArchComponent(name="shipping"),
+        ],
     )
 
-    lookups = [c[1] for c in graph.calls if c[0] == "tests_naming"][0]
-    assert lookups == [("ui", "unrelatedThing", [])]
+    result = await _run_plan()
+
+    assert planned.edges_asked[-1] == ["orders", "shipping"]
+    assert result.service_dependencies == [ServiceDependency(source="orders", target="shipping")]
 
 
-def test_lookup_terms_come_from_the_symbol_not_the_ticket():
-    """"ATS Link CC email addresses changes semi-colon to comma" yields no
-    identifiers, so a lookup keyed on the ticket had nothing to search."""
-    source = "atsIntegration.sendReportRequestedLinkCcEmailAddresses.split(/[;,]+/)"
+@pytest.mark.asyncio
+async def test_a_parse_error_is_not_swallowed(planned, monkeypatch):
+    def fail(raw):
+        raise TddParseError("boom")
 
-    terms = query_flow._test_lookup_terms(source, [])
-
-    assert "sendReportRequestedLinkCcEmailAddresses" in terms
-
-
-def test_lookup_terms_keep_a_ticket_identifier_the_symbol_touches():
-    terms = query_flow._test_lookup_terms("const x = reportNumber;", ["reportNumber"])
-    assert "reportNumber" in terms
+    monkeypatch.setattr(query_flow.planner, "parse_tdd", fail)
+    with pytest.raises(TddParseError):
+        await _run_plan()
 
 
-def test_lookup_terms_drop_a_ticket_identifier_the_symbol_never_touches():
-    terms = query_flow._test_lookup_terms("const x = 1;", ["reportNumber"])
-    assert terms == []
+@pytest.mark.asyncio
+async def test_every_change_is_verified_against_the_files_shown(planned):
+    planned.shown = {"ui": {"src/m/view.tsx"}}
+
+    await _run_plan()
+
+    assert planned.verified == {"ui": {"src/m/view.tsx"}}
 
 
-def test_lookup_terms_keep_the_longest_when_a_symbol_names_many():
-    """Each term costs a scan of the service's spec files, and a long name
-    is the specific one."""
-    source = " ".join(f"name{'x' * n}Thing" for n in range(1, 30))
+@pytest.mark.asyncio
+async def test_a_decision_keeps_only_targets_that_exist(planned):
+    planned.shown = {"ui": {"shown.tsx"}}
+    planned.existing_files = {("ui", "in-graph.tsx")}
+    planned.tdd = _tdd(decisions=[DesignDecision(
+        id="d", title="t", choice="c", reason="r",
+        applies_to=[DecisionTarget(service="ui", file_path=f) for f in
+                    ("shown.tsx", "in-graph.tsx", "invented.tsx")],
+    )])
 
-    terms = query_flow._test_lookup_terms(source, [])
+    result = await _run_plan()
 
-    assert len(terms) == query_flow._MAX_TEST_LOOKUP_TERMS
-    assert f"name{'x' * 29}Thing" in terms
-    assert "namexThing" not in terms
+    assert [t.file_path for t in result.decisions[0].applies_to] == ["shown.tsx", "in-graph.tsx"]
 
 
 def test_the_architecture_lists_only_the_links_of_services_that_change():
-    from src.query.models import TechnicalDesignDoc
-
     tdd = TechnicalDesignDoc.model_validate({
         "title": "t", "issue_summary": "s", "overall_reasoning": "r",
         "services": [

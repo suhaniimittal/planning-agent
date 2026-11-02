@@ -1,21 +1,15 @@
-"""Two independent sources of "which services exist and which repo to
-clone for each," both producing the same ServiceSpec shape:
+"""Reads services.yaml — "which services exist and which repo to clone for
+each" — for LOCAL/DEV runs only (the CLI entry point at the bottom of
+ingest.py, ad-hoc scripts). The published agent never reads it: each run
+supplies its own service list as the `repos` text, parsed in
+src/tools/ingestion_tools.py.
 
-- load_services(): reads services.yaml — a LOCAL/DEV convenience only
-  (the CLI entry point at the bottom of ingest.py, ad-hoc scripts). The
-  published agent never calls this.
-- parse_service_specs(): reads the `repos` text a user typed into the
-  Aetherion UI form at run time — this is the published agent's own,
-  only source of truth. No yaml file is ever read once this project is
-  published; each run supplies its own service list as input.
-
-Pure I/O + parsing either way, no Neo4j/GitHub calls here.
+Pure I/O + parsing, no Neo4j/GitHub calls here.
 """
 
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,41 +81,3 @@ def load_services(path: str | Path | None = None) -> list[ServiceSpec]:
 
     return specs
 
-
-# One service per line: "name: org/repo" or "name: org/repo@branch".
-# `=` also accepted as the separator, blank lines and "#"-comments ignored —
-# forgiving of the small formatting differences a person typing into a UI
-# textarea will actually produce.
-_SPEC_LINE_RE = re.compile(r"^([^:=]+?)\s*[:=]\s*([^@\s]+)(?:@(\S+))?$")
-
-#function takes text and converts into list of ServiceSpec objects
-def parse_service_specs(text: str) -> list[ServiceSpec]:
-    """Parses the `repos` field a user typed into the Aetherion UI form —
-    the published agent's ENTIRE source of "which services exist" for this
-    run. Raises ManifestError on a malformed line rather than silently
-    skipping it: a typo'd repo name here means the wrong (or no) code gets
-    analyzed, which must fail loudly, not quietly ingest nothing.
-    """
-    specs: list[ServiceSpec] = []
-    seen_names: set[str] = set()
-    for lineno, raw_line in enumerate(text.splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        match = _SPEC_LINE_RE.match(line)
-        if not match:
-            raise ManifestError(
-                f"line {lineno}: expected 'name: org/repo' or "
-                f"'name: org/repo@branch', got {raw_line!r}"
-            )
-        name, repo, branch = match.groups()
-        name = name.strip()
-        if name in seen_names:
-            raise ManifestError(f"line {lineno}: duplicate service name {name!r}")
-        seen_names.add(name)
-        specs.append(ServiceSpec(name=name, repo=repo, branch=branch))
-
-    if not specs:
-        raise ManifestError("no services found — provide at least one 'name: org/repo' line")
-
-    return specs

@@ -31,9 +31,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
+
+from src.ingestion.secret_store import secret
 
 from . import code_graph_writer, github_api, graph_writer, links, service_doc, service_links
 from .code_parser import (
@@ -86,7 +87,11 @@ from .test_paths import is_test_path
 #     embedded; and imports, references, tests, tables, operations, routes
 #     and Kafka messages are linked. On 13 services: code lines inside a
 #     symbol or chunk went from 80.4% to ~100%, and no file is missing.
-PIPELINE_VERSION = 4
+# 5 — the code is stored encrypted (code_crypto), top-level constants
+#     included, and each file's source carries the hashes of its words
+#     (text_terms) for the exact-text search. Unchanged files of a version 4
+#     graph would otherwise stay in plain text.
+PIPELINE_VERSION = 5
 
 # How many repos to sync concurrently — serially syncing 40-50 repos would
 # otherwise dominate ingestion runtime; unbounded concurrency risks GitHub
@@ -948,7 +953,7 @@ async def run(
 ) -> None:
     """`specs`, when given, IS this run's complete service list — the
     published agent's own path, built from the `repos` text a user typed
-    into the UI form (see manifest.parse_service_specs), never from
+    into the UI form (see tools/ingestion_tools.py), never from
     services.yaml. `specs=None` falls back to services.yaml via
     load_services() — local CLI/dev convenience only.
 
@@ -983,7 +988,7 @@ async def run(
     code_graph_writer.create_chunk_vector_index()
 
     print("\n=== Syncing services (full ingest on first run, git-diff incremental after) ===")
-    github_token = os.environ.get("GITHUB_TOKEN")
+    github_token = secret("GITHUB_TOKEN") or None
     semaphore = asyncio.Semaphore(_CODE_GRAPH_CONCURRENCY)
 
     async def _one(spec: ServiceSpec) -> tuple[str, RepoGraph | None]:
@@ -999,7 +1004,7 @@ async def run(
                 graph = None
             return spec.name, graph
 
-    results = await asyncio.gather(*(_one(spec) for spec in specs))
+    await asyncio.gather(*(_one(spec) for spec in specs))
 
     # Across the FULL manifest, not only this run's services: a link from an
     # unchanged service to one that just changed must be rebuilt too.

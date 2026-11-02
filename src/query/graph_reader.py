@@ -2,32 +2,18 @@
 traversal, candidate-doc loading. Counterpart to graph_writer.py's writes —
 kept separate since the two paths have different callers and failure modes
 (a write failure breaks ingestion; a read failure breaks a live request).
+
+Code, signatures, docstrings, chunk text, SERVICE.md text, import lines and
+test file text are stored encrypted (see src/ingestion/code_crypto.py); each
+read below decrypts only the rows it returns, as it returns them.
 """
 
 from __future__ import annotations
 
+from src.ingestion import code_crypto
 from src.ingestion.code_parser import MAX_TEST_SOURCE_CHARS
 from src.ingestion.graph_writer import get_driver
 from src.ingestion.test_paths import CYPHER_SPEC_FILE_RE, CYPHER_TEST_PATH_RE, is_test_path
-
-
-def vector_search_services(embedding: list[float], k: int = 5) -> list[dict]:
-    """Top-k services by cosine similarity on doc_embedding.
-
-    Returns [{"name": str, "score": float}, ...], descending score.
-    """
-    with get_driver().session() as session:
-        result = session.run(
-            """
-            CALL db.index.vector.queryNodes('service_doc_index', $k, $embedding)
-            YIELD node, score
-            RETURN node.name AS name, score
-            ORDER BY score DESC
-            """,
-            k=k,
-            embedding=embedding,
-        )
-        return [{"name": r["name"], "score": r["score"]} for r in result]
 
 
 def expand_neighbors(seed_names: list[str], hops: int = 2) -> list[dict]:
@@ -91,37 +77,41 @@ def load_candidate_docs(names: list[str]) -> list[dict]:
             """
             MATCH (s:Service)
             WHERE s.name IN $names
-            RETURN s.name AS name, s.doc AS summary
+            RETURN s.name AS name, s.doc AS doc
             """,
             names=names,
         )
-        return [dict(r) for r in result]
+        return [{"name": r["name"], "summary": _open_doc(dict(r))["doc"]} for r in result]
 
 
-def load_code_symbols_for_services(names: list[str]) -> list[dict]:
-    """Class/Function metadata for these services — everything EXCEPT
-    source_snippet, which is kept in a separate, narrower read
-    (load_source_snippets) since a service can have hundreds of symbols and
-    most won't survive candidates.select_relevant_symbols' ranking/cap.
-    """
-    if not names:
-        return []
-    with get_driver().session() as session:
-        result = session.run(
-            """
-            MATCH (n)
-            WHERE (n:Class OR n:Function OR n:Variable) AND n.service IN $names
-            RETURN n.service AS service, n.qualified_name AS qualified_name,
-                   n.name AS name, n.file_path AS file_path,
-                   n.line_start AS line_start, n.line_end AS line_end,
-                   n.signature AS signature, n.docstring AS docstring,
-                   n.language AS language,
-                   n.is_method AS is_method, n.parent_class AS parent_class,
-                   [l IN labels(n) WHERE l <> 'Symbol'][0] AS kind
-            """,
-            names=names,
-        )
-        return [dict(r) for r in result]
+def _open_doc(row: dict) -> dict:
+    return code_crypto.decrypt_row(
+        row, label="Service", service=row["name"], qualified_name=row["name"]
+    )
+
+
+def _open_file(row: dict) -> dict:
+    """A File row (service, file_path, ...) with its encrypted fields opened."""
+    return code_crypto.decrypt_row(
+        row, label="File", service=row["service"], qualified_name=row["file_path"]
+    )
+
+
+def _open_symbol(row: dict) -> dict:
+    """A Class/Function row with its code fields decrypted; the row must
+    carry service, qualified_name and kind (the node's label)."""
+    return code_crypto.decrypt_row(
+        row, label=row["kind"], service=row["service"], qualified_name=row["qualified_name"]
+    )
+
+
+def _open_chunk(row: dict, service: str) -> dict:
+    """A chunk row with its text decrypted; the chunk's own qualified_name,
+    needed to decrypt, is dropped from what callers see."""
+    qualified_name = row.pop("chunk_qualified_name")
+    return code_crypto.decrypt_row(
+        row, label="Chunk", service=service, qualified_name=qualified_name
+    )
 
 
 def vector_search_chunks(
@@ -137,7 +127,7 @@ def vector_search_chunks(
     graph today this is a non-issue, but at real scale a global top-k could
     theoretically miss a relevant chunk that belongs to a candidate service
     if enough higher-scoring chunks from OTHER services crowd it out; same
-    class of caveat already noted for `vector_search_services` and the
+    class of caveat as the
     `db.index.vector.queryNodes` deprecation in docs/INGESTION_PIPELINE.md.
     """
     if not service_names:
@@ -150,44 +140,14 @@ def vector_search_chunks(
             MATCH (f:Function)-[:HAS_CHUNK]->(node)
             WHERE node.service IN $service_names
             RETURN node.service AS service, f.qualified_name AS function_qualified_name,
-                   node.text AS text, score
+                   node.qualified_name AS chunk_qualified_name, node.text AS text, score
             ORDER BY score DESC
             """,
             k=k,
             embedding=embedding,
             service_names=service_names,
         )
-        return [dict(r) for r in result]
-
-
-def load_source_snippets(
-    service_qualified_name_pairs: list[tuple[str, str]],
-) -> dict[tuple[str, str], str]:
-    """source_snippet for exactly these (service, qualified_name) symbols,
-    keyed by that same (service, qualified_name) pair — called only for the
-    final, ranked+capped shortlist, never for every symbol a service has.
-
-    Keyed by the pair, not qualified_name alone: qualified_name is only
-    unique WITHIN a service (it's derived from file_path, which two
-    different repos can coincidentally share), so a bare-string key could
-    collide across services in the result.
-    """
-    if not service_qualified_name_pairs:
-        return {}
-    rows = [{"service": s, "qualified_name": q} for s, q in service_qualified_name_pairs]
-    with get_driver().session() as session:
-        result = session.run(
-            """
-            UNWIND $rows AS row
-            MATCH (n)
-            WHERE (n:Class OR n:Function OR n:Variable)
-              AND n.service = row.service AND n.qualified_name = row.qualified_name
-            RETURN n.service AS service, n.qualified_name AS qualified_name,
-                   n.source_snippet AS source_snippet
-            """,
-            rows=rows,
-        )
-        return {(r["service"], r["qualified_name"]): r["source_snippet"] for r in result}
+        return [_open_chunk(dict(r), r["service"]) for r in result]
 
 
 def file_exists(service: str, file_path: str) -> bool:
@@ -294,7 +254,9 @@ def search_service_chunks(
     ticket strongly is enough, so a specific detail is not averaged away.
     Two reads, merged: the top `k` by that score, plus every chunk
     containing one of `identifiers` (exact code names from the issue text),
-    whatever its score.
+    whatever its score. The text is encrypted, so the second read matches
+    the hashes of each identifier's words (`text_terms`), then keeps only
+    the chunks whose decrypted text really contains it.
 
     `k` is close to a count of candidate FUNCTIONS, not of chunks: 93% of
     functions are short enough to be a single chunk, so measured on this
@@ -327,27 +289,36 @@ def search_service_chunks(
             WITH c, {score} AS score
             ORDER BY score DESC LIMIT $k
             RETURN coalesce(c.function_qualified_name, c.file_path) AS function_qualified_name,
-                   c.text AS text, score, [] AS identifiers
+                   c.qualified_name AS chunk_qualified_name, c.text AS text, score,
+                   [] AS identifiers
             """,
             k=k,
             **params,
         )
-        rows = [dict(r) for r in semantic]
+        rows = [_open_chunk(dict(r), service) for r in semantic]
         if identifiers:
+            groups = [code_crypto.query_terms(service, w) for w in identifiers]
             exact = session.run(
                 f"""
                 MATCH (c:Chunk {{service: $service}})
-                WHERE any(w IN $identifiers WHERE c.text CONTAINS w) AND {_NOT_TEST}
+                WHERE {_NOT_TEST} AND (
+                  any(g IN $groups WHERE size(g) > 0
+                      AND all(t IN g WHERE t IN coalesce(c.text_terms, [])))
+                  OR (c.text_terms IS NULL AND any(w IN $identifiers WHERE c.text CONTAINS w)))
                 WITH c, {score} AS score
                 RETURN coalesce(c.function_qualified_name, c.file_path) AS function_qualified_name,
-                       c.text AS text, score,
-                       [w IN $identifiers WHERE c.text CONTAINS w] AS identifiers
+                       c.qualified_name AS chunk_qualified_name, c.text AS text, score
                 LIMIT 200
                 """,
+                groups=groups,
                 identifiers=identifiers,
                 **params,
             )
-            rows += [dict(r) for r in exact]
+            for record in exact:
+                row = _open_chunk(dict(record), service)
+                row["identifiers"] = [w for w in identifiers if w in (row["text"] or "")]
+                if row["identifiers"]:  # a hash match is checked against the real text
+                    rows.append(row)
         return rows
 
 
@@ -381,7 +352,7 @@ def load_symbols(service_qualified_name_pairs: list[tuple[str, str]]) -> list[di
             """,
             rows=rows,
         )
-        found = [dict(r) for r in result]
+        found = [_open_symbol(dict(r)) for r in result]
         seen = {(r["service"], r["qualified_name"]) for r in found}
         unresolved = [r for r in rows if (r["service"], r["qualified_name"]) not in seen]
         if not unresolved:
@@ -432,7 +403,8 @@ def load_file_imports(service_file_pairs: list[tuple[str, str]]) -> dict[tuple[s
             """,
             rows=rows,
         )
-        return {(r["service"], r["file_path"]): r["imports"] for r in result}
+        opened = [_open_file(dict(r)) for r in result]
+        return {(r["service"], r["file_path"]): r["imports"] for r in opened}
 
 
 def load_file_context(
@@ -568,7 +540,7 @@ def tests_naming(
     starts around sixty, so anything in that gap works; the default sits
     near the signal end of it.
 
-    A plain CONTAINS, not a vector search: this runs AFTER the files to
+    A plain substring match, not a vector search: this runs AFTER the files to
     change are chosen, so it cannot take a result slot from real code
     (search_service_chunks excludes test chunks for exactly that reason —
     test prose echoes a ticket's wording and outscores the code it tests).
@@ -603,26 +575,36 @@ def tests_naming(
     ]
     if not lookups:
         return {}
+    # The stored text is encrypted, so Neo4j cannot search inside it: each
+    # service's spec files are read once, opened here, and matched exactly
+    # as the CONTAINS in Cypher did. Bounded: a spec file stores at most
+    # MAX_TEST_SOURCE_CHARS (6,000), so even ui's 1,105 specs are ~6 MB.
+    services = sorted({lookup["service"] for lookup in lookups})
     with get_driver().session() as session:
         rows = session.run(
             """
-            UNWIND $lookups AS lookup
-            UNWIND lookup.terms AS term
-            MATCH (f:File {service: lookup.service})
-            WHERE f.file_path =~ $spec_re
-              AND coalesce(f.source, '') CONTAINS term
-            WITH lookup, term, collect(f.file_path) AS paths
-            WHERE size(paths) <= $max_files
-            UNWIND paths AS file_path
-            RETURN lookup.service AS service, lookup.symbol AS symbol, file_path
+            UNWIND $services AS service
+            MATCH (f:File {service: service})
+            WHERE f.file_path =~ $spec_re AND f.source IS NOT NULL AND f.source <> ''
+            RETURN service, f.file_path AS file_path, f.source AS source
             """,
-            lookups=lookups,
+            services=services,
             spec_re=CYPHER_SPEC_FILE_RE,
-            max_files=max_files,
         )
-        found: dict[tuple[str, str], set[str]] = {}
+        specs: dict[str, list[tuple[str, str]]] = {}
         for row in rows:
-            found.setdefault((row["service"], row["symbol"]), set()).add(row["file_path"])
+            opened = _open_file(dict(row))
+            specs.setdefault(opened["service"], []).append(
+                (opened["file_path"], opened["source"] or "")
+            )
+
+    found: dict[tuple[str, str], set[str]] = {}
+    for lookup in lookups:
+        files = specs.get(lookup["service"], [])
+        for term in lookup["terms"]:
+            paths = [path for path, source in files if term in source]
+            if paths and len(paths) <= max_files:
+                found.setdefault((lookup["service"], lookup["symbol"]), set()).update(paths)
     return {key: sorted(paths)[:limit] for key, paths in found.items()}
 
 
@@ -649,13 +631,16 @@ def load_test_sources(
             UNWIND $rows AS row
             MATCH (f:File {service: row.service, file_path: row.file_path})
             WHERE f.source IS NOT NULL AND f.source <> ''
-            RETURN row.service AS service, row.file_path AS file_path,
-                   substring(f.source, 0, $cap) AS source
+            RETURN row.service AS service, row.file_path AS file_path, f.source AS source
             """,
             rows=rows,
-            cap=MAX_TEST_SOURCE_CHARS,
         )
-        return {(r["service"], r["file_path"]): r["source"] for r in result}
+        # Cut after opening: a cut ciphertext no longer decrypts.
+        opened = [_open_file(dict(r)) for r in result]
+        return {
+            (r["service"], r["file_path"]): (r["source"] or "")[:MAX_TEST_SOURCE_CHARS]
+            for r in opened
+        }
 
 
 def tests_of_sibling_components(
@@ -774,12 +759,12 @@ def load_sibling_tests(
     return siblings
 
 
-# --- planner v2: whole files and the links between them -----------------------
+# --- the planner: whole files and the links between them ---------------------
 #
 # Everything below reads what ingestion pipeline version 4 writes: File.source,
 # the IMPORTS/REFERENCES/TESTS edges, tables, operations, routes and Kafka
 # messages. On an older graph these return nothing, which is why
-# query_flow checks pipeline_versions() before taking the v2 path.
+# query_flow warns when pipeline_versions() shows one.
 
 
 def _pair_rows(pairs: list[tuple[str, str]]) -> list[dict]:
@@ -811,7 +796,7 @@ def load_file_sources(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], dic
             """,
             rows=_pair_rows(pairs),
         )
-        return {(r["service"], r["file_path"]): dict(r) for r in result}
+        return {(r["service"], r["file_path"]): _open_file(dict(r)) for r in result}
 
 
 def load_file_symbols(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], list[dict]]:
@@ -1160,20 +1145,49 @@ def messages_named(name: str) -> list[dict]:
         return [dict(r) for r in result]
 
 
+# Files opened per service by one find_text. A file is a candidate when it
+# holds every word of the text; the phrase itself is checked once it is open.
+_FIND_TEXT_CANDIDATES = 300
+
+
 def find_text(services: list[str], text: str, limit: int = 20) -> list[dict]:
     """Files of `services` whose source contains `text` exactly, with up to
     five of the lines it is on. [{"service", "file_path", "hits": [{"line",
-    "text"}]}]."""
+    "text"}]}].
+
+    The source is stored encrypted, so Neo4j cannot search inside it: it
+    matches the hashes of the text's words (``text_terms``, written beside
+    each file's source), and the candidates are opened and checked here. A
+    file written before those hashes existed is still searched as plain
+    text. Text with no word in it (only symbols) matches nothing encrypted."""
+    found: list[dict] = []
     with get_driver().session() as session:
-        result = session.run(
-            """
-            MATCH (f:File) WHERE f.service IN $services AND f.source CONTAINS $text
-            WITH f, split(f.source, '\n') AS lines
-            ORDER BY f.service, f.file_path LIMIT $limit
-            RETURN f.service AS service, f.file_path AS file_path,
-                   [i IN range(0, size(lines) - 1) WHERE lines[i] CONTAINS $text |
-                    {line: i + 1, text: lines[i]}][..5] AS hits
-            """,
-            services=services, text=text, limit=limit,
-        )
-        return [dict(r) for r in result]
+        for service in sorted(set(services)):
+            result = session.run(
+                """
+                MATCH (f:File {service: $service})
+                WHERE f.source IS NOT NULL AND (
+                  (size($terms) > 0 AND f.text_terms IS NOT NULL
+                   AND all(t IN $terms WHERE t IN f.text_terms))
+                  OR (f.text_terms IS NULL AND f.source CONTAINS $text))
+                RETURN f.service AS service, f.file_path AS file_path, f.source AS source
+                ORDER BY f.file_path LIMIT $cap
+                """,
+                service=service,
+                terms=code_crypto.query_terms(service, text),
+                text=text,
+                cap=_FIND_TEXT_CANDIDATES,
+            )
+            for row in result:
+                source = _open_file(dict(row))["source"] or ""
+                if text not in source:
+                    continue
+                hits = [
+                    {"line": n, "text": line}
+                    for n, line in enumerate(source.split("\n"), start=1)
+                    if text in line
+                ]
+                found.append({"service": service, "file_path": row["file_path"], "hits": hits[:5]})
+                if len(found) == limit:
+                    return found
+    return found

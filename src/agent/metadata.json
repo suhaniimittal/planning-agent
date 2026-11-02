@@ -19,6 +19,13 @@
                 "friendly_name": "Repositories"
             },
             {
+                "name": "issue_key",
+                "type": "text",
+                "required": false,
+                "description": "Optional: the Jira ticket ID, e.g. KS-17531. With it, the design reads and is saved to that ticket's memory, so a later run builds on this one.",
+                "friendly_name": "Issue key"
+            },
+            {
                 "name": "uploaded_files",
                 "type": "file",
                 "required": false,
