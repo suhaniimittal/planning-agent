@@ -4,7 +4,7 @@
     3    service map the run's services only; paths only with code reads off
     4    evidence    reference changes, candidate files, reads within the caps
     5    questions   answered -> decisions, unanswered -> open (never answered here)
-    6    scout       optional model call: extra files from the path list
+    6    scout       optional model call: extra files to read (code reads on only)
     7    writer      model call: the TDD as JSON, no code
     8    checks      services, citations, questions, work order, no code;
                      one repair call, then a draft with the reason
@@ -32,10 +32,10 @@ from . import prompts, questions
 from .attachments import Attachment
 from .checks import CheckContext, check
 from .config import Settings, describe
-from .evidence import Evidence, Gatherer
+from .evidence import Evidence, Gatherer, is_test
 from .github import GitHubReader
 from .inputs import PlanInput
-from .models import OpenQuestion, PinnedService, TddDocument, WorkStep
+from .models import CARD_DECISION, OpenQuestion, PinnedService, TddDocument, WorkStep
 from .prepare import Prepared, prepare
 from .service_map.slice import MapSlice, build_slice
 
@@ -43,6 +43,20 @@ from .service_map.slice import MapSlice, build_slice
 _FLOW_FIELDS = ("ticket", "ticket_type", "status", "draft_reason", "high_level", "pinned",
                 "files_read", "not_read", "warnings", "generated_at")
 _LINE_RANGE = re.compile(r"(?::\d+(?:-\d+)?|#L\d+(?:-L\d+)?)$")
+# A requirement about where to check, not what the app does: no edit can make
+# "verified in Chrome 130" true (2026-11-03). Moved to the tests when it names
+# a browser, device, size or zoom and either says to check or has no "must".
+_ENVIRONMENT = re.compile(
+    r"\b(?:chrome|edge|firefox|safari|browsers?|windows|macos|ios|android|zoom"
+    r"|\d{3,4}\s*[x×]\s*\d{3,4})\b",
+    re.I,
+)
+_VERIFY = re.compile(r"\b(?:verif\w*|check\w*|tested|in-scope)\b", re.I)
+_MUST = re.compile(r"\bmust\b", re.I)
+_PATHISH = re.compile(r"[\w@.-]+(?:/[\w@.-]+)+")
+# An id worth replacing in prose: "d3", "q2", or a slug with a hyphen; a
+# one-word slug could be an ordinary word.
+_CODE_ID = re.compile(r"^(?:[a-z]{1,2}\d+|[a-z0-9]+(?:-[a-z0-9]+)+)$")
 
 
 async def run(
@@ -66,10 +80,16 @@ async def run(
             ev = await asyncio.to_thread(gatherer.gather, plan)
         decided, still_open = questions.split(plan.questions)
         map_view = map_slice.view()
-        if settings.scout and prepared.services and not gatherer.good_enough():
-            await _scout(plan, attachments, map_view, gatherer, prepared)
-        elif prepared.services:
+        # The scout picks files to READ: with code reads off its picks would only
+        # be listed, so the call is not made (2026-11-03).
+        if not prepared.services:
+            pass
+        elif not (settings.scout and settings.allow_code_reads):
+            print("  [TDD] scout: off (TDD_SCOUT, or code reads off: nothing it picks is read)")
+        elif gatherer.good_enough():
             print("  [TDD] scout: skipped, the evidence already has a strong lead per service")
+        else:
+            await _scout(plan, attachments, map_view, gatherer, prepared)
         if prepared.services:
             # The room kept for the scout, when it was skipped, failed or picked few.
             extra = await asyncio.to_thread(gatherer.fill)
@@ -175,8 +195,12 @@ async def _write(
     # What the TDD was based on: for the log, not the document.
     for line in doc.files_read:
         print(f"  [TDD] read {line}")
-    for line in doc.not_read[:30]:
+    for line in ev.not_read[:30]:
         print(f"  [TDD] not read: {line}")
+    # With code reads off, the leads are what the TDD names, with why each was found.
+    label = "not read" if settings.allow_code_reads else "lead"
+    for line in ev.unread_leads[:30]:
+        print(f"  [TDD] {label}: {line}")
     for line in doc.warnings:
         print(f"  [TDD] warning: {line}")
     return doc
@@ -249,6 +273,9 @@ def _complete(
     mine = [OpenQuestion(question=q.question, why_it_matters=q.why_it_matters, source="planner")
             for q in doc.open_questions if q.question and _flat(q.question) not in asked]
     doc.open_questions = list(still_open) + mine
+    _drop_test_files(doc)
+    _environment_to_tests(doc)
+    _no_ids(doc)
     # The work order: renumbered, and where to work filled from the input.
     by_name = {s.name: s for s in prepared.services}
     doc.work_order.ticket = card.key
@@ -284,6 +311,86 @@ def _fix_paths(doc: TddDocument, ev: Evidence) -> None:
     for decision in doc.decisions:
         for target in decision.applies_to:
             target.file_path = fixed(target.service, target.file_path)
+
+
+def _names_test(text: str) -> bool:
+    return any(is_test(p) for p in _PATHISH.findall(text))
+
+
+def _drop_test_files(doc: TddDocument) -> None:
+    """No test file as a step, a file to look at or a design decision's target:
+    the coding agent writes no tests, and the checks are in the test plan."""
+    for plan in doc.per_service_plan:
+        steps = [s for s in plan.steps if not (s.where and is_test(s.where))]
+        if len(steps) < len(plan.steps):
+            doc.warnings.append(f"{plan.service}: {len(plan.steps) - len(steps)} step(s) on a "
+                                "test file removed")
+        plan.steps = steps
+        plan.files_to_look_at = [f for f in plan.files_to_look_at if not is_test(f.path)]
+    kept = []
+    for d in doc.decisions:
+        if d.applies_to and not CARD_DECISION.match(d.id):
+            targets = [t for t in d.applies_to if not is_test(t.file_path)]
+            if not targets:
+                doc.warnings.append(f"decision '{d.title}' only about a test file, removed")
+                continue
+            d.applies_to = targets
+        kept.append(d)
+    doc.decisions = kept
+    doc.work_order.steps = [s for s in doc.work_order.steps if not _names_test(s.summary)]
+    doc.order_of_work = [line for line in doc.order_of_work if not _names_test(line)]
+
+
+def _environment_to_tests(doc: TddDocument) -> None:
+    """A requirement about where to check it goes to the test plan."""
+    kept, moved = [], []
+    tests = doc.risks_and_tests.tests
+    for line in doc.requirements:
+        if _ENVIRONMENT.search(line) and (_VERIFY.search(line) or not _MUST.search(line)):
+            if line not in tests:
+                moved.append(line)
+        else:
+            kept.append(line)
+    doc.requirements = kept
+    tests[:0] = moved  # first in the test plan, in the ticket's order
+
+
+def _no_ids(doc: TddDocument) -> None:
+    """A decision's id in prose ("d3 says") becomes its title."""
+    titles = {d.id: d.title or d.choice for d in doc.decisions if _CODE_ID.match(d.id or "")}
+    if not titles:
+        return
+    pattern = re.compile(
+        r"(?<![\w-])(" + "|".join(map(re.escape, sorted(titles, key=len, reverse=True)))
+        + r")(?![\w-])"
+    )
+
+    def plain(text: str) -> str:
+        return pattern.sub(lambda m: f"the decision '{titles[m.group(1)]}'", text)
+
+    doc.problem, doc.cause, doc.fix = plain(doc.problem), plain(doc.cause), plain(doc.fix)
+    doc.requirements = [plain(t) for t in doc.requirements]
+    doc.order_of_work = [plain(t) for t in doc.order_of_work]
+    doc.risks_and_tests.risks = [plain(t) for t in doc.risks_and_tests.risks]
+    doc.risks_and_tests.tests = [plain(t) for t in doc.risks_and_tests.tests]
+    for d in doc.decisions:
+        if not CARD_DECISION.match(d.id):
+            d.choice, d.reason = plain(d.choice), plain(d.reason)
+    for step in [*doc.current_flow, *doc.flow_after_change]:
+        step.step = plain(step.step)
+    for plan in doc.per_service_plan:
+        plan.what_changes = plain(plan.what_changes)
+        for s in plan.steps:
+            s.title, s.what, s.why, s.done_when = (
+                plain(s.title), plain(s.what), plain(s.why), plain(s.done_when)
+            )
+        for f in plan.files_to_look_at:
+            f.why = plain(f.why)
+    for q in doc.open_questions:
+        if q.source == "planner":
+            q.why_it_matters = plain(q.why_it_matters)
+    for w in doc.work_order.steps:
+        w.summary = plain(w.summary)
 
 
 def _drop_bad_citations(doc: TddDocument, ctx: CheckContext) -> None:

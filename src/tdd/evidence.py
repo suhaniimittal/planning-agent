@@ -61,6 +61,15 @@ _NOT_READ_PER_SERVICE = 25
 # one of them ("report" in a reporting app).
 _COMMON_SHARE = 0.05
 _COMMON_MIN = 30
+# Generated code: a type file per query, written by a tool, never the place
+# of a change (BTS-40: utils/graphql/@types/ArchiveReports.ts as a lead).
+_GENERATED = re.compile(r"(?:^|/)(?:@types|__generated__|generated)/|\.generated\.|\.d\.ts$", re.I)
+# A monorepo's app folders sit right under one of these (apps/client, apps/internal).
+_APP_ROOTS = ("apps", "packages")
+# Another app's files and generated files are named to the writer only while
+# the app the title names, and shared code, give fewer leads than this: ten
+# is enough to plan from, and below it a lead elsewhere is better than none.
+_FEW_LEADS = 10
 # Searches: at most this many terms per service in step 2, and files used
 # for the step up in step 4.
 _TERMS_PER_SERVICE = 4
@@ -99,6 +108,9 @@ _STOPWORDS = {
     "shifted", "space", "white", "control", "controls", "view", "views", "table", "list",
     "field", "fields", "value", "values", "data", "hide", "hidden", "open", "close", "item",
     "items", "icon", "text", "link", "row", "rows", "column", "columns", "move", "moves",
+    # Words of how a bug is told, not of the code (BTS-40: "down", "clicks", "Process").
+    "down", "clicks", "process", "processes", "status", "misclick", "misclicks", "shifts",
+    "moved", "moving", "happened", "selecting", "unselect", "unselecting",
 }
 _IDENTIFIER = re.compile(
     r"\b(?:[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+|[a-z]+(?:[A-Z][a-z0-9]+)+|[a-z]+(?:_[a-z0-9]+)+)\b"
@@ -123,6 +135,9 @@ class Candidate:
     # x1.5 under a folder the ticket's title names ("Client UI" -> apps/client/):
     # ranking only, never what counts as a strong lead.
     boost: float = 1.0
+    # 0 in the app the title names, 1 shared code or no app named, 2 another
+    # app, 3 generated: ranked in this order before the score (2026-11-03).
+    tier: int = 1
 
     def add(self, score: float, why: str) -> None:
         self.score += score
@@ -132,6 +147,12 @@ class Candidate:
     @property
     def rank(self) -> float:
         return self.score * self.boost
+
+    @property
+    def note(self) -> str:
+        return {2: "in another app than the one the title names", 3: "a generated file"}.get(
+            self.tier, ""
+        )
 
 
 @dataclass
@@ -183,9 +204,21 @@ class Evidence:
         return any(f.service == service and f.path == path for f in self.files)
 
     def ranked(self, service: str) -> list[Candidate]:
+        """Best first: the app the title names, then shared code, then other
+        apps, then generated files; by score within each."""
         return sorted(
-            self.candidates.get(service, {}).values(), key=lambda c: (-c.rank, c.path)
+            self.candidates.get(service, {}).values(), key=lambda c: (c.tier, -c.rank, c.path)
         )
+
+    def leads(self, service: str, limit: int) -> list[Candidate]:
+        """Unread candidates worth naming, best first. Another app's files and
+        generated files only while the others are fewer than _FEW_LEADS."""
+        good = [
+            c for c in self.ranked(service)
+            if c.score >= 1 and not self.was_read(service, c.path) and not is_test(c.path)
+        ]
+        near = [c for c in good if c.tier < 2]
+        return (near if len(near) >= _FEW_LEADS else good)[:limit]
 
     def has_strong_lead(self, service: str) -> bool:
         return any(c.score >= STRONG for c in self.candidates.get(service, {}).values())
@@ -296,6 +329,22 @@ def _stem(path: str) -> str:
     return name.split(".", 1)[0]
 
 
+def _app_of(path: str) -> str | None:
+    """The monorepo app a path is in: "src/apps/client/x.tsx" -> "client"."""
+    parts = path.split("/")
+    for i, part in enumerate(parts[:-2]):
+        if part in _APP_ROOTS:
+            return parts[i + 1]
+    return None
+
+
+def _named_apps(paths: tuple[str, ...], scope: set[str]) -> set[str]:
+    """The repo's apps whose folder name is a word of the title ("Client UI" ->
+    client), singular or plural; empty when the title names none."""
+    apps = {a for a in (_app_of(p) for p in paths) if a}
+    return {a for a in apps if norm(a) in scope or norm(a).removesuffix("s") in scope}
+
+
 def _in_folder(paths: tuple[str, ...], folder: str) -> list[str]:
     if not folder:
         return list(paths)
@@ -323,6 +372,7 @@ class Gatherer:
         self.budget = Budget(settings.max_files, settings.max_files_per_service, settings.max_chars)
         self.stopped = ""  # set by a rate limit or the run's call cap: no more GitHub
         self.scope: set[str] = set()  # the title's words, to rank files under a named area
+        self.named_apps: dict[str, set[str]] = {}  # service -> app folders the title names
         self.failed: set[tuple[str, str]] = set()  # (service, path) whose read failed, noted
 
     # --- the steps ----------------------------------------------------------------------
@@ -345,6 +395,12 @@ class Gatherer:
                 continue
             self.ev.folders[svc.name] = self.map.folders.get(svc.name, svc.path)
             usable.append(svc)
+        for svc in usable:
+            named = _named_apps(self.ev.trees[svc.name].paths, self.scope)
+            self.named_apps[svc.name] = named
+            if named:
+                print(f"  [TDD] {svc.name}: the title names the app(s) {', '.join(sorted(named))}; "
+                      "their files rank first")
         for svc in usable:
             self._references(svc)
         searches_each = self._search_share(len(usable))
@@ -575,7 +631,9 @@ class Gatherer:
     def _candidate(self, service: str, path: str) -> Candidate:
         per_service = self.ev.candidates.setdefault(service, {})
         if path not in per_service:
-            per_service[path] = Candidate(service, path, boost=self._boost(path))
+            per_service[path] = Candidate(
+                service, path, boost=self._boost(path), tier=self._tier(service, path)
+            )
         return per_service[path]
 
     def _boost(self, path: str) -> float:
@@ -584,6 +642,15 @@ class Gatherer:
         folders = {norm(part) for part in path.split("/")[:-1]}
         named = any(f in self.scope or f.removesuffix("s") in self.scope for f in folders)
         return 1.5 if named else 1.0
+
+    def _tier(self, service: str, path: str) -> int:
+        if _GENERATED.search(path):
+            return 3
+        named = self.named_apps.get(service)
+        app = _app_of(path)
+        if not named or app is None:
+            return 1
+        return 0 if app in named else 2
 
     # --- 3. reading ---------------------------------------------------------------------
 
@@ -688,7 +755,8 @@ class Gatherer:
                 )
             for c in unread[:_NOT_READ_PER_SERVICE]:
                 if not self.settings.allow_code_reads:
-                    why = "code reads are off (ALLOW_CODE_READS)"
+                    # Nothing is read: say why the file was found instead.
+                    why = "; ".join([*c.why, c.note] if c.note else c.why)
                 elif sizes.get(c.path, 0) > _MAX_FILE_BYTES:
                     why = f"over {_MAX_FILE_BYTES // 1000} KB, likely generated"
                 elif self.stopped:

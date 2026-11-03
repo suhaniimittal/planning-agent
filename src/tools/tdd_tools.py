@@ -57,7 +57,7 @@ async def plan_tdd(planning_input: str, attachments: list[dict] | None = None) -
 
     text = render.render_text(doc)
     html = render.render_html(doc)
-    pdf = pdf_from_html(html, doc.title, render.coding_task(doc))
+    pdf = pdf_from_html(html, doc.title, render.coding_task(doc, render.issue(plan, loaded)))
     file_name = f"technical_designs/{_slug(doc.title)}-{_stamp(doc.generated_at)}.pdf"
     _, s3_key = storage.store_object(bucket, file_name, pdf, "application/pdf")
     return {

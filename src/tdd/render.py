@@ -15,8 +15,18 @@ from __future__ import annotations
 import html
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from .models import Step, TddDocument
+
+if TYPE_CHECKING:
+    from .attachments import Attachment
+    from .inputs import PlanInput
+
+# The coding agent's copy of the ticket: one attachment's text, and the
+# whole copy (its prompt also holds the code), the longest attachments cut first.
+_ATTACHMENT_CHARS = 8_000
+_ISSUE_CHARS = 30_000
 
 
 @dataclass
@@ -39,7 +49,10 @@ def _outline(doc: TddDocument) -> list[tuple[str, list[Block]]]:
         if kept:
             sections.append((title, kept))
 
-    add("Summary", Block("kv", [("Problem", doc.problem), ("Cause", doc.cause), ("Fix", doc.fix)]
+    # Written from file paths only, the cause and the fix are the planner's
+    # best reading, for the developer or the coding agent to confirm.
+    cause, fix = ("Likely cause", "Suggested approach") if doc.high_level else ("Cause", "Fix")
+    add("Summary", Block("kv", [("Problem", doc.problem), (cause, doc.cause), (fix, doc.fix)]
                          if (doc.problem or doc.cause or doc.fix) else []))
 
     pinned = {p.service: p for p in doc.pinned}
@@ -126,14 +139,15 @@ def _outline(doc: TddDocument) -> list[tuple[str, list[Block]]]:
     return sections
 
 
-def coding_task(doc: TddDocument) -> dict:
+def coding_task(doc: TddDocument, issue: dict | None = None) -> dict:
     """The TDD as data for coding_agent (2026-11-02), kept inside the PDF as
     hidden metadata (pdf_render.pdf_from_html): what the pages say, without
     their layout, so the coding agent reads it exactly and with no model
-    call. Commits are full shas here; the pages show 12 characters."""
+    call. Commits are full shas here; the pages show 12 characters.
+    ``issue`` (from issue()) is the ticket itself, which the pages do not show."""
     pinned = {p.service: p for p in doc.pinned}
     planned = [p.service for p in doc.per_service_plan] or list(pinned)
-    return {
+    task = {
         "version": 1,
         "ticket": doc.ticket,
         "ticket_type": doc.ticket_type,
@@ -175,7 +189,68 @@ def coding_task(doc: TddDocument) -> dict:
             q.question + (f" Why it matters: {q.why_it_matters}" if q.why_it_matters else "")
             for q in doc.open_questions
         ],
+        # The same questions with who raised them: "card", asked on the ticket and
+        # unanswered, is a person's to decide; "planner", raised while planning,
+        # is usually one the code can answer.
+        "open_questions_detail": [
+            {"question": q.question, "why_it_matters": q.why_it_matters, "source": q.source}
+            for q in doc.open_questions
+        ],
     }
+    if issue:
+        task["issue"] = issue
+    return task
+
+
+def issue(plan: PlanInput, attachments: list[Attachment]) -> dict:
+    """The ticket as it was given, for the coding agent (2026-11-02): the TDD
+    is a reference, the ticket is what must be true. Its description, each
+    attachment's description and text (for a screenshot on the platform, the
+    vision call's account of it), and the card's answered questions word for
+    word; the open ones are the TDD's open_questions. At most _ISSUE_CHARS
+    in all: what is left after the description and the answers is shared by
+    the attachments' texts, the longest cut first."""
+    card = plan.card
+    description = card.description[:_ISSUE_CHARS]
+    answers = [
+        {"question": q.question, "answers": list(q.answers)}
+        for q in plan.questions
+        if q.answered
+    ]
+    used = len(description) + sum(
+        len(a["question"]) + sum(len(x) for x in a["answers"]) for a in answers
+    )
+    texts = [a.text[:_ATTACHMENT_CHARS] for a in attachments]
+    fitted = _fit(texts, _ISSUE_CHARS - used - sum(len(a.description) for a in attachments))
+    return {
+        "key": card.key,
+        "type": card.type,
+        "title": card.title,
+        "description": description,
+        "attachments": [
+            {"name": a.name, "description": a.description, "text": text,
+             "cut": len(text) < len(a.text)}
+            for a, text in zip(attachments, fitted, strict=True)
+        ],
+        "answers": answers,
+    }
+
+
+def _fit(texts: list[str], budget: int) -> list[str]:
+    """The texts within ``budget`` characters in all: the longest are cut to
+    one even length, the shorter ones kept whole."""
+    budget = max(budget, 0)
+    if sum(len(t) for t in texts) <= budget:
+        return texts
+    sizes = sorted(len(t) for t in texts)
+    left, cap = budget, 0
+    for i, size in enumerate(sizes):
+        share = left // (len(sizes) - i)
+        if size > share:
+            cap = share
+            break
+        left -= size
+    return [t[:cap] for t in texts]
 
 
 def _header(doc: TddDocument) -> tuple[str, list[str]]:
@@ -186,8 +261,8 @@ def _header(doc: TddDocument) -> tuple[str, list[str]]:
     if doc.status == "draft":
         notes.append(f"Draft: {doc.draft_reason}")
     if doc.high_level:
-        notes.append("High-level: written from file paths only. Confirm each step in the file "
-                     "it names before changing it.")
+        notes.append("High-level: written without reading the source code. Confirm each step "
+                     "in the file it names before changing it.")
     return meta, notes
 
 

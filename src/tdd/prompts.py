@@ -25,10 +25,11 @@ SCOUT_PICKS = 10
 _LEADS = 25
 
 _SHAPE = """{
-  "title": "a short, specific title for this change",
-  "problem": "what is wrong (or what is needed), as the user sees it: 1-2 sentences",
+  "title": "a short title naming the problem (a bug) or the need (a feature), not the fix",
+  "problem": "what is wrong (or what is needed), as the user sees it: 1-3 sentences; when an \
+attachment shows the screen, what appears where on it",
   "cause": "why it happens, in the code: 1-3 sentences; when unsure, 'likely' + where to confirm",
-  "fix": "the change in one or two sentences",
+  "fix": "the suggested change, in one or two sentences",
   "requirements": ["one thing the ticket or its answers require, as a plain sentence"],
   "decisions": [{"id": "short-slug", "title": "the choice in a few words",
                  "choice": "what is decided", "reason": "why, in one sentence",
@@ -54,9 +55,12 @@ _SHAPE = """{
 }"""
 
 _BUG = """This card is a BUG. In current_flow, describe how the fault happens today, step by \
-step, and where it comes from as far as the files read show it; say "likely" for anything \
-inferred. The plan is the smallest change that meets the card's acceptance check and its \
-decisions, in every place the card says it happens."""
+step, and where it comes from as far as the evidence below shows it; say "likely" for \
+anything inferred. The plan is the smallest change that meets the card's acceptance check and its \
+decisions, in every place the card says it happens. For a layout bug (a gap appears, things \
+shift or wrap), the fix must say to find where the space comes from (a row that wraps, a fixed \
+width or column share, a container that grows) in the component that lays out that row: \
+always showing or hiding what triggers it is not enough on its own."""
 
 _FEATURE = """This card is a FEATURE or change. In current_flow, describe how the area works \
 today; in flow_after_change, how it will work. The plan covers every service the change \
@@ -91,14 +95,24 @@ reference_pr.
 developer confirms it.
 8. Write about the code and the change, never about your sources: no "the read portion", \
 "unread", "the files shown", "the excerpt" or "the screenshots suggest". The reader has the \
-repository, not your input.
-9. requirements: every requirement of the ticket and its answers, one plain sentence each, \
-true to the answers' words (browsers, sizes, scope, acceptance). Do not repeat them as \
-decisions; decisions are only design choices you make.
+repository, not your input. Say what a screenshot shows as a fact of the screen: "a blank band \
+appears beside the title and the search row drops below it".
+9. requirements: what the app must do, or must not do, after the change: every requirement \
+of the ticket and its answers, one plain sentence each, true to their words (behaviour, scope, \
+acceptance). Every symptom the title or description names is a "must not" requirement \
+("No blank band appears above the search row, in any selection state"). Where to check it \
+(browsers, devices, screen size, zoom) is not a requirement: put it in tests. Do not repeat \
+requirements as decisions; decisions are only design choices you make.
 10. Each step: `where` is one file path given below (or a new file, with new_file true); \
 `what` says what to change in words; `done_when` is checkable.
 11. work_order: one step per piece of work, in the order to do it; every service in \
-per_service_plan has at least one step.""",
+per_service_plan has at least one step.
+12. No step, decision or file to look at is a test file (tests, specs, Cypress, e2e): the \
+checks a tester runs go in tests.
+13. Prefer files of the app the ticket names. When you do not know which file lays out or owns \
+what changes, describe it ("the shared grid or toolbar component the client screen renders") \
+instead of naming a file of another app.
+14. Never refer to a decision or a question by its id: name it.""",
         _BUG if is_bug else _FEATURE,
     ]
     if high_level:
@@ -186,10 +200,9 @@ def writer_user(
     lines += ["", "## Leads not read (paths only: name them as files to inspect)"]
     any_lead = False
     for svc in prepared.services:
-        for c in ev.ranked(svc.name)[: _LEADS * 2]:
-            if ev.was_read(svc.name, c.path) or c.score < 1:
-                continue
-            lines.append(f"- {svc.name}/{c.path}: {'; '.join(c.why)}")
+        for c in ev.leads(svc.name, _LEADS * 2):
+            why = [*c.why, c.note] if c.note else c.why
+            lines.append(f"- {svc.name}/{c.path}: {'; '.join(why)}")
             any_lead = True
     if not any_lead:
         lines.append("- none")
