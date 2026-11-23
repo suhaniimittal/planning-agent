@@ -1,36 +1,24 @@
 {
     "name": "planning_agent",
     "version": "1.0.0",
-    "description": "Syncs the service graph, then turns a requirement or bug report into a downloadable technical design doc.",
+    "description": "Turns a Jira card, its ranked services and its answered questions into a plain-English technical design and a work order, reading code only through GitHub's API.",
     "config": {
         "triggers": [
             {
-              "name": "issue_text",
-              "type": "textarea",
-              "required": true,
-              "description": "Plain-text requirement or bug report",
-              "friendly_name": "Issue"
+                "name": "planning_input",
+                "type": "textarea",
+                "required": true,
+                "description": "The card as JSON: {\"card\": {key, type, title, description, files}, \"services\": [{service, repo, branch, rank, reason, prs, path}], \"questions\": [{question, answers}], \"issue_key\" (optional)}.",
+                "friendly_name": "Planning input"
             },
             {
-              "name": "repos",
-              "type": "textarea",
-              "required": true,
-              "description": "One service per line: 'name: org/repo' or 'name: org/repo@branch'. Example:\norders: myorg/orders-service\npayment: myorg/payment-service@develop",
-              "friendly_name": "Repositories"
-            },
-            {
-              "name": "top_k",
-              "type": "number",
-              "required": false,
-              "description": "How many top-matching services to seed the search with (default 5).",
-              "friendly_name": "Top K"
-            },
-            {
-              "name": "hops",
-              "type": "number",
-              "required": false,
-              "description": "How many CALLS-graph hops to expand from the seed services (default 2).",
-              "friendly_name": "Graph hops"
+                "name": "attachments",
+                "type": "file",
+                "required": false,
+                "multiple": true,
+                "accepts": ".png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md",
+                "description": "Optional: the card's files (images, PDFs, text). Add one, then more. Describe each in Planning input under card.files, with the same name: {\"name\": \"screenshot.png\", \"description\": \"what it shows\"}.",
+                "friendly_name": "Attachments"
             }
         ]
     }

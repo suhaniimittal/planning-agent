@@ -1,10 +1,9 @@
 """Talks to Confluence Cloud's REST API to publish a TDD as a real page.
 
-Same auth convention as the rest of this pipeline's external calls
-(repo_fetcher.py/github_api.py): credentials come from the environment,
-never hardcoded. Confluence Cloud uses HTTP Basic auth with the account
-email + an API token (the same kind of token Jira uses — same Atlassian
-account, same token, different product).
+Same auth convention as the agent's other external calls (GitHub, Memsy):
+credentials come from the environment, never hardcoded. Confluence Cloud
+uses HTTP Basic auth with the account email + an API token (the same kind
+of token Jira uses — same Atlassian account, same token, different product).
 """
 
 from __future__ import annotations
@@ -12,6 +11,8 @@ from __future__ import annotations
 import os
 
 import httpx
+
+from src.ingestion.secret_store import secret
 
 _TIMEOUT = 30
 
@@ -30,7 +31,7 @@ def _base_url() -> str:
 
 def _auth() -> tuple[str, str]:
     email = os.environ.get("CONFLUENCE_EMAIL")
-    token = os.environ.get("CONFLUENCE_API_TOKEN")
+    token = secret("CONFLUENCE_API_TOKEN") or None
     if not email or not token:
         raise ConfluenceApiError("CONFLUENCE_EMAIL / CONFLUENCE_API_TOKEN are not set")
     return email, token

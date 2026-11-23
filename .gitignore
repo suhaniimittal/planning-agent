@@ -49,3 +49,7 @@ htmlcov/
 .DS_Store
 Thumbs.db
 jumpstart-main/
+.archify/
+
+# Claude Code local settings
+.claude/
