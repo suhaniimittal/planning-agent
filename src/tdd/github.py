@@ -4,13 +4,11 @@ No clone and no archive. Every fact about a repository comes from one of the
 calls below, and every call after the first pins to a commit sha, so a push
 in the middle of a run cannot mix two versions of the code. Built on the
 service-map POC's reader, with what planning adds: pull requests, compare,
-code search, the rate limit, pagination, a cap on calls per run and the
-ALLOW_CODE_READS switch.
+code search, the rate limit, pagination and a cap on calls per run.
 
-With ALLOW_CODE_READS off, `read()` refuses before any request is sent and
-pull request / compare results carry no patch text, only paths, statuses and
-counts. Code search returns file paths only in either mode: no text matches
-are asked for.
+No call here returns a file's contents (2026-11-03): there is no contents
+call, pull request and compare results keep paths, statuses and counts but
+no patch text, and code search asks for paths only, no text matches.
 
 Results live in this object for one run and are written nowhere. Error
 messages name the repository, branch or file — never its contents, and never
@@ -19,7 +17,6 @@ the token. Synchronous (httpx.Client): callers run it in a thread.
 
 from __future__ import annotations
 
-import base64
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -33,13 +30,6 @@ from .config import Settings
 
 _API_VERSION = "2022-11-28"
 _TIMEOUT = 30.0
-# One file's text is cut here: past it, a file is too large to be one
-# change's context anyway, and the run's character cap is what really limits.
-# A longer file keeps its start AND its end, the middle left out: a screen's
-# render section is at its end (BTS-40: the Archive button's placement was in
-# the part a start-only cut dropped).
-MAX_FILE_CHARS = 60_000
-_HEAD_SHARE = 0.6
 _PAGE = 100
 # 3,000 entries: GitHub's own maximum for the files of one pull request.
 _MAX_PAGES = 30
@@ -49,8 +39,7 @@ _MAX_COMMIT_LINES = 20
 # GitHub's compare lists at most 300 files.
 _COMPARE_MAX_FILES = 300
 _SEARCH_RESULTS = 30
-# A fenced block in a pull request's description: code, left out when code
-# reads are off.
+# A fenced block in a pull request's description: code, always left out.
 _FENCED = re.compile(r"```.*?(?:```|\Z)", re.S)
 
 
@@ -60,10 +49,6 @@ class GitHubError(Exception):
 
 class GitHubStopped(GitHubError):
     """GitHub's rate limit, or this run's own call or search cap: the step stops."""
-
-
-class CodeReadsOff(GitHubError):
-    """ALLOW_CODE_READS is off, so no file text is fetched."""
 
 
 @dataclass(frozen=True)
@@ -81,20 +66,12 @@ class Tree:
 
 
 @dataclass(frozen=True)
-class FileText:
-    path: str
-    text: str
-    cut: bool  # longer than MAX_FILE_CHARS; its start and end kept, the middle left out
-
-
-@dataclass(frozen=True)
 class ChangedFile:
     path: str
     status: str  # added | removed | modified | renamed | copied | changed
     additions: int
     deletions: int
     previous_path: str | None
-    patch: str | None  # None whenever code reads are off
 
 
 @dataclass(frozen=True)
@@ -255,39 +232,12 @@ class GitHubReader:
             )
         return self._trees[key]
 
-    # --- file text: only with ALLOW_CODE_READS -------------------------------------------
-
-    def read(self, repo: str, path: str, sha: str) -> FileText:
-        """One file's text at ``sha``, held in memory for this run only."""
-        if not self.settings.allow_code_reads:
-            raise CodeReadsOff(f"{path} in {repo}: not read (ALLOW_CODE_READS is off)")
-        data = self._get(
-            f"/repos/{repo}/contents/{_q(path)}", f"the file {path} in {repo}", {"ref": sha}
-        )
-        if isinstance(data, list) or data.get("type") != "file":
-            raise GitHubError(f"{path} in {repo} is not a file")
-        if data.get("encoding") != "base64":
-            raise GitHubError(f"{path} in {repo} is over 1 MB, too large for GitHub's contents API")
-        raw = base64.b64decode(data.get("content") or "")
-        if b"\x00" in raw[:8000]:
-            raise GitHubError(f"{path} in {repo} is a binary file")
-        text = raw.decode("utf-8", errors="replace")
-        if len(text) <= MAX_FILE_CHARS:
-            return FileText(path=path, text=text, cut=False)
-        head = int(MAX_FILE_CHARS * _HEAD_SHARE)
-        tail = MAX_FILE_CHARS - head
-        left_out = len(text) - head - tail
-        kept = f"{text[:head]}\n... [{left_out:,} characters in the middle left out] ...\n"
-        return FileText(path=path, text=kept + text[-tail:], cut=True)
-
     # --- pull requests and branches ------------------------------------------------------
 
     def pull(self, repo: str, number: int) -> PullInfo:
         """A pull request's title, description, state and branches."""
         data = self._get(f"/repos/{repo}/pulls/{number}", f"pull request #{number} of {repo}")
-        body = data.get("body") or ""
-        if not self.settings.allow_code_reads:
-            body = _FENCED.sub("(code left out)", body)
+        body = _FENCED.sub("(code left out)", data.get("body") or "")
         return PullInfo(
             number=number,
             title=data.get("title") or "",
@@ -333,7 +283,6 @@ class GitHubReader:
             additions=int(item.get("additions") or 0),
             deletions=int(item.get("deletions") or 0),
             previous_path=item.get("previous_filename"),
-            patch=item.get("patch") if self.settings.allow_code_reads else None,
         )
 
     # --- search and limits ---------------------------------------------------------------

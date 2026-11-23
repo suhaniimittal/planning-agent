@@ -1,7 +1,9 @@
 """Step 8 of the TDD flow (2026-11-02): what every TDD must pass to be final.
 
 1. Its services are a subset of the input's services.
-2. Every file it cites was read, or is in that service's pinned file list.
+2. Every step's area is a folder of that service at its pinned commit, and
+   no file is named anywhere (2026-11-06): with no code read, a file name is
+   a guess. A file a reference change changed is a fact, and may be named.
 3. Every card question is accounted for: an answered one as a decision, an
    open one as an open question.
 4. The work order is usable: steps in order, each for an input service, every
@@ -18,7 +20,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .models import TddDocument
 
@@ -42,18 +44,26 @@ _READING = re.compile(
     r"|\bfiles? shown\b|\bshown (?:files?|code|excerpts?)\b|\bthe excerpts?\b",
     re.I,
 )
+# A file name: a name with a code or config extension.
+_FILE_NAME = re.compile(
+    r"\b[\w@-]+(?:\.[\w-]+)*\.(?:tsx?|jsx?|mjs|kts?|java|py|go|rb|cs|sql|graphqls?|gql|ya?ml"
+    r"|json|xml|s?css|html|properties|gradle|avsc|proto)\b"
+)
 # Ids and paths are names, not prose; they are not scanned.
 _NOT_SCANNED = {"id", "path", "file_path", "symbol", "service", "reference_pr", "repo",
-                "base_branch", "base_sha", "sha", "branch", "where", "new_file"}
+                "base_branch", "base_sha", "sha", "branch", "areas", "new_area", "confirm_in"}
 
 
 @dataclass
 class CheckContext:
     input_services: set[str]
     readable_services: set[str]  # services whose repository was read
-    known: Callable[[str, str], bool]  # (service, path): read, or in the pinned file list
+    known: Callable[[str, str], bool]  # (service, path): in the pinned file list
+    known_folder: Callable[[str, str], bool]  # (service, folder): in the pinned file list
     decision_ids: list[str]  # the card's answered questions
     open_questions: list[str]  # the card's unanswered questions
+    # File names a reference change changed: facts, so they may be named.
+    reference_files: set[str] = field(default_factory=set)
 
 
 def check(doc: TddDocument, ctx: CheckContext) -> list[str]:
@@ -81,35 +91,30 @@ def _citations(doc: TddDocument, ctx: CheckContext) -> list[str]:
     out = []
     for i, plan in enumerate(doc.per_service_plan):
         for j, step in enumerate(plan.steps):
-            where = f"per_service_plan[{i}].steps[{j}].where"
-            if not step.where or step.new_file:
-                continue
-            if plan.service not in ctx.readable_services:
-                out.append(f"{where} names a file of '{plan.service}', whose repo was not read")
-            elif not ctx.known(plan.service, step.where):
-                out.append(
-                    f"{where}: '{step.where}' is not a file of {plan.service}; use a path given, "
-                    "or set new_file for a file to create"
-                )
-        for j, f in enumerate(plan.files_to_look_at):
-            where = f"per_service_plan[{i}].files_to_look_at[{j}]"
-            if plan.service not in ctx.readable_services:
-                out.append(f"{where} cites a file of '{plan.service}', whose repo was not read")
-            elif not ctx.known(plan.service, f.path):
-                out.append(
-                    f"{where}: '{f.path}' is not a file of {plan.service}; cite only paths given"
-                )
+            for k, area in enumerate(step.areas):
+                where = f"per_service_plan[{i}].steps[{j}].areas[{k}]"
+                out += _folder(where, plan.service, area, step.new_area and k == 0, ctx)
+    for i, need in enumerate(doc.data_needed):
+        if need.confirm_in:
+            out += _folder(f"data_needed[{i}].confirm_in", need.service, need.confirm_in,
+                           False, ctx)
     for i, decision in enumerate(doc.decisions):
-        for j, target in enumerate(decision.applies_to):
-            where = f"decisions[{i}].applies_to[{j}]"
-            if target.service not in ctx.readable_services:
-                out.append(f"{where} cites a file of '{target.service}', whose repo was not read")
-            elif not ctx.known(target.service, target.file_path):
-                out.append(
-                    f"{where}: '{target.file_path}' is not a file of {target.service}; "
-                    "cite only paths given"
-                )
+        if decision.applies_to and decision.id not in ctx.decision_ids:
+            out.append(f"decisions[{i}].applies_to must be empty: name no files")
     return out
+
+
+def _folder(where: str, service: str, folder: str, new: bool, ctx: CheckContext) -> list[str]:
+    """Why ``folder`` cannot be cited for ``service``; empty when it can."""
+    if service not in ctx.readable_services:
+        return [f"{where} names a folder of '{service}', whose repo was not read"]
+    parent = folder.rsplit("/", 1)[0] if new else folder
+    if ctx.known_folder(service, parent):
+        return []
+    return [
+        f"{where}: '{folder}' is not a folder of {service}; give a folder that appears in the "
+        "paths given (set new_area for a folder to create inside one)"
+    ]
 
 
 def _questions(doc: TddDocument, ctx: CheckContext) -> list[str]:
@@ -153,6 +158,12 @@ def _code(doc: TddDocument, ctx: CheckContext) -> list[str]:
                 return
             if _CODE.search(value):
                 out.append(f"{where} looks like code; describe the change in words instead")
+            named = {m.group(0) for m in _FILE_NAME.finditer(value)} - ctx.reference_files
+            if named:
+                out.append(
+                    f"{where} names a file; describe the component in words, and give its "
+                    "folder as the step's area"
+                )
             if _READING.search(value):
                 out.append(
                     f"{where} talks about what was read; state the fact, or say 'likely' "
@@ -168,8 +179,8 @@ def _code(doc: TddDocument, ctx: CheckContext) -> list[str]:
     # Only what the model wrote: the flow's own fields hold paths and notes.
     written = doc.model_dump(
         include={"title", "problem", "cause", "fix", "requirements", "decisions",
-                 "current_flow", "flow_after_change", "per_service_plan", "order_of_work",
-                 "risks_and_tests", "open_questions", "work_order"}
+                 "current_flow", "per_service_plan", "data_needed", "risks_and_tests",
+                 "open_questions", "work_order"}
     )
     card_ids = set(ctx.decision_ids)
     written["decisions"] = [d if d["id"] not in card_ids else {} for d in written["decisions"]]

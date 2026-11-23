@@ -4,6 +4,8 @@ An answered question becomes a decision, the answer copied word for word: a
 person settled it, so the TDD follows it. An unanswered one stays an open
 question, also word for word, and the planner is never asked to answer it —
 the flow puts both back into the document itself, whatever the model wrote.
+An answer that is still "to confirm" (2026-11-06) is not settled: it stays an
+open question with its answer beside it, which the plan builds on.
 
 Decision ids are "q<number>-<slug>", stable for the same question, so the
 memory recognises the same decision on the ticket's next version.
@@ -19,6 +21,11 @@ from .inputs import Question
 from .models import OpenQuestion
 
 _SLUG = re.compile(r"[^a-z0-9]+")
+# An answer that says it is not settled yet.
+_TENTATIVE = re.compile(
+    r"\bto (?:be )?(?:confirm(?:ed)?|decided)\b|\btbd\b|\btbc\b|\bdecided during design\b",
+    re.I,
+)
 
 
 def question_id(number: int, question: str) -> str:
@@ -33,6 +40,11 @@ def split(questions: list[Question]) -> tuple[list[DesignDecision], list[OpenQue
     for number, q in enumerate(questions, start=1):
         if not q.answered:
             still_open.append(OpenQuestion(question=q.question, source="card"))
+            continue
+        if any(_TENTATIVE.search(a) for a in q.answers):
+            still_open.append(
+                OpenQuestion(question=q.question, source="card", answer=" ".join(q.answers))
+            )
             continue
         if len(q.answers) == 1:
             choice = q.answers[0]

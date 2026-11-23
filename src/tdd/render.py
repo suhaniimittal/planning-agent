@@ -13,11 +13,12 @@ and skipped is the log's and Orchestration's (`files_read`, `not_read`,
 from __future__ import annotations
 
 import html
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from .models import Step, TddDocument
+from .models import DataNeed, OpenQuestion, Step, TddDocument
 
 if TYPE_CHECKING:
     from .attachments import Attachment
@@ -32,7 +33,8 @@ _ISSUE_CHARS = 30_000
 @dataclass
 class Block:
     """One piece of a section. kind: "p", "note", "ul", "ol", "kv" (label/value
-    rows), "table" (head + rows), "steps", "h3"."""
+    rows), "table" (head + rows; a cell that is a list is one line each),
+    "steps", "h3"."""
 
     kind: str
     content: object
@@ -58,36 +60,38 @@ def _outline(doc: TddDocument) -> list[tuple[str, list[Block]]]:
     pinned = {p.service: p for p in doc.pinned}
     planned = [p.service for p in doc.per_service_plan] or list(pinned)
     what = {p.service: p.what_changes for p in doc.per_service_plan}
+    # The service's details stacked in one cell (2026-11-16): the PDF does not
+    # wrap a name with no spaces, so in a narrow column of its own a repo or
+    # branch name ran into the next column.
     rows = []
     for name in dict.fromkeys(planned):
         pin = pinned.get(name)
-        rows.append([
+        where = [
             name,
-            pin.repo if pin else "not readable",
-            pin.branch if pin else "-",
-            pin.sha[:12] if pin else "-",
-            (pin.path or "whole repository") if pin else "-",
-            what.get(name, ""),
-        ])
+            f"Repo: {pin.repo}",
+            f"Branch: {pin.branch}",
+            f"Commit: {pin.sha[:12]}",
+            f"Folder: {pin.path or 'whole repository'}",
+        ] if pin else [name, "Repo: not readable"]
+        rows.append([where, what.get(name, "")])
     add(
         "Services to change",
         Block("p", "Clone each repository at the commit shown; the paths below are inside it."
               if rows else ""),
-        Block("table", rows, ("Service", "Repository", "Branch", "Commit", "Folder",
-                              "What changes"), (11, 17, 11, 13, 14, 34)),
+        Block("table", rows, ("Service", "What changes"), (38, 62)),
     )
 
-    agreed = doc.requirements or [f"{d.title} {d.choice}" for d in doc.card_decisions()]
-    design = [
-        f"{d.title}: {d.choice} Why: {d.reason}"
-        + (f" Applies to {', '.join(t.file_path for t in d.applies_to)}." if d.applies_to else "")
-        for d in doc.design_decisions()
-    ]
+    # The card's settled answers word for word, always (2026-11-05: a fix
+    # proposed in an answer was lost when only the writer's requirements were
+    # shown). An answer still "to confirm" is under open questions instead.
+    answers = [f"{d.title} {d.choice}" for d in doc.card_decisions()]
+    design = [f"{d.title}: {d.choice} Why: {d.reason}" for d in doc.design_decisions()]
+    add("Answers on the ticket", Block("ul", answers))
+    add("Design decisions", Block("ul", design))
     add(
-        "Agreed on the ticket",
-        Block("ul", agreed),
-        Block("h3", "Design decisions" if design else ""),
-        Block("ul", design),
+        "Requirements and how to check them",
+        Block("ol", [r.requirement + (f" Check: {r.check}" if r.check else "")
+                     for r in doc.requirements]),
     )
 
     several = len({p.service for p in doc.per_service_plan}) > 1
@@ -96,43 +100,39 @@ def _outline(doc: TddDocument) -> list[tuple[str, list[Block]]]:
         return [f"{s.step} ({s.service})" if several and s.service else s.step for s in steps]
 
     add("How it works today", Block("ol", flow(doc.current_flow)))
-    add("How it will work", Block("ol", flow(doc.flow_after_change)))
+    add("Data the change needs", Block("ul", [_need(d) for d in doc.data_needed]))
 
     for plan in doc.per_service_plan:
         add(
             f"Implementation guide: {plan.service}",
-            Block("p", plan.what_changes),
+            # Its what_changes is in "Services to change" already.
             Block("steps", plan.steps),
-            Block("h3", "Files to look at" if plan.files_to_look_at else ""),
-            Block("ul", [f"{f.path}: {f.why}" if f.why else f.path
-                         for f in plan.files_to_look_at]),
             Block("p", f"Reference change: {plan.reference_pr}" if plan.reference_pr else ""),
         )
 
     add("Order of work", Block("ol", doc.order_of_work))
-    add("Test plan", Block("ol", doc.risks_and_tests.tests))
+    add("Other checks", Block("ol", doc.risks_and_tests.tests))
     add("Risks", Block("ul", doc.risks_and_tests.risks))
-    add(
-        "Open questions",
-        Block("ul", [
-            q.question
-            + (" (from the ticket)" if q.source == "card" else "")
-            + (f" Why it matters: {q.why_it_matters}" if q.why_it_matters else "")
-            for q in doc.open_questions
-        ]),
-    )
+    # A card answer still "to confirm" is an assumption the plan uses, one
+    # line each (2026-11-08); the answer in full is in the coding task.
+    add("Assumptions to confirm",
+        Block("ul", [q.assumption or q.question for q in doc.open_questions if q.answer]))
+    add("Open questions",
+        Block("ul", [_question(q) for q in doc.open_questions if not q.answer]))
 
     wo = doc.work_order
     add(
         "Work order for the coding agent",
         Block("table", [
-            [str(s.order), s.service,
-             f"{s.repo} @ {s.base_sha[:12]}" if s.repo else "not readable",
-             s.path or ("whole repository" if s.repo else "-"), s.summary,
-             s.reference_pr or "-"]
+            [str(s.order),
+             [s.service,
+              *([f"Repo: {s.repo}", f"Commit: {s.base_sha[:12]}",
+                 f"Folder: {s.path or 'whole repository'}"] if s.repo
+                else ["Repo: not readable"]),
+              f"Reference: {s.reference_pr}" if s.reference_pr else ""],
+             s.summary]
             for s in wo.steps
-        ], ("#", "Service", "Repository @ commit", "Folder", "Task", "Reference"),
-           (5, 10, 22, 11, 41, 11)),
+        ], ("#", "Service", "Task"), (5, 37, 58)),
         Block("p", "Ready for the coding agent." if wo.ready
               else f"Not ready for the coding agent: {wo.not_ready_reason}." if wo.steps else ""),
     )
@@ -163,37 +163,40 @@ def coding_task(doc: TddDocument, issue: dict | None = None) -> dict:
             for name in dict.fromkeys(planned)
             if (pin := pinned.get(name))
         ],
-        "requirements": doc.requirements
-        or [f"{d.title} {d.choice}" for d in doc.card_decisions()],
+        "agreed": [f"{d.title} {d.choice}" for d in doc.card_decisions()],
+        "requirements": [r.model_dump() for r in doc.requirements],
         "design_decisions": [
             f"{d.title}: {d.choice} Why: {d.reason}" for d in doc.design_decisions()
         ],
         "flow_today": [s.step for s in doc.current_flow],
-        "flow_after": [s.step for s in doc.flow_after_change],
+        # No file is named (2026-11-06): each step gives the component in
+        # words and its folder; the coding agent finds the file there.
         "steps": [
-            {"service": plan.service, "title": s.title,
-             "where": f"{s.where} (new file)" if s.where and s.new_file else s.where,
-             "what": s.what, "why": s.why, "done_when": s.done_when}
+            {"service": plan.service, "title": s.title, "what": s.what,
+             "component": s.component, "areas": _areas(s), "done_when": s.done_when}
             for plan in doc.per_service_plan
             for s in plan.steps
         ],
-        "files_to_look_at": [
-            {"service": plan.service, "path": f.path, "why": f.why}
-            for plan in doc.per_service_plan
-            for f in plan.files_to_look_at
-        ],
+        # Each value the change needs, where it may come from, and the contract
+        # to confirm it in before it is used (2026-11-12).
+        "data_needed": [d.model_dump() for d in doc.data_needed],
+        # Paths whose names or contents match the ticket's words: unconfirmed,
+        # a place to start searching, never where to change.
+        "search_hints": doc.hints,
         "order_of_work": doc.order_of_work,
         "tests": doc.risks_and_tests.tests,
         "risks": doc.risks_and_tests.risks,
-        "open_questions": [
-            q.question + (f" Why it matters: {q.why_it_matters}" if q.why_it_matters else "")
-            for q in doc.open_questions
+        "assumptions": [
+            {"question": q.question, "assumption": q.assumption, "answer_so_far": q.answer}
+            for q in doc.open_questions if q.answer
         ],
+        "open_questions": [_question(q) for q in doc.open_questions if not q.answer],
         # The same questions with who raised them: "card", asked on the ticket and
         # unanswered, is a person's to decide; "planner", raised while planning,
         # is usually one the code can answer.
         "open_questions_detail": [
-            {"question": q.question, "why_it_matters": q.why_it_matters, "source": q.source}
+            {"question": q.question, "why_it_matters": q.why_it_matters, "source": q.source,
+             "answer_so_far": q.answer, "assumption": q.assumption}
             for q in doc.open_questions
         ],
     }
@@ -261,25 +264,9 @@ def _header(doc: TddDocument) -> tuple[str, list[str]]:
     if doc.status == "draft":
         notes.append(f"Draft: {doc.draft_reason}")
     if doc.high_level:
-        notes.append("High-level: written without reading the source code. Confirm each step "
-                     "in the file it names before changing it.")
+        notes.append("High-level: written without reading the source code. Each step names a "
+                     "component and its folder; find the file there before changing it.")
     return meta, notes
-
-
-def _footer(doc: TddDocument) -> str:
-    if not doc.pinned:
-        return "Based on the ticket only: no repository could be read."
-    if doc.high_level:
-        where = ", ".join(f"{p.repo} at {p.sha[:12]}" for p in doc.pinned)
-        return f"Based on the file lists of {where}."
-    count = {p.service: 0 for p in doc.pinned}
-    for line in doc.files_read:
-        service = line.split("/", 1)[0]
-        if service in count:
-            count[service] += 1
-    return "Based on " + "; ".join(
-        f"{count[p.service]} files of {p.repo} at commit {p.sha[:12]}" for p in doc.pinned
-    ) + "."
 
 
 def _day(iso: str) -> str:
@@ -290,10 +277,34 @@ def _day(iso: str) -> str:
     return f"{when.day} {when:%b %Y}"
 
 
+def _areas(step: Step) -> list[str]:
+    return [f"{a} (new folder)" if step.new_area and k == 0 else a
+            for k, a in enumerate(step.areas)]
+
+
 def _step_rows(step: Step) -> list[tuple[str, str]]:
-    where = f"{step.where} (new file)" if step.where and step.new_file else step.where
-    return [(k, v) for k, v in (("Where", where), ("What", step.what), ("Why", step.why),
+    return [(k, v) for k, v in (("Change", step.what), ("Component", step.component),
+                                ("Area", ", ".join(_areas(step))),
                                 ("Done when", step.done_when)) if v]
+
+
+def _need(d: DataNeed) -> str:
+    text = d.what
+    if d.sources:
+        text += ". From: " + "; otherwise ".join(d.sources)
+    if d.confirm_in:
+        text += f". Confirm it exists in {d.confirm_in} first"
+    return text + "."
+
+
+def _question(q: OpenQuestion) -> str:
+    """An open question, with who asked it."""
+    text = q.question
+    if q.source == "card":
+        text += " (from the ticket)"
+    if q.why_it_matters:
+        text += f" Why it matters: {q.why_it_matters}"
+    return text
 
 
 # --- HTML -------------------------------------------------------------------------------
@@ -301,6 +312,35 @@ def _step_rows(step: Step) -> list[tuple[str, str]]:
 
 def _e(text: object) -> str:
     return html.escape(str(text))
+
+
+# A path longer than this is wider than a table cell.
+_LONG_PATH = re.compile(r"\S{70,}")
+
+
+def _cell(text: object) -> str:
+    """A table cell's text, a long path broken after a "/" every ~60
+    characters: the PDF cuts off a word wider than its cell, and its font has
+    no invisible break character (2026-11-12). The coding task keeps paths
+    whole."""
+
+    def wrap(match: re.Match) -> str:
+        parts, line = [], ""
+        for piece in re.split(r"(?<=/)", match.group(0)):
+            if line and len(line) + len(piece) > 60:
+                parts.append(line)
+                line = ""
+            line += piece
+        return " ".join([*parts, line])
+
+    return _e(_LONG_PATH.sub(wrap, str(text)))
+
+
+def _lines(cell: object) -> str:
+    """A table cell: a list is one line each, empty lines left out."""
+    if isinstance(cell, list):
+        return "<br/>".join(_cell(line) for line in cell if line)
+    return _cell(cell)
 
 
 def _html_block(block: Block) -> str:
@@ -312,7 +352,9 @@ def _html_block(block: Block) -> str:
         items = "".join(f"<li>{_e(i)}</li>" for i in block.content)
         return f"<{block.kind}>{items}</{block.kind}>"
     if block.kind == "kv":
-        rows = "".join(f"<tr><th>{_e(k)}</th><td>{_e(v)}</td></tr>" for k, v in block.content if v)
+        rows = "".join(
+            f"<tr><th>{_e(k)}</th><td>{_cell(v)}</td></tr>" for k, v in block.content if v
+        )
         return f'<table class="kv"><tbody>{rows}</tbody></table>'
     if block.kind == "table":
         widths = block.widths or (0,) * len(block.head)
@@ -321,7 +363,8 @@ def _html_block(block: Block) -> str:
             for h, w in zip(block.head, widths, strict=True)
         )
         body = "".join(
-            "<tr>" + "".join(f"<td>{_e(c)}</td>" for c in row) + "</tr>" for row in block.content
+            "<tr>" + "".join(f"<td>{_lines(c)}</td>" for c in row) + "</tr>"
+            for row in block.content
         )
         return f'<table class="grid"><tbody><tr>{head}</tr>{body}</tbody></table>'
     if block.kind == "steps":
@@ -329,7 +372,7 @@ def _html_block(block: Block) -> str:
         for n, step in enumerate(block.content, start=1):
             title = f"Step {n}" + (f". {step.title}" if step.title else "")
             rows = "".join(
-                f"<tr><th>{_e(k)}</th><td>{_e(v)}</td></tr>" for k, v in _step_rows(step)
+                f"<tr><th>{_e(k)}</th><td>{_cell(v)}</td></tr>" for k, v in _step_rows(step)
             )
             out.append(f'<h4>{_e(title)}</h4><table class="kv"><tbody>{rows}</tbody></table>')
         return "".join(out)
@@ -344,7 +387,6 @@ def render_html(doc: TddDocument) -> str:
     for number, (title, blocks) in enumerate(_outline(doc), start=1):
         parts.append(f"<h2>{number}. {_e(title)}</h2>")
         parts += [_html_block(b) for b in blocks]
-    parts.append(f'<p class="foot">{_e(_footer(doc))}</p>')
     return "\n".join(parts)
 
 
@@ -364,7 +406,10 @@ def _text_block(block: Block) -> list[str]:
         return [f"   {k + ':':<11}{v}" for k, v in block.content if v]
     if block.kind == "table":
         return [
-            "   - " + "; ".join(f"{h}: {c}" for h, c in zip(block.head, row, strict=True) if c)
+            "   - " + "; ".join(
+                f"{h}: {'; '.join(x for x in c if x) if isinstance(c, list) else c}"
+                for h, c in zip(block.head, row, strict=True) if c
+            )
             for row in block.content
         ]
     if block.kind == "steps":
@@ -384,5 +429,4 @@ def render_text(doc: TddDocument) -> str:
         for block in blocks:
             lines += _text_block(block)
         lines.append("")
-    lines.append(_footer(doc))
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines).rstrip("\n") + "\n"

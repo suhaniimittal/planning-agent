@@ -353,10 +353,10 @@ def _decision_lines(decisions: list[dict], story_key: str) -> list[str]:
         where = (
             "this story" if d["story_key"] == story_key.upper() else f"project, {d['story_key']}"
         )
-        files = ", ".join(sorted({t["file_path"] for t in d["applies_to"]})) or "no file named"
+        files = ", ".join(sorted({t["file_path"] for t in d["applies_to"]}))
         lines.append(
-            f"- [{d['id']}] {d['title']}: {d['choice']} (why: {d['reason']}; from {where}; "
-            f"applies to {files})"
+            f"- [{d['id']}] {d['title']}: {d['choice']} (why: {d['reason']}; from {where}"
+            + (f"; applies to {files})" if files else ")")
         )
     return lines
 
@@ -382,9 +382,10 @@ def decisions_block(
         blocks.append(
             "\n".join(
                 [
-                    "DECISIONS FROM THIS TICKET'S EARLIER VERSIONS (not yet agreed) — build on "
-                    "them; keep each one that still holds, with the same id, and say in risks "
-                    "which you changed and why."
+                    "DECISIONS FROM THIS TICKET'S EARLIER VERSIONS (not yet agreed) — keep "
+                    "each one that still holds, with the same id; drop the rest without "
+                    "mentioning them or earlier versions. One about something the ticket "
+                    "leaves to confirm or to be decided does not hold."
                 ]
                 + _decision_lines(proposed_decisions, story_key)
             )

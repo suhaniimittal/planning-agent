@@ -10,8 +10,23 @@ and the run goes on without it.
 from __future__ import annotations
 
 import asyncio
+import re
 
 from src.memory import conversation, operations, record
+
+# A decision taken from the card's own answers ("q3-..."): it comes from the
+# card again on every run, settled or still to confirm as the card says now.
+_CARD_DECISION = re.compile(r"^q\d+(-|$)")
+
+
+def _for_prompt(decisions: list[dict]) -> list[dict]:
+    """The decisions as the writer is shown them (2026-11-08): not the card's
+    own answers, and no files. A file an earlier version named was a guess
+    from paths, and showing it again brings the guess back. What is stored
+    is not changed."""
+    return [
+        {**d, "applies_to": []} for d in decisions if not _CARD_DECISION.match(d.get("id", ""))
+    ]
 
 
 def change_line(change) -> str:
@@ -53,7 +68,7 @@ async def memory_before(
             "The ticket has changed since then: " + ("; ".join(changes) or checked["reason"])
             + ". Design for the ticket as it reads now."
         )
-    block = record.decisions_block(agreed, key, earlier)
+    block = record.decisions_block(_for_prompt(agreed), key, _for_prompt(earlier))
     if block:
         parts.append(block)
     return {"checked": checked, "text": "\n\n".join(parts)}

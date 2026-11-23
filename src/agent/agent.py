@@ -28,7 +28,7 @@ from temporalio.common import RetryPolicy
 
 # Left unset, a tool call gets the platform's default activity timeout —
 # observed in a real run to be far too short (~30s) for genuine work. A TDD
-# makes up to three model calls (scout, writer, one repair) plus its GitHub
+# makes up to two model calls (the writer and one repair) plus its GitHub
 # calls, so it is given room; the real risk is a correct, slow run killed
 # mid-flight by an undersized clock.
 _TDD_TIMEOUT = timedelta(minutes=15)

@@ -1,33 +1,29 @@
 """Step 4 of the TDD flow (2026-11-02): the evidence a TDD is written from.
 
-Gathered by code, within hard caps (files per service, files in total,
-characters in total, GitHub calls, code searches), in this order:
+Gathered by code, by path only (2026-11-03: no file's contents are read),
+within the run's caps on GitHub calls and code searches, in this order:
 
 1. Reference changes. Every pull request listed for a service: its title,
-   description, state and changed files; with code reads on, its patches,
-   which count against the character cap. A branch listed without a pull
-   request is compared against the service's branch instead.
+   description, state and changed files, no patches. A branch listed without
+   a pull request is compared against the service's branch instead.
 2. Candidate files, each with a score and the reasons it was picked:
    - GitHub code search for the ticket's most distinctive terms (paths
      only), the main source: it finds a file by what it CONTAINS, which a
      path cannot ("Archive" lives in a toolbar whose name says nothing);
    - tree paths whose names match the ticket's terms;
-   - files the service map points to (a route or topic named in the ticket);
    - files a reference pull request changed.
    Search covers the default branch only, so every hit is checked against
-   the pinned tree; one not there is noted, never read.
-3. Reading (code reads on only), best first, up to the caps, keeping a
-   third of each service's files for step 4 and a few for the scout's
-   picks (`fill()` reads the best leads into that room when the scout is
-   skipped or fails).
-4. One step up: for the best files read, a search for their names finds the
-   files that USE them — the grid or toolbar that lays a button out — and
-   those are read next. The tests that go with each file are listed by
-   path, never read.
+   the pinned tree; one not there is noted.
+3. One step up: for the best leads by name, a search for their names finds
+   the files that USE them — the grid or toolbar that lays a button out.
+   The tests that go with each lead are listed by path.
+4. Contract files (2026-11-15; before, a separate service map): each
+   service's schemas and API definitions, those matching the ticket's terms
+   first, and the folders that hold them. A contract's name often has none of
+   the ticket's words, yet it is where a "confirm the data" step looks.
 
-Every candidate not read is listed with why (a cap, an error, code reads
-off, not at the pinned commit), and the TDD shows that list as "not read".
-`drop()` clears every file text and patch at the end of the run.
+The leads go to the writer as places to choose folders from, each with why
+it was found; the coding agent reads the files.
 """
 
 from __future__ import annotations
@@ -40,23 +36,43 @@ from .config import Settings
 from .github import ChangedFile, GitHubError, GitHubReader, GitHubStopped, Tree
 from .inputs import PlanInput
 from .prepare import ReadyService
-from .service_map.classify import SKIP_DIRS, TEST_DIRS, TEST_NAME
-from .service_map.slice import MapSlice
 
-# A candidate at least this strong is a real lead: the scout call is skipped
-# when every service has one.
+# Not source: dependencies, build output, generated code.
+SKIP_DIRS = (
+    "node_modules/", "target/", "build/", "dist/", ".git/", "vendor/", ".gradle/",
+    "generated/", "__generated__/", "coverage/", ".next/", "out/",
+)
+# Tests and test data (KS-16908: client/fixtures/GetClient.ts as a step's file).
+TEST_DIRS = (
+    "/test/", "/tests/", "/__tests__/", "/androidtest/", "/e2e/", "/cypress/", "/__mocks__/",
+    "/mocks/", "/fixtures/", "/__fixtures__/",
+)
+TEST_NAME = re.compile(
+    r"(\.|_)(spec|test|stories)\.[jt]sx?$|(Test|Tests|IT|Spec)\.(kt|java)$", re.IGNORECASE
+)
+# A contract: a schema or API definition another service or the UI relies on.
+_CONTRACT_NAME = re.compile(r"^(openapi|swagger|asyncapi)[\w.-]*\.(ya?ml|json)$", re.IGNORECASE)
+_CONTRACT_EXT = (".proto", ".graphqls", ".graphql", ".avdl", ".avsc")
+# Contract files shown per service: the matching ones, best first, and the
+# folders holding contracts, most contracts first. A prompt-size guard only:
+# a ticket rarely matches more.
+_CONTRACTS_SHOWN = 15
+
+# A candidate at least this strong is a real lead: its tests are listed.
 STRONG = 3.0
 # Scores per kind of evidence; a file found several ways adds them up.
 _SEARCH_HIT = 3.0
 _NAME_MATCH = 2.0
 _FOLDER_MATCH = 1.0
-_MAP_POINTER = 2.0
 _PR_FILE = 2.0
-_USES_READ_FILE = 2.5
-# Above one search hit: the scout runs because the leads were weak.
-_SCOUT_PICK = 3.5
-# Unread leads listed under "not read", per service.
-_NOT_READ_PER_SERVICE = 25
+_USES_LEAD = 2.5
+# Per extra distinct ticket term a path matches, up to _PAIR_MAX in all: a
+# file matching "package" AND "template" outranks one matching only
+# "template" (KS-16908: form-rendering templates outranked the Packages module).
+_PAIR_BONUS = 1.0
+_PAIR_MAX = 2.0
+# Leads listed for the log and Orchestration, per service.
+_LEADS_PER_SERVICE = 25
 # A term matching more of a service's paths than this says nothing about any
 # one of them ("report" in a reporting app).
 _COMMON_SHARE = 0.05
@@ -70,19 +86,10 @@ _APP_ROOTS = ("apps", "packages")
 # the app the title names, and shared code, give fewer leads than this: ten
 # is enough to plan from, and below it a lead elsewhere is better than none.
 _FEW_LEADS = 10
-# Searches: at most this many terms per service in step 2, and files used
-# for the step up in step 4.
+# Searches: at most this many terms per service in step 2, and leads used
+# for the step up in step 3.
 _TERMS_PER_SERVICE = 4
 _STEP_UP_FILES = 3
-# Files per service kept free for the scout's picks (BTS-40: steps 3 and 4
-# used the whole cap, so every pick was left unread).
-_SCOUT_ROOM = 5
-# A file larger than this is generated or data, not the code to change.
-_MAX_FILE_BYTES = 300_000
-# One patch of a reference pull request, and a file read when little of the
-# character cap is left.
-_MAX_PATCH_CHARS = 6_000
-_MIN_USEFUL_CHARS = 2_000
 _SKIP_EXT = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg", ".pdf", ".zip", ".jar",
     ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".lock", ".map", ".min.js", ".snap",
@@ -116,7 +123,11 @@ _IDENTIFIER = re.compile(
     r"\b(?:[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+|[a-z]+(?:[A-Z][a-z0-9]+)+|[a-z]+(?:_[a-z0-9]+)+)\b"
 )
 _QUOTED = re.compile(r"[\"'`“”‘’]([^\"'`“”‘’\n]{3,40})[\"'`“”‘’]")
-_TITLE_PHRASE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
+# Two or three capitalised words; a hyphenated one stays whole ("Initiate
+# Pre-Adverse Action", not "Initiate Pre").
+_TITLE_PHRASE = re.compile(
+    r"\b([A-Z][a-z]+(?:-[A-Z][a-z]+)*(?:\s+[A-Z][a-z]+(?:-[A-Z][a-z]+)*){1,2})\b"
+)
 _CAPS_WORD = re.compile(r"\b[A-Z]{4,}\b")
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9]{3,}")
 
@@ -138,11 +149,14 @@ class Candidate:
     # 0 in the app the title names, 1 shared code or no app named, 2 another
     # app, 3 generated: ranked in this order before the score (2026-11-03).
     tier: int = 1
+    terms: set[str] = field(default_factory=set)  # the distinct ticket terms it matched
 
-    def add(self, score: float, why: str) -> None:
+    def add(self, score: float, why: str, term: str = "") -> None:
         self.score += score
         if why not in self.why:
             self.why.append(why)
+        if term:
+            self.terms.add(norm(term))
 
     @property
     def rank(self) -> float:
@@ -153,15 +167,6 @@ class Candidate:
         return {2: "in another app than the one the title names", 3: "a generated file"}.get(
             self.tier, ""
         )
-
-
-@dataclass
-class ReadFile:
-    service: str
-    path: str
-    text: str
-    cut: bool
-    why: str
 
 
 @dataclass
@@ -178,30 +183,41 @@ class ReferenceChange:
     files: list[ChangedFile]
     files_cut: bool
     commit_lines: tuple[str, ...] = ()
-    patches: dict[str, str] = field(default_factory=dict)  # path -> patch, code reads on only
 
 
 @dataclass
 class Evidence:
     terms: list[str] = field(default_factory=list)
     term_scores: dict[str, float] = field(default_factory=dict)
-    files: list[ReadFile] = field(default_factory=list)
     references: list[ReferenceChange] = field(default_factory=list)
     candidates: dict[str, dict[str, Candidate]] = field(default_factory=dict)
     trees: dict[str, Tree] = field(default_factory=dict)
     folders: dict[str, str] = field(default_factory=dict)
+    contracts: dict[str, list[str]] = field(default_factory=dict)  # matching contract files
+    contract_folders: dict[str, list[str]] = field(default_factory=dict)
     searches: list[str] = field(default_factory=list)
     not_read: list[str] = field(default_factory=list)  # errors, cut lists, searches left out
-    unread_leads: list[str] = field(default_factory=list)  # strong leads the caps left unread
+    unread_leads: list[str] = field(default_factory=list)  # the strong leads, with why each
     warnings: list[str] = field(default_factory=list)
+    _folders: dict[str, set[str]] = field(default_factory=dict)
 
     def known(self, service: str, path: str) -> bool:
         """Is ``path`` a file of ``service`` at its pinned commit?"""
         tree = self.trees.get(service)
         return tree is not None and path in tree.sizes
 
-    def was_read(self, service: str, path: str) -> bool:
-        return any(f.service == service and f.path == path for f in self.files)
+    def known_folder(self, service: str, folder: str) -> bool:
+        """Is ``folder`` a folder of ``service`` at its pinned commit?"""
+        tree = self.trees.get(service)
+        if tree is None:
+            return False
+        if service not in self._folders:
+            folders = set()
+            for path in tree.paths:
+                parts = path.split("/")[:-1]
+                folders.update("/".join(parts[: i + 1]) for i in range(len(parts)))
+            self._folders[service] = folders
+        return folder in self._folders[service]
 
     def ranked(self, service: str) -> list[Candidate]:
         """Best first: the app the title names, then shared code, then other
@@ -211,58 +227,11 @@ class Evidence:
         )
 
     def leads(self, service: str, limit: int) -> list[Candidate]:
-        """Unread candidates worth naming, best first. Another app's files and
+        """Candidates worth naming, best first. Another app's files and
         generated files only while the others are fewer than _FEW_LEADS."""
-        good = [
-            c for c in self.ranked(service)
-            if c.score >= 1 and not self.was_read(service, c.path) and not is_test(c.path)
-        ]
+        good = [c for c in self.ranked(service) if c.score >= 1 and not is_test(c.path)]
         near = [c for c in good if c.tier < 2]
         return (near if len(near) >= _FEW_LEADS else good)[:limit]
-
-    def has_strong_lead(self, service: str) -> bool:
-        return any(c.score >= STRONG for c in self.candidates.get(service, {}).values())
-
-    def chars(self) -> int:
-        return sum(len(f.text) for f in self.files) + sum(
-            len(p) for r in self.references for p in r.patches.values()
-        )
-
-    def drop(self) -> None:
-        """Clears every file text and patch held for this run."""
-        for f in self.files:
-            f.text = ""
-        self.files.clear()
-        for ref in self.references:
-            ref.patches.clear()
-
-
-@dataclass
-class Budget:
-    max_files: int
-    max_per_service: int
-    max_chars: int
-    files: int = 0
-    chars: int = 0
-    per_service: Counter = field(default_factory=Counter)
-
-    def why_not(self, service: str, per_service_limit: int | None = None) -> str | None:
-        """Why one more file of ``service`` cannot be read, or None when it can."""
-        limit = per_service_limit or self.max_per_service
-        if self.files >= self.max_files:
-            return f"the run's cap of {self.max_files} files (TDD_MAX_FILES)"
-        if self.per_service[service] >= limit:
-            return (
-                f"the cap of {self.max_per_service} files per service "
-                "(TDD_MAX_FILES_PER_SERVICE)"
-            )
-        if self.max_chars - self.chars < _MIN_USEFUL_CHARS:
-            return f"the run's cap of {self.max_chars:,} characters (TDD_MAX_CHARS)"
-        return None
-
-    def room(self) -> int:
-        return max(self.max_chars - self.chars, 0)
-
 
 # --- the ticket's terms -----------------------------------------------------------------
 
@@ -280,11 +249,14 @@ def clue_terms(plan: PlanInput, limit: int = 20) -> list[tuple[str, float]]:
     shown: dict[str, str] = {}
 
     def add(term: str, weight: float) -> None:
+        if norm(term) in _STOPWORDS:
+            return
+        term = _singular(term.strip())
         key = norm(term)
         if len(key) < 4 or key in _STOPWORDS:
             return
         scores[key] += weight
-        shown.setdefault(key, term.strip())
+        shown.setdefault(key, term)
 
     for text, weight in sources:
         for m in _IDENTIFIER.finditer(text):
@@ -300,7 +272,49 @@ def clue_terms(plan: PlanInput, limit: int = 20) -> list[tuple[str, float]]:
         for m in _WORD.finditer(text):
             if m.group(0).lower() not in _STOPWORDS:
                 add(m.group(0).lower(), weight)
-    return [(shown[key], score) for key, score in scores.most_common(limit)]
+    ranked = [(shown[key], score) for key, score in scores.most_common(limit * 2)]
+    texts = [text for text, _ in sources]
+    kept = [(t, sc) for t, sc in ranked if not _only_in_phrase(t, ranked, texts)]
+    # A phrase that is two terms side by side is no clue of its own:
+    # "Spanish Pre-Adverse Action" is "spanish" + "Pre-Adverse Action". One
+    # that adds a word ("Pre-Adverse Action" beside "Adverse Action") stays.
+    keys = {norm(t) for t, _ in kept}
+    kept = [
+        (t, sc) for t, sc in kept
+        if not any(o != t and norm(o) in norm(t)
+                   and norm(t).replace(norm(o), "", 1) in keys for o, _ in kept)
+    ]
+    return kept[:limit]
+
+
+def _only_in_phrase(term: str, ranked: list[tuple[str, float]], texts: list[str]) -> bool:
+    """Is a one-word term only ever part of a phrase that is a term itself?
+    Then it is the same clue counted twice: "adverse" and "action" from
+    "Adverse Action", which also matched every actions/ folder (2026-11-15)."""
+    if " " in term or "-" in term:
+        return False
+    phrases = [t for t, _ in ranked if (" " in t or "-" in t) and norm(term) in norm(t)]
+    if not phrases:
+        return False
+    alone = re.compile(rf"\b{re.escape(term)}s?\b", re.I)
+    for text in texts:
+        for phrase in sorted(phrases, key=len, reverse=True):
+            text = re.sub(re.escape(phrase), " ", text, flags=re.I)
+        if alone.search(text):
+            return False
+    return True
+
+
+def _singular(term: str) -> str:
+    """One plain word in the singular, so "templates" and "template" are one
+    term (KS-16908: each was scored, and matched, twice). Names, phrases and
+    words ending in "ss", "us" or "is" ("address", "status", "analysis") are
+    kept as they are."""
+    if not term.isalpha() or not (term.islower() or term[1:].islower()):
+        return term
+    if len(term) > 4 and term.endswith("s") and not term.endswith(("ss", "us", "is")):
+        return term[:-1]
+    return term
 
 
 # --- paths ------------------------------------------------------------------------------
@@ -329,6 +343,11 @@ def _stem(path: str) -> str:
     return name.split(".", 1)[0]
 
 
+def _is_contract(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return bool(_CONTRACT_NAME.match(name)) or name.endswith(_CONTRACT_EXT)
+
+
 def _app_of(path: str) -> str | None:
     """The monorepo app a path is in: "src/apps/client/x.tsx" -> "client"."""
     parts = path.split("/")
@@ -355,25 +374,21 @@ def _in_folder(paths: tuple[str, ...], folder: str) -> list[str]:
 
 
 class Gatherer:
-    """Holds one run's evidence and budget; gather() once, read_more() for the scout."""
+    """Holds one run's evidence; gather() once."""
 
     def __init__(
         self,
         reader: GitHubReader,
         settings: Settings,
         services: list[ReadyService],
-        map_slice: MapSlice,
     ):
         self.reader = reader
         self.settings = settings
         self.services = services
-        self.map = map_slice
         self.ev = Evidence()
-        self.budget = Budget(settings.max_files, settings.max_files_per_service, settings.max_chars)
         self.stopped = ""  # set by a rate limit or the run's call cap: no more GitHub
         self.scope: set[str] = set()  # the title's words, to rank files under a named area
         self.named_apps: dict[str, set[str]] = {}  # service -> app folders the title names
-        self.failed: set[tuple[str, str]] = set()  # (service, path) whose read failed, noted
 
     # --- the steps ----------------------------------------------------------------------
 
@@ -393,7 +408,7 @@ class Gatherer:
                 self._stop_if(error)
                 self.ev.warnings.append(f"{svc.name}: its file list could not be read: {error}")
                 continue
-            self.ev.folders[svc.name] = self.map.folders.get(svc.name, svc.path)
+            self.ev.folders[svc.name] = self._folder(svc)
             usable.append(svc)
         for svc in usable:
             named = _named_apps(self.ev.trees[svc.name].paths, self.scope)
@@ -406,80 +421,20 @@ class Gatherer:
         searches_each = self._search_share(len(usable))
         for svc in usable:
             self._candidates(svc, searches_each)
-        limit = self.settings.max_files_per_service - self._scout_room()
-        for svc in usable:
-            reserve = max(1, limit // 3)
-            self._read_best(svc, limit - reserve)
         for svc in usable:
             self._step_up(svc)
-        for svc in usable:
-            self._read_best(svc, limit)
             self._list_tests(svc)
-        self._note_unread()
+            self._contracts(svc)
+        self._pair_bonus()
+        self._note_leads()
         self.ev.warnings += [w for w in self.reader.warnings if w not in self.ev.warnings]
+        leads = sum(len(self.ev.leads(svc.name, 10_000)) for svc in usable)
         print(
-            f"  [TDD] evidence: {len(self.ev.files)} files read, {self.budget.chars:,} chars, "
-            f"{len(self.ev.references)} reference changes, {len(self.ev.not_read)} not read; "
-            f"{self.reader.calls} GitHub calls, {self.reader.searches} searches"
+            f"  [TDD] evidence: {leads} leads, {len(self.ev.references)} reference changes, "
+            f"{len(self.ev.not_read)} notes; {self.reader.calls} GitHub calls, "
+            f"{self.reader.searches} searches"
         )
         return self.ev
-
-    def _scout_room(self) -> int:
-        """Files per service left for the scout: none when it cannot run."""
-        if not (self.settings.scout and self.settings.allow_code_reads):
-            return 0
-        return min(_SCOUT_ROOM, self.settings.max_files_per_service // 3)
-
-    def fill(self) -> int:
-        """Reads the best unread leads into the room kept for the scout, up to
-        the full caps; after the scout's own reads there is usually none left.
-        Returns how many files it read."""
-        before = len(self.ev.files)
-        for svc in self.services:
-            if svc.name in self.ev.trees:
-                self._read_best(svc, self.settings.max_files_per_service)
-        self._note_unread()
-        return len(self.ev.files) - before
-
-    def good_enough(self) -> bool:
-        """Every service has a strong lead (and, with code reads on, read it):
-        the scout call would add little."""
-        for svc in self.services:
-            if svc.name not in self.ev.trees:
-                continue
-            if not self.ev.has_strong_lead(svc.name):
-                return False
-            if self.settings.allow_code_reads and not any(
-                f.service == svc.name for f in self.ev.files
-            ):
-                return False
-        return True
-
-    def read_more(self, picks: list[dict]) -> list[str]:
-        """The scout's picks ({service, path, why}): checked against the pinned
-        tree, added as candidates, and read within the same caps. Returns a
-        note per pick that was refused."""
-        refused = []
-        by_name = {svc.name: svc for svc in self.services}
-        touched = set()
-        for pick in picks:
-            service = str(pick.get("service") or "").strip()
-            path = str(pick.get("path") or "").strip().lstrip("/")
-            if not self.ev.known(service, path) and path.startswith(service + "/"):
-                path = path[len(service) + 1 :]  # written as the prompt shows it: ui/src/...
-            svc = by_name.get(service)
-            if svc is None or not self.ev.known(service, path):
-                refused.append(f"scout picked {service}/{path}, which is not a file of this run")
-                continue
-            self._candidate(service, path).add(
-                _SCOUT_PICK, f"picked by the scout: {str(pick.get('why') or '')[:120]}"
-            )
-            touched.add(service)
-        for svc in self.services:
-            if svc.name in touched:
-                self._read_best(svc, self.settings.max_files_per_service)
-        self._note_unread()
-        return refused
 
     # --- 1. reference changes -----------------------------------------------------------
 
@@ -523,37 +478,12 @@ class Gatherer:
                     f"{svc.name}: {change.ref} changes more files than GitHub lists; "
                     "only the first ones are known"
                 )
-            self._keep_patches(change)
             for f in change.files:
                 if f.status != "removed" and self.ev.known(svc.name, f.path):
                     self._candidate(svc.name, f.path).add(_PR_FILE, f"changed by {change.ref}")
             self.ev.references.append(change)
             print(f"  [TDD] {svc.name}: reference {change.ref} ({change.state}), "
                   f"{len(change.files)} files")
-
-    def _keep_patches(self, change: ReferenceChange) -> None:
-        """With code reads on, the patches of a reference change, within the
-        character cap: the service's own folder first, tests last."""
-        if not self.settings.allow_code_reads:
-            return
-        folder = self.ev.folders.get(change.service, "")
-        ordered = sorted(
-            (f for f in change.files if f.patch),
-            key=lambda f: (bool(folder) and not f.path.startswith(folder + "/"),
-                           is_test(f.path), f.path),
-        )
-        for f in ordered:
-            if not readable(f.path):
-                continue
-            if self.budget.room() < _MIN_USEFUL_CHARS:
-                self.ev.not_read.append(
-                    f"{change.service}: patch of {f.path} in {change.ref}: the run's character "
-                    "cap (TDD_MAX_CHARS)"
-                )
-                continue
-            patch = f.patch[: min(_MAX_PATCH_CHARS, self.budget.room())]
-            change.patches[f.path] = patch
-            self.budget.chars += len(patch)
 
     # --- 2. candidates ------------------------------------------------------------------
 
@@ -579,17 +509,12 @@ class Gatherer:
                 too_common.add(term)  # says nothing about any one file
                 continue
             for p in name_hits:
-                self._candidate(svc.name, p).add(_NAME_MATCH, f"its name matches '{term}'")
+                self._candidate(svc.name, p).add(_NAME_MATCH, f"its name matches '{term}'", term)
             for p in folder_hits:
                 if p not in name_hits:
-                    self._candidate(svc.name, p).add(_FOLDER_MATCH, f"its folder matches '{term}'")
-        # The service map.
-        for what, path in self.map.pointers(svc.name):
-            hits = [t for t in terms if norm(t) in norm(what)]
-            if hits and self.ev.known(svc.name, path):
-                self._candidate(svc.name, path).add(
-                    _MAP_POINTER, f"the service map has '{what.strip()}' there"
-                )
+                    self._candidate(svc.name, p).add(
+                        _FOLDER_MATCH, f"its folder matches '{term}'", term
+                    )
         # Code search: the best-scored terms, a name or phrase counting half
         # again; a term all over the paths is all over the code too.
         def priority(term: str) -> float:
@@ -598,10 +523,10 @@ class Gatherer:
 
         ordered = sorted((t for t in terms if t not in too_common), key=priority, reverse=True)
         for term in ordered[:searches]:
-            self._search(svc, term, _SEARCH_HIT, f"contains '{term}'")
+            self._search(svc, term, _SEARCH_HIT, f"contains '{term}'", ticket_term=True)
 
     def _search(self, svc: ReadyService, term: str, score: float, why: str,
-                exclude: str = "") -> int:
+                exclude: str = "", ticket_term: bool = False) -> int:
         if self.stopped:
             return 0
         folder = self.ev.folders.get(svc.name, "")
@@ -618,7 +543,7 @@ class Gatherer:
             if not self.ev.known(svc.name, path):
                 missing += 1
             elif readable(path):
-                self._candidate(svc.name, path).add(score, why)
+                self._candidate(svc.name, path).add(score, why, term if ticket_term else "")
                 kept += 1
         if missing:
             self.ev.not_read.append(
@@ -638,7 +563,11 @@ class Gatherer:
 
     def _boost(self, path: str) -> float:
         """x1.5 when a folder on the path is a word of the ticket's title, singular
-        or plural: "Client UI ... report" -> apps/client/, modules/Reports/."""
+        or plural: "Client UI ... report" -> apps/client/, modules/Reports/.
+        Not for an index, main or app file: an app's root (KS-16908:
+        apps/client/index.tsx is the router, not a screen)."""
+        if _stem(path).lower() in _GENERIC_STEMS:
+            return 1.0
         folders = {norm(part) for part in path.split("/")[:-1]}
         named = any(f in self.scope or f.removesuffix("s") in self.scope for f in folders)
         return 1.5 if named else 1.0
@@ -652,54 +581,14 @@ class Gatherer:
             return 1
         return 0 if app in named else 2
 
-    # --- 3. reading ---------------------------------------------------------------------
-
-    def _read_best(self, svc: ReadyService, limit: int) -> None:
-        """Reads the best unread candidates (tests aside) until ``limit`` files
-        of this service are read or a cap is reached. Code reads off: nothing."""
-        if not self.settings.allow_code_reads or self.stopped:
-            return
-        sizes = self.ev.trees[svc.name].sizes
-        for candidate in self.ev.ranked(svc.name):
-            if self.ev.was_read(svc.name, candidate.path) or is_test(candidate.path):
-                continue
-            if (svc.name, candidate.path) in self.failed:
-                continue
-            if sizes.get(candidate.path, 0) > _MAX_FILE_BYTES:
-                continue  # noted as too large in _note_unread
-            if self.budget.why_not(svc.name, limit):
-                return
-            try:
-                got = self.reader.read(svc.repo, candidate.path, svc.sha)
-            except GitHubError as error:
-                self._stop_if(error)
-                if self.stopped:
-                    return  # not noted as failed: _note_unread says why it was not read
-                self.failed.add((svc.name, candidate.path))
-                self.ev.not_read.append(f"{svc.name}/{candidate.path}: {error}")
-                continue
-            text = got.text[: self.budget.room()]
-            self.ev.files.append(
-                ReadFile(
-                    service=svc.name, path=candidate.path, text=text,
-                    cut=got.cut or len(text) < len(got.text), why="; ".join(candidate.why),
-                )
-            )
-            self.budget.files += 1
-            self.budget.per_service[svc.name] += 1
-            self.budget.chars += len(text)
-
-    # --- 4. one step up, and the tests --------------------------------------------------
+    # --- 3. one step up, and the tests --------------------------------------------------
 
     def _step_up(self, svc: ReadyService) -> None:
-        """Who uses the best files found: a search for each one's name."""
-        if self.settings.allow_code_reads:
-            base = [f.path for f in self.ev.files if f.service == svc.name]
-        else:
-            base = [
-                c.path for c in self.ev.ranked(svc.name)
-                if c.score >= _NAME_MATCH and not is_test(c.path)
-            ]
+        """Who uses the best leads found: a search for each one's name."""
+        base = [
+            c.path for c in self.ev.ranked(svc.name)
+            if c.score >= _NAME_MATCH and not is_test(c.path)
+        ]
         done = 0
         for path in base:
             if done == _STEP_UP_FILES or self.stopped:
@@ -713,16 +602,12 @@ class Gatherer:
                     "(TDD_MAX_CODE_SEARCHES)"
                 )
                 break
-            self._search(svc, stem, _USES_READ_FILE, f"uses {stem}", exclude=path)
+            self._search(svc, stem, _USES_LEAD, f"uses {stem}", exclude=path)
             done += 1
 
     def _list_tests(self, svc: ReadyService) -> None:
-        """The tests that go with each file read (or, code reads off, each lead):
-        by path only, never read."""
-        if self.settings.allow_code_reads:
-            base = [f.path for f in self.ev.files if f.service == svc.name]
-        else:
-            base = [c.path for c in self.ev.ranked(svc.name) if c.score >= STRONG]
+        """The tests that go with each strong lead: by path only."""
+        base = [c.path for c in self.ev.ranked(svc.name) if c.score >= STRONG]
         stems = {norm(_stem(p)): _stem(p) for p in base if len(_stem(p)) >= 4}
         folder = self.ev.folders.get(svc.name, "")
         for path in _in_folder(self.ev.trees[svc.name].paths, folder):
@@ -731,39 +616,68 @@ class Gatherer:
                 if key in stems:
                     self._candidate(svc.name, path).add(0.5, f"test of {stems[key]}")
 
-    # --- the not-read list --------------------------------------------------------------
+    def _pair_bonus(self) -> None:
+        """More for a path that matches several distinct ticket terms. A term
+        inside another one it also matched ("action" in "adverseaction") is
+        the same clue, not a second one."""
+        for per_service in self.ev.candidates.values():
+            for c in per_service.values():
+                distinct = {t for t in c.terms if not any(t != o and t in o for o in c.terms)}
+                if len(distinct) > 1:
+                    bonus = min(_PAIR_BONUS * (len(distinct) - 1), _PAIR_MAX)
+                    c.add(bonus, f"matches {len(distinct)} of the ticket's terms")
 
-    def _note_unread(self) -> None:
-        """Every strong candidate not read, with why. Rebuilt each time so a
-        later read (the scout's) takes a file off it."""
+    def _folder(self, svc: ReadyService) -> str:
+        """The service's folder inside its repo; the whole repo, with a
+        warning, when the folder the input gives is not there."""
+        folder = svc.path
+        paths = self.ev.trees[svc.name].paths
+        if folder and not any(p.startswith(folder + "/") for p in paths):
+            self.ev.warnings.append(
+                f"{svc.name}: the folder '{folder}' is not in {svc.repo} at {svc.sha[:12]}; "
+                "the whole repository is used"
+            )
+            return ""
+        return folder
+
+    def _contracts(self, svc: ReadyService) -> None:
+        """The service's contract files that match the ticket's terms, best
+        first, and the folders that hold its contracts, most first."""
+        folder = self.ev.folders.get(svc.name, "")
+        keys = [norm(t) for t in self.ev.terms]
+        found = [
+            p for p in _in_folder(self.ev.trees[svc.name].paths, folder)
+            if readable(p) and not is_test(p) and _is_contract(p)
+        ]
+        hits = sorted(
+            ((sum(k in norm(p) for k in keys), p) for p in found), key=lambda h: (-h[0], h[1])
+        )
+        self.ev.contracts[svc.name] = [p for n, p in hits if n][:_CONTRACTS_SHOWN]
+        held = Counter(p.rsplit("/", 1)[0] if "/" in p else "" for p in found)
+        self.ev.contract_folders[svc.name] = [
+            f for f, _ in held.most_common(_CONTRACTS_SHOWN) if f
+        ]
+
+    # --- the leads list ---------------------------------------------------------------
+
+    def _note_leads(self) -> None:
+        """Every strong lead (tests aside), with why it was found: for the log
+        and Orchestration."""
         self.ev.unread_leads = []
         for svc in self.services:
             if svc.name not in self.ev.trees:
                 continue
-            sizes = self.ev.trees[svc.name].sizes
-            unread = [
+            strong = [
                 c for c in self.ev.ranked(svc.name)
-                if c.score >= _NAME_MATCH
-                and not self.ev.was_read(svc.name, c.path)
-                and not is_test(c.path)  # tests are listed, never read
-                and (svc.name, c.path) not in self.failed  # already noted with its error
+                if c.score >= _NAME_MATCH and not is_test(c.path)
             ]
-            if len(unread) > _NOT_READ_PER_SERVICE:
-                self.ev.unread_leads.append(
-                    f"{svc.name}: {len(unread) - _NOT_READ_PER_SERVICE} weaker "
-                    "leads not listed"
-                )
-            for c in unread[:_NOT_READ_PER_SERVICE]:
-                if not self.settings.allow_code_reads:
-                    # Nothing is read: say why the file was found instead.
-                    why = "; ".join([*c.why, c.note] if c.note else c.why)
-                elif sizes.get(c.path, 0) > _MAX_FILE_BYTES:
-                    why = f"over {_MAX_FILE_BYTES // 1000} KB, likely generated"
-                elif self.stopped:
-                    why = self.stopped
-                else:
-                    why = self.budget.why_not(svc.name) or "ranked below the files read"
+            for c in strong[:_LEADS_PER_SERVICE]:
+                why = "; ".join([*c.why, c.note] if c.note else c.why)
                 self.ev.unread_leads.append(f"{svc.name}/{c.path}: {why}")
+            if len(strong) > _LEADS_PER_SERVICE:
+                self.ev.unread_leads.append(
+                    f"{svc.name}: {len(strong) - _LEADS_PER_SERVICE} weaker leads not listed"
+                )
 
     def _stop_if(self, error: GitHubError) -> None:
         if isinstance(error, GitHubStopped) and not self.stopped:
