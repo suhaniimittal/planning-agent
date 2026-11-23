@@ -19,7 +19,6 @@ dependencies = [
     # (src/ingestion/code_crypto.py, used by src/memory/record.py).
     "cryptography>=43",
     "pydantic>=2.13,<3",
-    "pyyaml",
     # pyhanko (pulled in by xhtml2pdf, for a PDF-signing feature this project
     # never uses) constructs a zoneinfo.ZoneInfo('Europe/Brussels') at
     # IMPORT time — not when actually signing anything. Minimal Linux
