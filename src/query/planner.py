@@ -29,6 +29,7 @@ _MODEL_REJECTED = re.compile(
 )
 _working_model: str | None = None
 # gpt-5.4 accepts a seed; gpt-5.5 refuses it as well as `temperature`.
+# The default; OPENAI_MODEL in .env picks another (2026-11-23).
 _OPENAI_MODEL = "gpt-5.4"
 # Models that can think before writing, and whose API takes
 # `max_completion_tokens` rather than `max_tokens`.
@@ -41,8 +42,19 @@ _OPENAI_NO_TEMPERATURE_PREFIXES = ("gpt-5.5", "gpt-5.6", "o1", "o3", "o4")
 # missed edge states. Asking for it means giving up temperature=0 ("only the
 # default (1) is supported" once reasoning is on); a model that works the
 # problem through first beats a model that is merely repeatable.
-_OPENAI_REASONING_EFFORT = "high"
+_OPENAI_REASONING_EFFORT = "high"  # the default; OPENAI_REASONING_EFFORT in .env
 _OPENAI_REASONING_MAX_TOKENS = 40000
+
+
+def _openai_model() -> str:
+    """The OpenAI model: OPENAI_MODEL from the environment, else the default."""
+    return os.environ.get("OPENAI_MODEL", "").strip() or _OPENAI_MODEL
+
+
+def _reasoning_effort() -> str:
+    """How hard a thinking model thinks (low, medium, high): from the
+    environment, else the default."""
+    return os.environ.get("OPENAI_REASONING_EFFORT", "").strip().lower() or _OPENAI_REASONING_EFFORT
 
 # 0, not the API default of 1.0: the same ticket and the same code must give
 # the same TDD. At 1.0 one run named three real backend files and the next
@@ -132,7 +144,7 @@ def _openai_params(model: str) -> dict:
     """
     thinking = {
         "max_completion_tokens": _OPENAI_REASONING_MAX_TOKENS,
-        "reasoning_effort": _OPENAI_REASONING_EFFORT,
+        "reasoning_effort": _reasoning_effort(),
     }
     if model.startswith(_OPENAI_NO_TEMPERATURE_PREFIXES):
         return thinking
@@ -146,6 +158,7 @@ async def _plan_via_openai(system_prompt: str, user_prompt: str, images=None) ->
 
     # OpenAI directly, off the gateway (a laptop); the platform always uses the gateway.
     client = local_client.new_client()
+    model = _openai_model()
     # Screenshots from the ticket (images.TicketImage) go at images.SLOT.
     user_content = user_prompt
     if images:
@@ -155,13 +168,13 @@ async def _plan_via_openai(system_prompt: str, user_prompt: str, images=None) ->
             for image in images
         ] + ([{"type": "text", "text": tail}] if tail else [])
     resp = await client.chat.completions.create(
-        model=_OPENAI_MODEL,
+        model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
         response_format={"type": "json_object"},
-        **_openai_params(_OPENAI_MODEL),
+        **_openai_params(model),
     )
     return resp.choices[0].message.content
 
