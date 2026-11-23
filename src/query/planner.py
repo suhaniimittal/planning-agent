@@ -32,8 +32,9 @@ _working_model: str | None = None
 # The default; OPENAI_MODEL in .env picks another (2026-11-23).
 _OPENAI_MODEL = "gpt-5.4"
 # Models that can think before writing, and whose API takes
-# `max_completion_tokens` rather than `max_tokens`.
-_OPENAI_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+# `max_completion_tokens` rather than `max_tokens`. gpt-6 (2026-11-23,
+# verified: gpt-6.2-sol and gpt-6.2-astra) thinks and takes a seed, like gpt-5.4.
+_OPENAI_REASONING_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
 # Models in that family that additionally REFUSE `seed`. Checked before the
 # prefix list above, which they also match. Verified against the API.
 _OPENAI_NO_TEMPERATURE_PREFIXES = ("gpt-5.5", "gpt-5.6", "o1", "o3", "o4")
